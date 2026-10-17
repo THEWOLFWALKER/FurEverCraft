@@ -15,6 +15,7 @@
 - `src/bridge/protocol/session.ts`：1.20.4/protocol 765 阶段状态机、packet fixture、观察队列和 upstream gate。
 - `src/bridge/windows/driver.ts` 与 `native/windows/FurEverCraft.Helper.ps1`：JSONL helper、PID/HWND 绑定、TTL、去重、heartbeat、dry-run 和退出清理路径。
 - `src/bridge/composite.ts`：协议观察、Windows driver、截图能力的组合和诚实能力声明。
+- `PACKET_OWNERSHIP.md`：阶段、方向、库处理和 fixture 限制。
 - `src/diagnostics`：事件游标、持久关键事件和日志脱敏。
 - 配置：`configs/simulated.json`、`configs/client-offline.example.json`。
 - Node 22 CI：`.github/workflows/offline.yml`。
@@ -33,7 +34,8 @@ npm run test:offline
 npm run demo:offline
 ```
 
-当前离线测试：7 个测试文件，27 个测试通过。
+- `npm run test:offline`：7 个测试文件，27 个测试通过。
+- `npm run cli -- doctor` 和 `npm run cli -- bridge --config configs/client-offline.example.json`：实际运行成功，默认网络关闭。
 
 测试覆盖：world context/gap、SQLite 重开和 effect/checkpoint、五技能执行、provider/runtime 回归、protocol 阶段和方向、Windows fake transport、Composite bridge、响应错序/输入过期/命令去重。
 

@@ -160,8 +160,8 @@ export class SQLiteStore {
 
   getCriticalEvents(after = '0', limit = 100, kind?: string) {
     const sql = `SELECT * FROM critical_events WHERE CAST(event_seq AS INTEGER)>CAST(? AS INTEGER) ${kind ? 'AND kind=?' : ''}
-      ORDER BY CAST(event_seq AS INTEGER) LIMIT ?`;
-    const values = kind ? [after, kind, limit] : [after, limit];
+      ORDER BY CAST(event_seq AS INTEGER) LIMIT CAST(? AS INTEGER)`;
+    const values = kind ? [String(after), kind, String(limit)] : [String(after), String(limit)];
     return (this.db.prepare(sql).all(...values) as any[])
       .map(row => ({ seq: row.event_seq, eventId: row.event_id, kind: row.kind, durable: true, context: parse(row.context), payload: parse(row.payload_json) }));
   }
