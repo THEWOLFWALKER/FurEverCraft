@@ -35,6 +35,10 @@ Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Sta
 
 - The Minecraft codec path is the legacy 1.20.4/765 fixture; the 26.3 adapter is candidate metadata only. No live 26.3 interoperability is claimed.
 - The raw relay is verified on loopback sockets only; no real server was contacted.
-- The React web UI is implemented and served same-origin; browser Playwright E2E and full 26.3 domain normalizers remain not implemented.
-- Six of the eleven skills are registered but intentionally return unavailable without the corresponding capability.
+- The React web UI is implemented and served same-origin; browser Playwright E2E remains not implemented.
+- All eleven skills are registered; `look_at`/`dig_one`/`return_to_place`/`collect_nearby`/`gather_blocks` run against simulated capabilities and fail closed when the capability is absent.
 - Real Windows input/capture, paid model APIs, Node 22 execution and real Minecraft are unverified.
+
+## Review status (2026-10-18)
+
+A dedicated read-only review of the bridge/relay/observer/control/server/world/skills/web code found ten defects; all ten were fixed with regression tests (relay stop deadlock, half-close reply loss, supervisor late-exit corruption, owner-loss revoke, conflict receipt replay, world gap cell loss, observer concurrency, SSE timer leak, wait-skill no-op, web event kinds). A corrected recovery test also exposed missing durable side-effect persistence, now wired as prepared → may-have-dispatched → confirmed/partial/ambiguous.

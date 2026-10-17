@@ -37,7 +37,24 @@ Current HEAD after this pass: `279fd8d` (plus documentation commits).
 - `src/diagnostics/trace.ts` bounded trace.
 - Tests: unit, integration, soak (60 virtual minutes) and trace suites.
 
-## Verified commands (local Linux, Node 20.19.5, npm 10.8.2)
+## Review pass (2026-10-18)
+
+A dedicated read-only review of the recent bridge/relay/observer/control/server/world/skills/web code produced ten findings; all were fixed with regression tests:
+
+1. Relay `stop()` deadlocked with active sessions — stop now closes sessions before `server.close` and flush ends the writable side so drain can fire.
+2. Supervisor late child `exit` after restart corrupted state — handlers now ignore events from a non-current child.
+3. Conflict/rejected command receipts were persisted as `completed` and replayed as `terminal` — receipt states `conflict`/`rejected` added and replay preserved.
+4. `WorldState` gap destroyed previously known cells — gapped deltas now preserve prior keys as `unknown`.
+5. Relay half-close dropped the upstream reply — sockets use `allowHalfOpen`; the upstream reply is delivered after client FIN.
+6. Supervisor owner-loss did not revoke control — `request()` refuses unless running and revokes on loss.
+7. Observer concurrency could exceed `maxConcurrency` after listener timeout — slots remain counted until the listener settles.
+8. SSE could leak `poll`/`heartbeat` intervals when the initial snapshot closed the stream — timers are cleared if the stream finished.
+9. `wait_for_condition` returned immediately with an injected clock — it now resolves only after the scheduled deadline and honours cancellation.
+10. Web SSE skipped `control.quit`/`control.message`/`runtime.shutdown-requested` — the subscriber listens to the full control/runtime/tool event kinds.
+
+Additionally, the corrected recovery test exposed a real gap: side-effect skills did not persist a durable effect. The router now writes `prepared → may-have-dispatched` inside the execution (after the execution row exists) and settles `confirmed/partial/ambiguous` by outcome, so a crash leaves a reconcilable pending effect.
+
+
 
 ```text
 npm run typecheck            pass
