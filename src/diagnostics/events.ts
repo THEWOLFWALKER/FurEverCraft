@@ -9,6 +9,7 @@ export class EventHub {
   private readonly events: Event[] = [];
   readonly bootEpoch: string;
   private seq: bigint;
+  private readonly subscribers = new Set<(event: Event) => void>();
   constructor(private readonly capacity = 1024, private readonly store?: SQLiteStore, private readonly defaultContext?: BodyContext) {
     this.bootEpoch = nextId('boot');
     this.seq = BigInt(store?.getLatestCriticalSequence() ?? '0');
@@ -21,8 +22,10 @@ export class EventHub {
     }
     this.events.push(event);
     while (this.events.length > this.capacity) this.events.shift();
+    for (const subscriber of this.subscribers) { try { subscriber(event); } catch { /* isolate consumers */ } }
     return event;
   }
+  subscribe(listener: (event: Event) => void) { this.subscribers.add(listener); return () => this.subscribers.delete(listener); }
   read(after = '0', limit = 100, filter?: string): EventRead {
     if (!/^\d+$/.test(after)) throw new Error('invalid-event-cursor');
     if (!Number.isInteger(limit) || limit < 1 || limit > 10000) throw new Error('invalid-event-limit');

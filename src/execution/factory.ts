@@ -10,6 +10,10 @@ import { OpenAIProvider, FetchTransport } from '../providers/openai/index.js';
 import { AnthropicProvider } from '../providers/anthropic/index.js';
 import type { Clock } from '../contracts/index.js';
 import { ManualClock, SystemClock } from '../contracts/index.js';
+import { ControlService } from '../control/service.js';
+import { GoalManager, TaskScheduler } from '../autonomous/tasks.js';
+import { SessionSupervisor } from '../autonomous/session.js';
+import type { ProviderMetadata } from '../control/dto.js';
 
 export type RuntimeProfile = 'simulated' | 'client-offline' | 'unsupported';
 export type RuntimeFactoryOptions = {
@@ -24,7 +28,7 @@ export type RuntimeFactoryOptions = {
   apiKey?: string;
   bridge?: ClientBridgeCapabilities;
 };
-export type RuntimeAssembly = { bridge: ClientBridgeCapabilities; store: SQLiteStore; session: SessionRuntime; router: ToolRouter; provider: ModelProvider; loop: AgentLoop; clock: Clock; close(): void };
+export type RuntimeAssembly = { bridge: ClientBridgeCapabilities; store: SQLiteStore; session: SessionRuntime; router: ToolRouter; provider: ModelProvider; loop: AgentLoop; clock: Clock; control: ControlService; goalManager: import('../autonomous/tasks.js').GoalManager; scheduler: import('../autonomous/tasks.js').TaskScheduler; sessionSupervisor: import('../autonomous/session.js').SessionSupervisor; close(): void };
 
 const activeRuntimes = new Set<string>();
 export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssembly {
@@ -43,8 +47,22 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
   const provider = options.provider ?? createProvider(options);
   const router = new ToolRouter(bridge, store, session.events, executor, new MemoryService(store), () => clock.now());
   const loop = new AgentLoop(provider, router);
+  const providerName = options.modelProvider ?? 'scripted';
+  const providerMetadata: ProviderMetadata = {
+    provider: providerName,
+    configured: !(provider instanceof UnavailableProvider),
+    model: options.model,
+    networkEnabled: options.allowModelNetwork ?? false,
+    transport: options.provider ? 'fixture' : provider instanceof UnavailableProvider ? 'unavailable' : 'network',
+  };
+  const control = new ControlService(undefined as unknown as RuntimeAssembly, providerMetadata);
+  const goalManager = new GoalManager(store, session.events);
+  const scheduler = new TaskScheduler(session.events, async () => undefined, 25);
+  const sessionSupervisor = new SessionSupervisor(session.events);
   let closed = false;
-  return { bridge, store, session, router, provider, loop, clock, close() { if (closed) return; closed = true; try { store.close(); } finally { if (lockKey) activeRuntimes.delete(lockKey); } } };
+  const assembly = { bridge, store, session, router, provider, loop, clock, control, goalManager, scheduler, sessionSupervisor, close() { if (closed) return; closed = true; scheduler.close(); void sessionSupervisor.stop(); try { store.close(); } finally { if (lockKey) activeRuntimes.delete(lockKey); } } } as RuntimeAssembly;
+  control.attach(assembly);
+  return assembly;
 }
 
 function createProvider(options: RuntimeFactoryOptions): ModelProvider {
