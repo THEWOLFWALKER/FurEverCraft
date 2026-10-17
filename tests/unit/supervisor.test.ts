@@ -55,6 +55,20 @@ describe('B06 process supervisor', () => {
     now = 70_000; expect(await supervisor.restart()).toBe(true);
   });
 
+  it('correlates request/response and rejects a stale-session response', async () => {
+    const child = new FakeChild();
+    const supervisor = new ProcessSupervisor({ spawn: () => child, ipcTimeoutMs: 50 });
+    await supervisor.start();
+    child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'child-1', bootEpoch: 'b', capabilities: [] });
+    const pending = supervisor.request('status');
+    const request = child.sent.at(-1) as { requestId: string };
+    child.emit('message', { type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch: 'old', ok: true, result: { stale: true } });
+    await expect(Promise.race([pending.then(() => 'settled'), new Promise(r => setTimeout(() => r('pending'), 10))])).resolves.toBe('pending');
+    child.emit('message', { type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch: 'child-1', ok: true, result: { sessions: 0 } });
+    await expect(pending).resolves.toEqual({ sessions: 0 });
+    await supervisor.stop();
+  });
+
   it('adopts the first child epoch and rejects an in-flight identity change', async () => {
     const child = new FakeChild();
     const supervisor = new ProcessSupervisor({ spawn: () => child });

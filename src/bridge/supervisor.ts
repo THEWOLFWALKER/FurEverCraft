@@ -21,9 +21,11 @@ export type SupervisorOptions = {
   restartWindowMs?: number;
   heartbeatMs?: number;
   ownerLossMs?: number;
+  ipcTimeoutMs?: number;
 };
 
 export type OwnerLossResult = { ownerLost: boolean; revoked: boolean; reason?: string };
+type PendingRequest = { timer: ReturnType<typeof setTimeout>; resolve: (value: unknown) => void; reject: (error: Error) => void; epoch?: string };
 
 export class ProcessSupervisor {
   readonly ownerEpoch = `owner_${randomUUID()}`;
@@ -37,6 +39,8 @@ export class ProcessSupervisor {
   private readonly restartWindowMs: number;
   private readonly ownerLossMs: number;
   private readonly heartbeatMs: number;
+  private readonly ipcTimeoutMs: number;
+  private readonly pending = new Map<string, PendingRequest>();
 
   constructor(private readonly options: SupervisorOptions) {
     this.now = options.now ?? (() => Date.now());
@@ -44,6 +48,7 @@ export class ProcessSupervisor {
     this.restartWindowMs = options.restartWindowMs ?? 60_000;
     this.ownerLossMs = options.ownerLossMs ?? 1_000;
     this.heartbeatMs = options.heartbeatMs ?? 250;
+    this.ipcTimeoutMs = options.ipcTimeoutMs ?? 5_000;
     this.lastHeartbeat = this.now();
   }
 
@@ -65,6 +70,13 @@ export class ProcessSupervisor {
         if (!this.childEpoch) this.childEpoch = message.sessionEpoch;
         else if (message.sessionEpoch !== this.childEpoch) { this.stateValue = 'failed'; child.kill(); return; }
       }
+      if (isResponse(message)) {
+        const waiter = this.pending.get(message.requestId);
+        if (waiter && (!message.sessionEpoch || !this.childEpoch || message.sessionEpoch === this.childEpoch)) {
+          this.pending.delete(message.requestId); clearTimeout(waiter.timer);
+          message.ok ? waiter.resolve(message.result) : waiter.reject(new Error(message.error?.code ?? 'ipc-request-failed'));
+        }
+      }
       this.lastHeartbeat = this.now();
     });
     child.on('exit', () => { this.child = undefined; if (this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; });
@@ -72,6 +84,20 @@ export class ProcessSupervisor {
     const hello: IpcMessage = { type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch: this.ownerEpoch, bootEpoch: randomUUID(), capabilities: ['control', 'observe'] };
     if (!child.send(hello)) { this.stateValue = 'failed'; throw new Error('supervisor-hello-backpressure'); }
     this.stateValue = 'running';
+  }
+
+  /** Send a control request to the child and await its correlated response. */
+  request<T = unknown>(command: 'status' | 'shutdown' | 'capabilities' | 'observe' | 'start-observer' | 'stop-observer', payload: unknown = {}): Promise<T> {
+    const child = this.child;
+    if (!child) return Promise.reject(new Error('supervisor-no-child'));
+    const requestId = `sup_${randomUUID()}`;
+    const sessionEpoch = this.childEpoch ?? this.ownerEpoch;
+    const message = { type: 'request', protocolVersion: 1, requestId, sessionEpoch, command, payload, timeoutMs: this.ipcTimeoutMs } satisfies IpcMessage;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error('ipc-timeout')); }, this.ipcTimeoutMs);
+      this.pending.set(requestId, { timer, resolve: value => resolve(value as T), reject });
+      if (!child.send(message)) { clearTimeout(timer); this.pending.delete(requestId); reject(new Error('ipc-backpressure')); }
+    });
   }
 
   /** Called on each heartbeat. Returns whether the owner link is still alive. */
@@ -113,6 +139,7 @@ export class ProcessSupervisor {
     const child = this.child;
     this.child = undefined;
     this.childEpoch = undefined;
+    for (const [id, waiter] of this.pending) { clearTimeout(waiter.timer); waiter.reject(new Error('ipc-disconnected')); this.pending.delete(id); }
     if (!child) return;
     try { child.send({ type: 'request', protocolVersion: 1, requestId: `stop-${reason}`, sessionEpoch: this.ownerEpoch, command: 'shutdown', payload: {}, timeoutMs: 1_000 } satisfies IpcMessage); } catch { /* best effort */ }
     try { child.kill(); } catch { /* best effort */ }
@@ -121,4 +148,8 @@ export class ProcessSupervisor {
 
 function isHello(value: unknown): value is { type: 'hello'; sessionEpoch: string } {
   return Boolean(value) && typeof value === 'object' && (value as { type?: unknown }).type === 'hello' && typeof (value as { sessionEpoch?: unknown }).sessionEpoch === 'string';
+}
+
+function isResponse(value: unknown): value is { type: 'response'; requestId: string; sessionEpoch?: string; ok: boolean; result?: unknown; error?: { code?: string } } {
+  return Boolean(value) && typeof value === 'object' && (value as { type?: unknown }).type === 'response' && typeof (value as { requestId?: unknown }).requestId === 'string' && typeof (value as { ok?: unknown }).ok === 'boolean';
 }
