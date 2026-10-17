@@ -43,8 +43,8 @@ Current HEAD after this pass: `279fd8d` (plus documentation commits).
 npm run typecheck            pass
 npm run build                pass
 npm run build:web            pass
-npm run test:offline         21 files / 94 tests pass
-npm run test:v:offline       integration + soak + trace pass
+npm run test:offline         24 files / 106 tests pass
+npm run test:v:offline       integration (incl. forked relay child) + soak + trace pass
 npm run demo:offline         6 scenarios pass
 npm run doctor -- --profile simulated   pass
 npm run bridge:protocol -- --config configs/simulated.json   pass (fixture, loopback)
@@ -57,7 +57,7 @@ Loopback smoke: `serve` served the built UI (200 text/html), `/api/v1/status` re
 
 - Minecraft codec remains the legacy 1.20.4/765 fixture. The 26.3 adapter is candidate metadata only; no live 26.3 packet decoding is claimed.
 - Raw relay verified on loopback sockets only; no real upstream connection.
-- No child-process Supervisor; IPC endpoint exists but process orchestration is not implemented.
+- A child-process Supervisor manages the relay child (owner epoch, 3-per-60s restart budget, owner-loss revoke); it does not manage or auto-restart a game process. Observer runs in a worker_threads host.
 - `collect_nearby` and `gather_blocks` intentionally fail closed (no capability).
 - No Playwright browser E2E; the web build and same-origin serving are verified but not driven by a browser.
 - Node 22 CI is configured (Linux verify + Windows helper static parse) but has not been observed passing on GitHub.

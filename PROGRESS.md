@@ -15,7 +15,7 @@ Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Sta
 | B03 bounded observer | implemented-offline (partial) | `src/bridge/observer/bounded.ts` async bounded queue, per-frame offsets, sticky unknown; no compression/typed worker | `tests/unit/bounded-observer.test.ts` (5 tests) |
 | B04 domain adapters | implemented-offline (partial) | `src/bridge/protocol/domain.ts` position/chat/registry projection with explicit unknown for unmapped packets; 26.3 complete packet families not available | `tests/unit/domain-projection.test.ts` |
 | B05 Windows helper/driver | implemented-unverified (Linux) | `src/bridge/windows/driver.ts`, PowerShell helper; no real SendInput run | `tests/unit/windows-driver.test.ts` |
-| B06 IPC/Supervisor | partial | `src/bridge/ipc/protocol.ts` + `endpoint.ts` with session-epoch fencing; no child-process Supervisor | `tests/unit/ipc-endpoint.test.ts` |
+| B06 IPC/Supervisor | implemented-offline | `src/bridge/ipc/*` session-epoch fencing; `src/bridge/supervisor.ts` owner epoch/restart budget/owner-loss; `src/bridge/relay/entry.ts` + `spawn.ts` fork IPC; `src/bridge/observer/host.ts` worker_threads observer | `tests/unit/ipc-endpoint.test.ts`, `supervisor.test.ts`, `observer-host.test.ts`, `tests/integration/relay-child.test.ts` |
 | U01 shared ControlService | implemented-offline | `src/control/service.ts`, `serve`/`attach` CLI | `tests/unit/control-service.test.ts` |
 | U02 HTTP/SSE | implemented-offline | `src/server/index.ts`, JSON API, SSE snapshot+cursor, bounds, same-origin static hosting | `tests/integration/server.test.ts` |
 | U03 React control UI | implemented-offline | `web/` Vite+React console with the blue-white design tokens, truthful states, command forms, SSE feed | `npm run test:web`, `npm run build:web`, loopback smoke |
@@ -35,6 +35,6 @@ Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Sta
 
 - The Minecraft codec path is the legacy 1.20.4/765 fixture; the 26.3 adapter is candidate metadata only. No live 26.3 interoperability is claimed.
 - The raw relay is verified on loopback sockets only; no real server was contacted.
-- The React web UI is implemented and served same-origin; browser Playwright E2E, a child-process Supervisor and full 26.3 domain normalizers are not implemented.
+- The React web UI is implemented and served same-origin; browser Playwright E2E and full 26.3 domain normalizers remain not implemented.
 - Six of the eleven skills are registered but intentionally return unavailable without the corresponding capability.
 - Real Windows input/capture, paid model APIs, Node 22 execution and real Minecraft are unverified.
