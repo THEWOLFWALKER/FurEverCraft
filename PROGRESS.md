@@ -13,7 +13,7 @@ Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Sta
 | B01 26.3 version profile | implemented-offline (candidate) | `src/bridge/version-profile.ts` 26.3/777/5023 candidate; codec remains legacy 1.20.4 fixture (not live) | `tests/unit/version-profile.test.ts` |
 | B02 raw TCP relay | implemented-offline | `src/bridge/relay/raw.ts` byte relay, handshake rewrite with nextState validation, backpressure, half-close, bounded flush | `tests/unit/raw-relay.test.ts` (7 tests) |
 | B03 bounded observer | implemented-offline (partial) | `src/bridge/observer/bounded.ts` async bounded queue, per-frame offsets, sticky unknown; no compression/typed worker | `tests/unit/bounded-observer.test.ts` (5 tests) |
-| B04 domain adapters | not-implemented | — | — |
+| B04 domain adapters | implemented-offline (partial) | `src/bridge/protocol/domain.ts` position/chat/registry projection with explicit unknown for unmapped packets; 26.3 complete packet families not available | `tests/unit/domain-projection.test.ts` |
 | B05 Windows helper/driver | implemented-unverified (Linux) | `src/bridge/windows/driver.ts`, PowerShell helper; no real SendInput run | `tests/unit/windows-driver.test.ts` |
 | B06 IPC/Supervisor | partial | `src/bridge/ipc/protocol.ts` + `endpoint.ts` with session-epoch fencing; no child-process Supervisor | `tests/unit/ipc-endpoint.test.ts` |
 | U01 shared ControlService | implemented-offline | `src/control/service.ts`, `serve`/`attach` CLI | `tests/unit/control-service.test.ts` |
