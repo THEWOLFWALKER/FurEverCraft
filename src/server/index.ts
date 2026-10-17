@@ -156,6 +156,8 @@ function startEvents(control: Control, request: IncomingMessage, response: Serve
     bytes += Buffer.byteLength(frame);
     response.write(frame);
   }, options.heartbeatMs);
+  // The snapshot/replay may have already closed the stream; never keep timers for a finished stream.
+  if (closed) { if (poll) clearInterval(poll); if (heartbeat) clearInterval(heartbeat); poll = undefined; heartbeat = undefined; }
   request.on('aborted', finish);
   request.on('close', finish);
   response.on('close', finish);

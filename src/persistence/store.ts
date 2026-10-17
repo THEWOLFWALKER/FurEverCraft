@@ -25,8 +25,8 @@ const canonical = (value: unknown): unknown => Array.isArray(value)
     : value;
 const sameJson = (left: unknown, right: unknown) => JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
 const effectStatuses = ['prepared', 'may-have-dispatched', 'verifying', 'confirmed', 'partial', 'ambiguous'] as const;
-const receiptStatuses = ['pending', 'completed', 'unknown', 'sent', 'ambiguous'] as const;
-const receiptTerminal = new Set(['completed', 'unknown', 'sent', 'ambiguous']);
+const receiptStatuses = ['pending', 'completed', 'unknown', 'sent', 'ambiguous', 'conflict', 'rejected'] as const;
+const receiptTerminal = new Set(['completed', 'unknown', 'sent', 'ambiguous', 'conflict', 'rejected']);
 const effectRank: Record<string, number> = { prepared: 0, 'may-have-dispatched': 1, verifying: 2, ambiguous: 3, partial: 4, confirmed: 5 };
 
 export class SQLiteStore {

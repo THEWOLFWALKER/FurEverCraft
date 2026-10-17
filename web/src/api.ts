@@ -47,9 +47,14 @@ export function subscribeEvents(onEvent: (event: EventRecord) => void, onState: 
       try { onEvent({ seq: message.lastEventId, eventId: message.lastEventId, kind: message.type, payload: JSON.parse(message.data) }); } catch { /* ignore malformed */ }
     }
   };
-  source.addEventListener('message', push as EventListener);
-  for (const kind of ['control.goal.set', 'control.goal.revise', 'control.chat', 'control.pause', 'control.resume', 'control.stop', 'control.cancel', 'control.save', 'runtime.pausing', 'runtime.stopping', 'runtime.recovered', 'tool.start_skill', 'tool.send_chat']) {
-    source.addEventListener(kind, push as EventListener);
-  }
+  // Any named SSE event carries a kind; listen broadly via a catch-all dispatch on the source
+  // using the EventSource message handler plus the known event names used by the control surface.
+  source.onmessage = push as (message: MessageEvent) => void;
+  for (const kind of [
+    'control.goal.set', 'control.goal.revise', 'control.message', 'control.chat', 'control.pause', 'control.resume',
+    'control.stop', 'control.cancel', 'control.save', 'control.quit',
+    'runtime.pausing', 'runtime.stopping', 'runtime.shutdown-requested', 'runtime.recovered', 'runtime.recovery_failed',
+    'tool.start_skill', 'tool.send_chat', 'tool.cancel_execution',
+  ]) source.addEventListener(kind, push as EventListener);
   return () => source.close();
 }

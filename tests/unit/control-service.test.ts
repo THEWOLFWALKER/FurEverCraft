@@ -43,6 +43,18 @@ describe('U01 ControlService', () => {
     } finally { runtime.close(); }
   });
 
+  it('replays a conflict as conflict, never as terminal success', async () => {
+    const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
+    try {
+      await runtime.control.command({ requestId: 'g', command: 'goal.set', payload: { goalId: 'g1', text: 'one' } });
+      const conflict = await runtime.control.command({ requestId: 'c', command: 'goal.revise', payload: { goalId: 'g1', expectedRevision: 0, change: 'two' } });
+      expect(conflict.state).toBe('conflict');
+      const replay = await runtime.control.command({ requestId: 'c', command: 'goal.revise', payload: { goalId: 'g1', expectedRevision: 0, change: 'two' } });
+      expect(replay.state).toBe('conflict');
+      expect(replay.state).not.toBe('terminal');
+    } finally { runtime.close(); }
+  });
+
   it('stop cancels non-terminal executions instead of only flagging', async () => {
     const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
     try {

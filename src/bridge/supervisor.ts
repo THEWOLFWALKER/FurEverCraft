@@ -65,6 +65,7 @@ export class ProcessSupervisor {
     const child = this.options.spawn();
     this.child = child;
     child.on('message', message => {
+      if (this.child !== child) return;
       if (isHello(message)) {
         // Adopt the first hello as the child's session identity; an in-flight identity
         // change means ownership was taken over and must not be adopted silently.
@@ -82,8 +83,8 @@ export class ProcessSupervisor {
       }
       this.lastHeartbeat = this.now();
     });
-    child.on('exit', () => { this.child = undefined; if (this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; });
-    child.on('error', () => { if (this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; });
+    child.on('exit', () => { if (this.child === child) { this.child = undefined; if (this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; } });
+    child.on('error', () => { if (this.child === child && this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; });
     const hello: IpcMessage = { type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch: this.ownerEpoch, bootEpoch: randomUUID(), capabilities: ['control', 'observe'] };
     if (!child.send(hello)) { this.stateValue = 'failed'; throw new Error('supervisor-hello-backpressure'); }
     this.stateValue = 'running';
@@ -104,6 +105,8 @@ export class ProcessSupervisor {
   request<T = unknown>(command: 'status' | 'shutdown' | 'capabilities' | 'observe' | 'start-observer' | 'stop-observer', payload: unknown = {}): Promise<T> {
     const child = this.child;
     if (!child) return Promise.reject(new Error('supervisor-no-child'));
+    // Owner loss revokes control: a paused/failed supervisor must not keep driving the child.
+    if (this.stateValue !== 'running') return Promise.reject(new Error(`supervisor-not-running:${this.stateValue}`));
     const requestId = `sup_${randomUUID()}`;
     const sessionEpoch = this.childEpoch ?? this.ownerEpoch;
     const message = { type: 'request', protocolVersion: 1, requestId, sessionEpoch, command, payload, timeoutMs: this.ipcTimeoutMs } satisfies IpcMessage;
@@ -126,6 +129,7 @@ export class ProcessSupervisor {
     if (this.stateValue !== 'running') return { ownerLost: false, revoked: false };
     if (now - this.lastHeartbeat <= this.ownerLossMs) return { ownerLost: false, revoked: false };
     this.stateValue = 'paused';
+    void this.stopChild('owner-loss');
     return { ownerLost: true, revoked: true, reason: 'owner-heartbeat-expired' };
   }
 

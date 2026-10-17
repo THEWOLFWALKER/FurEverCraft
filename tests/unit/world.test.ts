@@ -27,6 +27,17 @@ describe('W03 world state and fake bridge contracts', () => {
     const full = state.apply(observation(bridge, '9', 0, 'full'));
     expect(full.gap).toBe(false); expect(full.cells['1,1']).toBe('free');
   });
+  it('does not lose previously known cells when a gapped delta omits them', () => {
+    const bridge = new FakeClientBridge(); const state = new WorldState(context);
+    state.apply(observation(bridge, '1', 0, 'full'));
+    bridge.block(3, 3);
+    const full = state.apply(observation(bridge, '2', 0, 'full'));
+    expect(full.cells['3,3']).toBe('blocked');
+    const gapped = state.apply({ ...observation(bridge, '5'), gap: true, cells: { '9,9': 'free' } });
+    expect(gapped.cells['3,3']).toBe('unknown');
+    expect(gapped.cells['9,9']).toBe('unknown');
+  });
+
   it('injects delayed, failed, dropped, disconnected and ambiguous effects', () => {
     let delayed = 0; const bridge = new FakeClientBridge(12, { delay: ms => { delayed += ms; }, faults: { walk:{fault:'delay',delayMs:7}, place:{fault:'ambiguous'} } });
     bridge.walk(1,0); expect(delayed).toBe(7);

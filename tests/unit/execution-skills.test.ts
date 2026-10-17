@@ -28,7 +28,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
     expect(second.owner).toBe('b');
   });
 
-  it('runs five skills with progress, cancellation, and verification outcomes', () => {
+  it('runs five skills with progress, cancellation, and verification outcomes', async () => {
     const bridge = new FakeClientBridge();
     const progress: string[] = [];
     const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: (p: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number }) => progress.push(p.stage) };
@@ -36,10 +36,10 @@ describe('W05/W06 execution lifecycle and skills', () => {
     expect(observeUi(ctx).outcome).toBe('confirmed');
     expect(sendChat(ctx, 'hello').outcome).toBe('confirmed');
     expect(placeOne({ ...ctx, bridge }, { x: 2, y: 0 }).outcome).toBe('confirmed');
-    expect(waitForCondition(ctx, 25).value).toEqual({ waitedMs: 25 });
+    await expect(Promise.resolve(waitForCondition(ctx, 25))).resolves.toMatchObject({ value: { waitedMs: 25 } });
     expect(progress).toContain('dispatch');
     expect(progress).toContain('verify');
-    expect(waitForCondition({ ...ctx, isCanceled: () => true }, 1).outcome).toBe('canceled');
+    expect((await Promise.resolve(waitForCondition({ ...ctx, isCanceled: () => true }, 1))).outcome).toBe('canceled');
     expect(bridge.inventory).toBe(7);
     expect(bridge.cell(2, 0)).toBe('blocked');
   });
@@ -82,6 +82,17 @@ describe('W05/W06 execution lifecycle and skills', () => {
     expect(returnToPlace(ctx, 'home').outcome).toBe('confirmed');
     expect(bridge.position).toEqual({ x: 2, y: 0 });
     expect(returnToPlace(ctx, 'missing').reason).toContain('unknown-place');
+  });
+
+  it('does not complete wait_for_condition before the clock deadline', async () => {
+    const clock = new ManualClock();
+    const ctx = { bridge: new FakeClientBridge(), lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: () => {}, clock };
+    const pending = Promise.resolve(waitForCondition(ctx, 100));
+    let settled = false; void pending.then(() => { settled = true; });
+    await new Promise(r => setTimeout(r, 10));
+    expect(settled).toBe(false);
+    clock.advance(100);
+    await expect(pending).resolves.toMatchObject({ ok: true, outcome: 'confirmed' });
   });
 
   it('watchdog marks an abandoned execution failed', async () => {

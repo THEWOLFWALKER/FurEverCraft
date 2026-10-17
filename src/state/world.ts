@@ -27,7 +27,10 @@ export class WorldState {
     const missing=!newEpoch&&!isFull&&seq>this.lastSequence+1n;
     // A gap is sticky: only an explicit full baseline clears it. Until then new deltas are not trusted.
     const mustGap=isFull ? false : (this.gap || missing || o.gap);
-    const cells:Record<string,Cell> = mustGap ? Object.fromEntries(Object.keys(o.cells).map(k=>[k,'unknown' as Cell])) : o.cells;
+    // Preserve the previous baseline's cell keys (now unknown) so known cells are not silently lost.
+    const cells:Record<string,Cell> = mustGap
+      ? { ...Object.fromEntries(Object.keys(this.current?.cells ?? {}).map(k=>[k,'unknown' as Cell])), ...Object.fromEntries(Object.keys(o.cells).map(k=>[k,'unknown' as Cell])) }
+      : o.cells;
     this.epoch=epoch; this.lastSequence=seq; this.revision++;
     this.gap=mustGap;
     if(!isFull && this.gap && !missing && !o.gap) { /* keep existing invalidated baseline */ }

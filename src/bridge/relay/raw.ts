@@ -36,7 +36,10 @@ class Session implements RelaySession {
     if(!handshakeDone) handshakeTimer=setTimeout(()=>void this.close('handshake-timeout'),this.config.handshakeTimeoutMs);
     const clientDir:RelayDirection='client-to-server'; const serverDir:RelayDirection='server-to-client';
     const stalled:Record<RelayDirection,ReturnType<typeof setTimeout>|undefined>={[clientDir]:undefined,[serverDir]:undefined};
-    let endsRemaining=2;
+    // Each socket contributes exactly one terminal event: an 'end' followed by 'close' on the
+    // same socket must not be counted twice, or the peer's reply could be destroyed early.
+    const accounted=new Set<Socket>();
+    const settle=(socket:Socket)=>{ if(accounted.has(socket))return false; accounted.add(socket); return true; };
     const forward=(dest:Socket,source:Socket,chunk:Buffer,dir:RelayDirection)=>{
       const queued=dest.writableLength; if(queued+chunk.length>this.config.budgets.hardLimitBytes){ void this.close(`${dir}-hard-limit`); return; }
       this.stats.forwardedBytes[dir]+=chunk.length;
@@ -49,8 +52,8 @@ class Session implements RelaySession {
       source.on('data',(chunk:Buffer)=>{ if(this.closed)return; if(source===this.client&&!handshakeDone){ first=Buffer.concat([first,chunk]); if(first.length>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); const parsed=readVarInt(first); if(!parsed||first.length<parsed.size+parsed.value)return; const frame=first.subarray(0,parsed.size+parsed.value); first=first.subarray(frame.length); try { const out=rewriteHandshake(frame,this.config.targetHost,this.config.targetPort,this.config.allowedNextStates); handshakeDone=true; if(handshakeTimer)clearTimeout(handshakeTimer); handshakeTimer=undefined; this.state='forwarding'; this.stats.state='forwarding'; forward(dest,source,out,dir); if(first.length){ forward(dest,source,first,dir); first=Buffer.alloc(0); } } catch { void this.close('handshake-rewrite-failed'); } return; }
         forward(dest,source,chunk,dir); });
       dest.on('drain',onDrain(source,dir));
-      source.on('end',()=>{ if(this.closed)return; endsRemaining-=1; if(this.state==='forwarding'){this.state='half-closed';this.stats.state='half-closed';} dest.end(); if(endsRemaining<=0) void this.close('closed'); });
-      source.on('close',()=>{ if(this.closed)return; endsRemaining-=1; if(endsRemaining<=0) void this.close('closed'); });
+      source.on('end',()=>{ if(this.closed)return; if(!settle(source))return; if(this.state==='forwarding'){this.state='half-closed';this.stats.state='half-closed';} dest.end(); if(accounted.size>=2) void this.close('closed'); });
+      source.on('close',()=>{ if(this.closed)return; if(!settle(source))return; if(accounted.size>=2) void this.close('closed'); });
       source.on('error',()=>void this.close(`${dir}-source-error`)); dest.on('error',()=>void this.close(`${dir}-destination-error`));
     }
   }
@@ -68,7 +71,11 @@ class Session implements RelaySession {
       let pending=0; let done=false;
       const finish=()=>{ if(done)return; done=true; resolve(); };
       const timer=setTimeout(()=>{ if(!done){ this.stats.undeliveredBytes={ 'client-to-server':this.server.writableLength, 'server-to-client':this.client.writableLength }; finish(); } },this.config.budgets.closeFlushMs);
-      for(const s of clients){ if(s.writableLength>0){ pending+=1; s.once('drain',()=>{ pending-=1; if(pending<=0){ clearTimeout(timer); finish(); } }); } }
+      for(const s of clients){
+        if(s.writableLength>0){ pending+=1; s.once('drain',()=>{ pending-=1; if(pending<=0){ clearTimeout(timer); finish(); } }); }
+        // End the writable side so pending bytes can be flushed and 'drain' can fire.
+        if(!s.writableEnded) s.end();
+      }
       if(pending===0){ clearTimeout(timer); finish(); }
     });
   }
@@ -79,9 +86,9 @@ export function createRawTcpRelay(config:RelayConfig):RawTcpRelay {
   const sessions=new Set<Session>(); const listeners=new Set<(s:RelaySession)=>void>(); let server:net.Server|undefined; let stopping=false;
   let address:AddressInfo={address:config.listenHost??'127.0.0.1',family:'IPv4',port:config.listenPort}; const budgets=mergeBudgets(config.budgets);
   const allowedNextStates=new Set(config.allowedNextStates??[...validNextStates]);
-  const api:RawTcpRelay={get address(){return address;},async start(){if(server)return;stopping=false;const created=net.createServer(client=>{ if(stopping){client.destroy();return;} const upstream=net.createConnection({host:config.targetHost,port:config.targetPort});const session=new Session(client,upstream,{targetHost:config.targetHost,targetPort:config.targetPort,rewriteHandshake:config.rewriteHandshake??false,handshakeLimitBytes:config.handshakeLimitBytes??8192,handshakeTimeoutMs:config.handshakeTimeoutMs??5000,allowedNextStates,budgets},()=>sessions.delete(session));sessions.add(session);listeners.forEach(l=>l(session));});
+  const api:RawTcpRelay={get address(){return address;},async start(){if(server)return;stopping=false;const created=net.createServer({allowHalfOpen:true},client=>{ if(stopping){client.destroy();return;} const upstream=net.createConnection({host:config.targetHost,port:config.targetPort,allowHalfOpen:true});const session=new Session(client,upstream,{targetHost:config.targetHost,targetPort:config.targetPort,rewriteHandshake:config.rewriteHandshake??false,handshakeLimitBytes:config.handshakeLimitBytes??8192,handshakeTimeoutMs:config.handshakeTimeoutMs??5000,allowedNextStates,budgets},()=>sessions.delete(session));sessions.add(session);listeners.forEach(l=>l(session));});
     await new Promise<void>((resolve,reject)=>{ created.once('error',reject); created.listen(config.listenPort,config.listenHost??'127.0.0.1',()=>{address=created.address() as AddressInfo;resolve();}); }).then(()=>{server=created;},error=>{created.close();throw error;});},
-    async stop(){ stopping=true; if(server){ const closing=server; server=undefined; await new Promise<void>(resolve=>closing.close(()=>resolve())); } await Promise.all([...sessions].map(s=>s.close('relay-stop'))); },
+    async stop(){ stopping=true; const active=[...sessions].map(s=>s.close('relay-stop')); if(server){ const closing=server; server=undefined; await new Promise<void>(resolve=>closing.close(()=>resolve())); } await Promise.all(active); },
     sessions:()=>[...sessions],onSession(listener){listeners.add(listener);return()=>listeners.delete(listener);}};
   return api;
 }

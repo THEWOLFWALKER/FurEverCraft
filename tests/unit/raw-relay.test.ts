@@ -55,4 +55,22 @@ describe('raw TCP relay fixture',()=>{
   await expect(relay.start()).rejects.toThrow();await new Promise<void>(r=>blocker.close(()=>r()));await relay.start();expect(relay.address.port).toBe(busyPort);
   await relay.stop();await new Promise<void>(r=>upstream.close(()=>r()));
  });
+ it('delivers the upstream reply after a client half-close',async()=>{
+  const sockets=new Set<net.Socket>();
+  const upstream=net.createServer({allowHalfOpen:true},s=>{sockets.add(s);s.on('close',()=>sockets.delete(s));s.on('data',()=>setTimeout(()=>s.write('reply'),10));});await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',()=>r()));
+  const relay=createRawTcpRelay({listenPort:0,targetHost:'127.0.0.1',targetPort:(upstream.address() as net.AddressInfo).port,allowMinecraftUpstream:true});await relay.start();
+  const client=await peer(relay.address.port);const chunks:Buffer[]=[];client.on('data',c=>chunks.push(Buffer.from(c)));
+  client.write(Buffer.from('status'));client.end();await new Promise(r=>setTimeout(r,120));
+  expect(Buffer.concat(chunks).toString()).toBe('reply');
+  await relay.stop();for(const s of sockets)s.destroy();await new Promise<void>(r=>upstream.close(()=>r()));
+ });
+ it('stops within a bounded time even with an active connection',async()=>{
+  const sockets=new Set<net.Socket>();
+  const upstream=net.createServer({allowHalfOpen:true},s=>{sockets.add(s);s.on('close',()=>sockets.delete(s));s.on('data',()=>{});});await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',()=>r()));
+  const relay=createRawTcpRelay({listenPort:0,targetHost:'127.0.0.1',targetPort:(upstream.address() as net.AddressInfo).port,allowMinecraftUpstream:true,budgets:{closeFlushMs:100}});await relay.start();
+  const client=await peer(relay.address.port);client.write(Buffer.alloc(64,7));await new Promise(r=>setTimeout(r,20));
+  const started=Date.now();await relay.stop();expect(Date.now()-started).toBeLessThan(2000);
+  expect(relay.sessions()).toHaveLength(0);
+  client.destroy();for(const s of sockets)s.destroy();await new Promise<void>(r=>upstream.close(()=>r()));
+ });
 });

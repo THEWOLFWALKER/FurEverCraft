@@ -48,19 +48,21 @@ export class ControlService {
     const old = this.runtime.store.getActionReceipt(scope, request.requestId);
     if (old) {
       if (old.payloadHash !== payloadHash) return { requestId: request.requestId, command: request.command, state: 'conflict', code: 'command-payload-conflict', payloadHash };
-      return { requestId: request.requestId, command: request.command, state: old.status === 'pending' ? 'accepted' : old.status === 'completed' ? 'terminal' : 'unknown', result: old.result, payloadHash };
+      return { requestId: request.requestId, command: request.command, state: old.status === 'pending' ? 'accepted' : old.status === 'completed' ? 'terminal' : old.status === 'conflict' ? 'conflict' : old.status === 'rejected' ? 'rejected' : 'unknown', result: old.result, payloadHash };
     }
     this.runtime.store.addActionReceipt({ receiptId: request.requestId, scope, commandId: request.requestId, status: 'pending', payloadHash });
     try {
       const result = await this.execute(request);
       const state = result.state;
-      this.runtime.store.updateActionReceipt(scope, request.requestId, state === 'accepted' ? 'pending' : state === 'unknown' ? 'unknown' : 'completed', result.result);
+      // Conflict/rejected are decisions, not terminal success: persisting them as completed would replay a false terminal.
+      const receiptStatus = state === 'accepted' ? 'pending' : state === 'unknown' ? 'unknown' : state === 'terminal' ? 'completed' : state === 'conflict' ? 'conflict' : 'rejected';
+      this.runtime.store.updateActionReceipt(scope, request.requestId, receiptStatus, result.result);
       this.runtime.session.events.publish(`control.${request.command}`, { requestId: request.requestId, state, result: result.result }, true);
       return { ...result, requestId: request.requestId, command: request.command, payloadHash };
     } catch (error) {
       const code = error instanceof Error ? error.message : String(error);
       const result: CommandResult = { requestId: request.requestId, command: request.command, state: code.startsWith('goal-revision-conflict') ? 'conflict' : 'rejected', code, payloadHash };
-      this.runtime.store.updateActionReceipt(scope, request.requestId, 'completed', result);
+      this.runtime.store.updateActionReceipt(scope, request.requestId, result.state === 'conflict' ? 'conflict' : 'rejected', result);
       return result;
     }
   }

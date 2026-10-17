@@ -48,16 +48,36 @@ export function placeOne(ctx: SkillContext, target: { x: number; y: number }): S
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
 }
 
-export function waitForCondition(ctx: SkillContext, ms: number, wait?: (ms: number) => boolean): SkillResult {
+export function waitForCondition(ctx: SkillContext, ms: number, wait?: (ms: number) => boolean | Promise<boolean>): SkillResult | Promise<SkillResult> {
   if (!Number.isFinite(ms) || ms < 0) return { ok: false, outcome: 'failed', reason: 'invalid-wait' };
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
   ctx.report({ stage: 'dispatch', completed: 0, total: ms });
-  if (wait ? !wait(ms) : ctx.clock ? !waitWithClock(ctx.clock, ms, () => !canceled(ctx)) : false) return { ok: false, outcome: 'failed', reason: 'condition-not-met' };
+  // With an injected clock the wait must span the requested deadline; resolve it asynchronously
+  // instead of pretending the condition was met immediately.
+  if (!wait && ctx.clock) {
+    return new Promise<SkillResult>(resolve => {
+      const timer = ctx.clock!.schedule(ctx.clock!.now() + ms, () => {
+        if (canceled(ctx)) { resolve({ ok: false, outcome: 'canceled' }); return; }
+        ctx.report({ stage: 'verify', completed: ms, total: ms });
+        resolve({ ok: true, outcome: 'confirmed', value: { waitedMs: ms } });
+      });
+      void timer;
+    });
+  }
+  const met = wait ? wait(ms) : true;
+  if (met instanceof Promise) {
+    return met.then(result => result
+      ? finishWait(ctx, ms)
+      : ({ ok: false, outcome: 'failed', reason: 'condition-not-met' } as SkillResult));
+  }
+  if (!met) return { ok: false, outcome: 'failed', reason: 'condition-not-met' };
+  return finishWait(ctx, ms);
+}
+function finishWait(ctx: SkillContext, ms: number): SkillResult {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
   ctx.report({ stage: 'verify', completed: ms, total: ms });
   return { ok: true, outcome: 'confirmed', value: { waitedMs: ms } };
 }
-function waitWithClock(clock: import('../contracts/index.js').Clock, ms: number, valid: () => boolean) { if (!valid()) return false; clock.schedule(clock.now() + ms, () => undefined); return true; }
 
 export function lookAt(ctx: SkillContext, target: { x: number; y: number }): SkillResult {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
