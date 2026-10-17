@@ -1,5 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { extname, join, normalize, resolve } from 'node:path';
 import type { RuntimeAssembly } from '../execution/factory.js';
 import type { ControlService } from '../control/service.js';
 import { redact } from '../diagnostics/redaction.js';
@@ -15,7 +17,24 @@ export type ControlServerOptions = {
   bearerToken?: string;
   csrfToken?: string;
   allowedOrigin?: string;
+  /** Directory of the built same-origin control UI. Defaults to dist/web. */
+  webRoot?: string;
 };
+
+const contentTypes: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
+function serveStatic(response: ServerResponse, webRoot: string, pathname: string): boolean {
+  if (!existsSync(webRoot)) return false;
+  const root = resolve(webRoot);
+  const relative = normalize(decodeURIComponent(pathname)).replace(/^(\.\.[/\\])+/, '');
+  let file = resolve(join(root, relative));
+  if (!file.startsWith(root)) return false;
+  if (!existsSync(file) || !statSync(file).isFile()) file = join(root, 'index.html');
+  if (!existsSync(file)) return false;
+  const body = readFileSync(file);
+  response.writeHead(200, { 'content-type': contentTypes[extname(file)] ?? 'application/octet-stream', 'content-length': String(body.length), 'cache-control': 'no-cache' });
+  response.end(body);
+  return true;
+}
 
 export type ControlServer = Server;
 type Control = Pick<ControlService, 'status' | 'capabilities' | 'goals' | 'executions' | 'effects' | 'places' | 'events' | 'provider' | 'command'>;
@@ -155,6 +174,7 @@ export function createControlServer(runtimeOrControl: RuntimeOrControl, options:
     bearerToken: options.bearerToken,
     csrfToken: options.csrfToken,
     allowedOrigin: options.allowedOrigin,
+    webRoot: options.webRoot ?? resolve(process.cwd(), 'dist', 'web'),
   };
   const server = createServer(async (request, response) => {
     try {
@@ -169,7 +189,10 @@ export function createControlServer(runtimeOrControl: RuntimeOrControl, options:
       if (request.method === 'GET' && (url.pathname === '/api/v1/events/stream' || url.pathname === '/events')) { startEvents(control, request, response, settings); return; }
       if (request.method === 'GET') {
         const result = routeQuery(control, url.pathname, url, context.runtime);
-        if (result === undefined) { errorResponse(response, 404, 'not-found'); return; }
+        if (result === undefined) {
+          if (!url.pathname.startsWith('/api/') && !url.pathname.startsWith('/events') && serveStatic(response, settings.webRoot, url.pathname)) return;
+          errorResponse(response, 404, 'not-found'); return;
+        }
         send(response, 200, result); return;
       }
       if (request.method === 'POST' && url.pathname === '/api/v1/commands') {

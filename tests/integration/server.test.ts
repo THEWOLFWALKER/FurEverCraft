@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createRuntime } from '../../src/execution/factory.js';
 import { createControlServer } from '../../src/server/index.js';
 
@@ -148,6 +151,30 @@ describe('control server offline integration', () => {
         if (index >= 0) openServers.splice(index, 1);
       }
     } finally {
+      runtime.close();
+    }
+  });
+
+  it('serves the same-origin control UI while keeping unknown API paths closed', async () => {
+    const runtime = createRuntime();
+    const dir = mkdtempSync(join(tmpdir(), 'furevercraft-web-'));
+    writeFileSync(join(dir, 'index.html'), '<!doctype html><title>FurEverCraft Control</title>');
+    try {
+      const server = createControlServer(runtime, { webRoot: dir, heartbeatMs: 60_000, pollMs: 50 });
+      const { baseUrl, close } = await listen(server);
+      try {
+        const root = await fetch(`${baseUrl}/`);
+        expect(root.status).toBe(200);
+        expect(await root.text()).toContain('FurEverCraft Control');
+        const unknownApi = await fetch(`${baseUrl}/api/v1/unknown`);
+        expect(unknownApi.status).toBe(404);
+      } finally {
+        await close();
+        const index = openServers.findIndex(item => item.close === close);
+        if (index >= 0) openServers.splice(index, 1);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
       runtime.close();
     }
   });
