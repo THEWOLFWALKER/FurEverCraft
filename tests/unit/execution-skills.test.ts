@@ -52,4 +52,20 @@ describe('W05/W06 execution lifecycle and skills', () => {
     expect(store.getExecution(execution.executionId)?.reason).toBe('watchdog-timeout');
     store.close();
   });
+
+  it('renews the watchdog and lease while progress is reported', async () => {
+    const store = new SQLiteStore(':memory:');
+    const clock = new ManualClock();
+    const executor = new Executor(new FakeClientBridge(), store, undefined, { clock, watchdogTtl: 5, leaseTtl: 5 });
+    const execution = await executor.start('g', 'observe_ui', { proposalId: 'long' }, (_lease, report) => {
+      report({ stage: 'dispatch', completed: 1 });
+      clock.advance(4);
+      report({ stage: 'dispatch', completed: 2 });
+      clock.advance(4);
+      report({ stage: 'dispatch', completed: 3 });
+    });
+    expect(execution.status).toBe('succeeded');
+    expect(store.getExecution(execution.executionId)?.status).toBe('succeeded');
+    store.close();
+  });
 });

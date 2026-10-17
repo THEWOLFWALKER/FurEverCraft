@@ -92,17 +92,23 @@ export class Executor {
     catch (error) { execution.status = 'failed'; execution.reason = error instanceof Error ? error.message : String(error); this.store.saveExecution(execution); return execution; }
     const active: { lease: Lease; watchdog?: string; canceled: boolean; controller: AbortController; token: symbol } = { lease, canceled: false, controller: new AbortController(), token: Symbol(execution.executionId) };
     this.active.set(execution.executionId, active);
+    const armWatchdog = () => {
+      if (active.watchdog) this.clock.cancel(active.watchdog);
+      active.watchdog = this.clock.schedule(this.clock.now() + this.watchdogTtl, () => {
+        if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; execution.status = 'failed'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); }
+      });
+    };
     const report = (p: Omit<Progress, 'at'>) => {
       this.assertLive(execution.executionId);
       const progress = { ...p, at: this.clock.now() };
       this.progressByExecution.set(execution.executionId, progress);
       this.store.saveExecution({ ...execution, checkpoint: progress });
+      // Progress renews the lease and resets the no-progress watchdog; long-running work is not failed for being slow.
+      this.arbiter.renew(lease.leaseId, execution.executionId, this.leaseTtl);
+      armWatchdog();
     };
     try {
       execution.status = 'running'; this.store.saveExecution(execution); report({ stage: 'prepare', completed: 0 });
-      active.watchdog = this.clock.schedule(this.clock.now() + this.watchdogTtl, () => {
-        if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; execution.status = 'failed'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); }
-      });
       const skillResult = await fn(lease, report, active.controller.signal);
       if (skillResult && typeof skillResult === 'object' && 'outcome' in skillResult) {
         const outcome = String((skillResult as { outcome: string }).outcome);
