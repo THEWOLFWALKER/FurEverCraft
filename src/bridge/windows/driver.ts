@@ -124,5 +124,5 @@ export class WindowsHelperDriver {
   captureWindow() { if (!this.enabled) throw new Error('os-input-disabled'); if (!this.bound) throw new Error('window-not-bound'); return this.command('captureWindow'); }
   releaseOwnedInputs() { return this.command('releaseOwnedInputs'); }
   async heartbeat() { this.lastReleaseAt = this.now(); return this.command('heartbeat'); }
-  async shutdown() { this.stopWatchdog(); if (this.enabled && this.bound) await this.releaseOwnedInputs(); this.bound = false; this.boundIdentity = undefined; this.state = undefined; await this.command('shutdown'); await this.transport.close(); }
+  async shutdown() { this.stopWatchdog(); let releaseError: unknown; try { if (this.enabled && this.bound) await this.releaseOwnedInputs(); } catch (error) { releaseError = error; } finally { this.bound = false; this.boundIdentity = undefined; this.state = undefined; } try { await this.command('shutdown'); } finally { await this.transport.close(); } if (releaseError) throw releaseError; }
 }

@@ -64,8 +64,9 @@ export class MinecraftBytePacketTransport implements PacketTransport {
   private readonly listeners = new Set<(packet: BridgePacket) => void>();
   private input = Buffer.alloc(0);
   private closed = false;
+  private readonly unsubscribe: () => void;
   constructor(readonly name: string, private readonly byteTransport: ByteTransport, private readonly direction: ProtocolDirection, private readonly phase: () => BridgePhase) {
-    this.byteTransport.onData(chunk => this.consume(Buffer.from(chunk)));
+    this.unsubscribe = this.byteTransport.onData(chunk => this.consume(Buffer.from(chunk)));
   }
   onPacket(listener: (packet: BridgePacket) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   async send(packet: BridgePacket): Promise<void> {
@@ -90,7 +91,7 @@ export class MinecraftBytePacketTransport implements PacketTransport {
       parser.write(body); parser.end();
     }
   }
-  async close() { this.closed = true; await this.byteTransport.close(); }
+  async close() { this.closed = true; this.unsubscribe(); await this.byteTransport.close(); }
 }
 
 export class LoopbackByteTransport implements ByteTransport {
