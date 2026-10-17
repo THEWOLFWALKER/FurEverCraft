@@ -3,11 +3,13 @@ import { nextId } from '../contracts/index.js';
 import type { ModelMessage, ModelProvider, ToolCall } from '../providers/scripted/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
-import { Executor } from '../execution/runtime.js';
+import { Executor, type InputArbiter } from '../execution/runtime.js';
 import { skillImplementations } from '../skills/skills.js';
 import { findSkills } from '../skills/registry.js';
 import type { EventHub } from '../diagnostics/events.js';
 import { redactError } from '../diagnostics/redaction.js';
+import { MemoryService } from '../autonomous/memory.js';
+import { syntheticCapture } from '../autonomous/bounds.js';
 
 export const ToolCallResultSchema = z.object({ callId: z.string(), name: z.string(), ok: z.boolean(), result: z.unknown().optional(), error: z.string().optional() });
 export type ToolDefinition = { name: string; description: string; parameters: unknown };
@@ -24,8 +26,9 @@ export const defaultTools: ToolDefinition[] = [
   { name: 'read_events', description: 'Read diagnostic events from a cursor', parameters: { type: 'object', properties: { cursor: { type: 'string' }, filter: { type: 'string' }, limit: { type: 'integer' } }, additionalProperties: false } },
   { name: 'revise_goal', description: 'CAS update a goal', parameters: { type: 'object', properties: { goalId: { type: 'string' }, expectedRevision: { type: 'integer' }, change: { type: 'string' } }, required: ['goalId', 'expectedRevision', 'change'], additionalProperties: false } },
   { name: 'send_chat', description: 'Send chat text', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false } },
-  { name: 'query_memory', description: 'Query durable places and episodes', parameters: empty },
-  { name: 'query_knowledge', description: 'Query durable places and episodes', parameters: empty },
+  { name: 'query_memory', description: 'Query durable spatial and episodic memory', parameters: { type: 'object', properties: { limit: { type: 'integer' }, cursor: { type: 'string' } }, additionalProperties: false } },
+  { name: 'query_knowledge', description: 'Query versioned knowledge rules', parameters: { type: 'object', properties: { predicate: { type: 'string' }, version: { type: 'integer' }, limit: { type: 'integer' }, cursor: { type: 'string' } }, additionalProperties: false } },
+  { name: 'remember_place', description: 'Remember an observed place', parameters: { type: 'object', properties: { placeId: { type: 'string' }, payload: { type: 'object' } }, required: ['placeId','payload'], additionalProperties: false } },
 ];
 
 const argsByTool: Record<string, z.ZodTypeAny> = {
@@ -37,17 +40,24 @@ const argsByTool: Record<string, z.ZodTypeAny> = {
     z.object({ skill: z.literal('send_chat'), text: z.string().min(1), proposalId: z.string().optional() }).strict(),
     z.object({ skill: z.literal('wait_for_condition'), ms: z.number().int().nonnegative().finite(), proposalId: z.string().optional() }).strict(),
     z.object({ skill: z.literal('observe_ui'), proposalId: z.string().optional() }).strict(),
+    z.object({ skill: z.literal('look_at'), x: z.number().int().finite(), y: z.number().int().finite(), proposalId: z.string().optional() }).strict(),
+    z.object({ skill: z.literal('explore_area'), radius: z.number().int().nonnegative().max(32), proposalId: z.string().optional() }).strict(),
+    z.object({ skill: z.literal('dig_one'), x: z.number().int().finite(), y: z.number().int().finite(), proposalId: z.string().optional() }).strict(),
+    z.object({ skill: z.literal('collect_nearby'), proposalId: z.string().optional() }).strict(),
+    z.object({ skill: z.literal('gather_blocks'), block: z.string().min(1), proposalId: z.string().optional() }).strict(),
+    z.object({ skill: z.literal('return_to_place'), placeId: z.string().min(1), proposalId: z.string().optional() }).strict(),
   ]),
   get_execution: z.object({ executionId: z.string() }), cancel_execution: z.object({ executionId: z.string() }),
   read_events: z.object({ cursor: z.string().optional(), filter: z.string().optional(), limit: z.number().int().positive().max(500).optional() }),
   revise_goal: z.object({ goalId: z.string(), expectedRevision: z.number().int().nonnegative(), change: z.string().min(1) }),
-  send_chat: z.object({ text: z.string().min(1) }), query_memory: z.object({}), query_knowledge: z.object({}),
+  send_chat: z.object({ text: z.string().min(1) }), query_memory: z.object({ limit: z.number().int().positive().max(20).optional(), cursor: z.string().optional() }), query_knowledge: z.object({ predicate: z.string().optional(), version: z.number().int().positive().optional(), limit: z.number().int().positive().max(20).optional(), cursor: z.string().optional() }), remember_place: z.object({ placeId: z.string(), payload: z.record(z.unknown()) }),
 };
 
 export class ToolRouter {
   private readonly executor?: Executor;
-  constructor(private readonly bridge: ClientBridgeCapabilities, private readonly store?: SQLiteStore, private readonly events?: EventHub) {
-    if (store) this.executor = new Executor(bridge, store);
+  private readonly memory?: MemoryService;
+  constructor(private readonly bridge: ClientBridgeCapabilities, private readonly store?: SQLiteStore, private readonly events?: EventHub, executor?: Executor, memory?: MemoryService, private readonly clockNow: () => number = () => Date.now()) {
+    if (store) { this.executor = executor ?? new Executor(bridge, store); this.memory = memory ?? new MemoryService(store); }
   }
   async invoke(call: ToolCall): Promise<z.infer<typeof ToolCallResultSchema>> {
     let raw: unknown;
@@ -61,17 +71,19 @@ export class ToolRouter {
         case 'get_state': result = this.bridge.snapshot(); break;
         case 'get_inventory': result = { count: this.bridge.inventory, source: 'simulated' }; break;
         case 'query_local_world': result = this.bridge.snapshot().cells; break;
-        case 'capture_view': result = { synthetic: true, mimeType: 'image/png', data: 'c2ltdWxhdGVk', captureReason: 'tool-request', sequence: this.bridge.snapshot().revision }; break;
+        case 'capture_view': result = syntheticCapture('tool-request', Date.now(), this.bridge.snapshot().revision); break;
         case 'find_skills': result = findSkills(args.query as string | undefined); break;
         case 'get_execution': result = this.store?.getExecution(String(args.executionId)); break;
         case 'read_events': result = this.events?.read(String(args.cursor ?? '0'), Number(args.limit ?? 100), args.filter as string | undefined); break;
         case 'revise_goal': result = this.store?.reviseGoal(String(args.goalId), Number(args.expectedRevision), String(args.change)); break;
-        case 'query_memory': case 'query_knowledge': result = { places: this.store?.listPlaces() ?? [], episodes: this.store?.listEpisodes() ?? [] }; break;
+        case 'query_memory': result = { spatial: this.memory?.querySpatial(args as any), episodic: this.memory?.queryEpisodic(args as any) }; break;
+        case 'query_knowledge': result = this.memory?.queryKnowledge(args as any); break;
+        case 'remember_place': result = this.memory?.rememberPlace({ placeId: String(args.placeId), context: this.bridge.context, payload: args.payload }); break;
         case 'start_skill': {
           const skill = String(args.skill);
           const implementation = skillImplementations[skill as keyof typeof skillImplementations];
           if (!implementation || !this.executor || !this.store) return { callId: call.id, name: call.name, ok: false, error: 'unsupported-skill' };
-          const executeArgs = skill === 'navigate_to' || skill === 'place_one' ? { x: Number(args.x), y: Number(args.y) } : skill === 'send_chat' ? String(args.text) : skill === 'wait_for_condition' ? Number(args.ms) : undefined;
+          const executeArgs = skill === 'navigate_to' || skill === 'place_one' || skill === 'look_at' || skill === 'dig_one' ? { x: Number(args.x), y: Number(args.y) } : skill === 'send_chat' ? String(args.text) : skill === 'wait_for_condition' ? Number(args.ms) : skill === 'explore_area' ? Number(args.radius) : skill === 'gather_blocks' ? String(args.block) : skill === 'return_to_place' ? String(args.placeId) : undefined;
           const execution = await this.executor.start('agent', skill, args, (lease, report) => (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report, isCanceled: () => false }, executeArgs));
           result = execution;
           if (execution.outcome === 'ambiguous' || execution.status === 'failed' || execution.status === 'canceled') {

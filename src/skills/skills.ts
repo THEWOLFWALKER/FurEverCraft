@@ -59,4 +59,25 @@ export function waitForCondition(ctx: SkillContext, ms: number, wait?: (ms: numb
 }
 function waitWithClock(clock: import('../contracts/index.js').Clock, ms: number, valid: () => boolean) { if (!valid()) return false; clock.schedule(clock.now() + ms, () => undefined); return true; }
 
-export const skillImplementations = { navigate_to: navigateTo, observe_ui: observeUi, send_chat: sendChat, place_one: placeOne, wait_for_condition: waitForCondition } as const;
+export function lookAt(ctx: SkillContext, target: { x: number; y: number }): SkillResult {
+  if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  ctx.report({ stage: 'dispatch', completed: 0, total: 1 });
+  return { ok: false, outcome: 'failed', reason: `orientation-unavailable:${target.x},${target.y}` };
+}
+export function exploreArea(ctx: SkillContext, radius: number): SkillResult {
+  if (!Number.isInteger(radius) || radius < 0 || radius > 32) return { ok: false, outcome: 'failed', reason: 'invalid-radius' };
+  if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  const snapshot = ctx.bridge.snapshot();
+  ctx.report({ stage: 'dispatch', completed: 1, total: 1, message: 'observed-local-area' });
+  return { ok: true, outcome: 'confirmed', value: { radius, position: snapshot.position, observed: Object.keys(snapshot.cells).length, source: snapshot.source } };
+}
+export function digOne(ctx: SkillContext, target: { x: number; y: number }): SkillResult {
+  if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  if (ctx.bridge.cell(target.x, target.y) !== 'blocked') return { ok: false, outcome: 'failed', reason: 'target-not-observed-blocked' };
+  return { ok: false, outcome: 'failed', reason: 'dig-capability-unavailable' };
+}
+export function collectNearby(ctx: SkillContext): SkillResult { return canceled(ctx) ? { ok: false, outcome: 'canceled' } : { ok: false, outcome: 'failed', reason: 'collection-capability-unavailable' }; }
+export function gatherBlocks(ctx: SkillContext, block: string): SkillResult { return !block ? { ok: false, outcome: 'failed', reason: 'block-required' } : { ok: false, outcome: 'failed', reason: 'gather-capability-unavailable' }; }
+export function returnToPlace(ctx: SkillContext, placeId: string): SkillResult { return !placeId ? { ok: false, outcome: 'failed', reason: 'place-required' } : { ok: false, outcome: 'failed', reason: 'place-navigation-capability-unavailable' }; }
+
+export const skillImplementations = { navigate_to: navigateTo, observe_ui: observeUi, send_chat: sendChat, place_one: placeOne, wait_for_condition: waitForCondition, look_at: lookAt, explore_area: exploreArea, dig_one: digOne, collect_nearby: collectNearby, gather_blocks: gatherBlocks, return_to_place: returnToPlace } as const;

@@ -1,4 +1,4 @@
-import type { FakeClientBridge } from '../bridge/fake/index.js';
+import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { BodyContext } from '../contracts/index.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { EventHub } from '../diagnostics/events.js';
@@ -18,7 +18,7 @@ export class SessionRuntime {
   readonly ownerId: string;
   private started = false;
   private _state: SessionState = 'idle';
-  constructor(readonly bridge: FakeClientBridge, readonly store: SQLiteStore, options?: { eventCapacity?: number }) {
+  constructor(readonly bridge: ClientBridgeCapabilities, readonly store: SQLiteStore, options?: { eventCapacity?: number }) {
     this.events = new EventHub(options?.eventCapacity ?? 1024, store, bridge.context);
     this.ownerId = this.events.bootEpoch;
   }
