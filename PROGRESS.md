@@ -17,9 +17,9 @@ Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Sta
 | B05 Windows helper/driver | implemented-unverified (Linux) | `src/bridge/windows/driver.ts`, PowerShell helper; no real SendInput run | `tests/unit/windows-driver.test.ts` |
 | B06 IPC/Supervisor | partial | `src/bridge/ipc/protocol.ts` + `endpoint.ts` with session-epoch fencing; no child-process Supervisor | `tests/unit/ipc-endpoint.test.ts` |
 | U01 shared ControlService | implemented-offline | `src/control/service.ts`, `serve`/`attach` CLI | `tests/unit/control-service.test.ts` |
-| U02 HTTP/SSE | implemented-offline | `src/server/index.ts`, JSON API, SSE snapshot+cursor, bounds | `tests/integration/server.test.ts` |
-| U03 React control UI | not-implemented | — | — |
-| U04 concurrent CLI/Web | partial | requestId dedupe + CAS via ControlService; browser E2E absent | server tests |
+| U02 HTTP/SSE | implemented-offline | `src/server/index.ts`, JSON API, SSE snapshot+cursor, bounds, same-origin static hosting | `tests/integration/server.test.ts` |
+| U03 React control UI | implemented-offline | `web/` Vite+React console with the blue-white design tokens, truthful states, command forms, SSE feed | `npm run test:web`, `npm run build:web`, loopback smoke |
+| U04 concurrent CLI/Web | implemented-offline (partial) | requestId dedupe + CAS via ControlService; CLI `serve`/`attach` share one Runtime | server + control tests; Playwright E2E not implemented |
 | M01-M05 3D state/motor | implemented-offline (partial) | `src/motor/*`, `src/fixtures/*`; not wired into production runtime | `tests/unit/m01-m05.test.ts` |
 | A01 GoalManager/TaskScheduler | implemented-offline | `src/autonomous/tasks.ts` | `tests/unit/autonomous.test.ts` |
 | A02 knowledge/spatial/episodic memory | implemented-offline | `src/autonomous/memory.ts` | `tests/unit/autonomous.test.ts` |
@@ -35,6 +35,6 @@ Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Sta
 
 - The Minecraft codec path is the legacy 1.20.4/765 fixture; the 26.3 adapter is candidate metadata only. No live 26.3 interoperability is claimed.
 - The raw relay is verified on loopback sockets only; no real server was contacted.
-- The React web UI, Playwright E2E, child-process Supervisor and full domain normalizers are not implemented.
+- The React web UI is implemented and served same-origin; browser Playwright E2E, a child-process Supervisor and full 26.3 domain normalizers are not implemented.
 - Six of the eleven skills are registered but intentionally return unavailable without the corresponding capability.
 - Real Windows input/capture, paid model APIs, Node 22 execution and real Minecraft are unverified.
