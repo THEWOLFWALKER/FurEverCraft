@@ -64,17 +64,23 @@ export class BoundedObserver {
     this.draining=true;
     try{
       while(this.pending.length){
-        const batch=this.pending.splice(0,this.limits.maxConcurrency);
+        // Never exceed maxConcurrency live listeners even when a previous batch timed out.
+        const batch=this.pending.splice(0,Math.max(1,this.limits.maxConcurrency-this.inflight));
         for(const item of batch)this.queuedBytes=Math.max(0,this.queuedBytes-item.frame.length);
         await Promise.all(batch.map(item=>this.dispatch(item)));
       }
     } finally { this.draining=false; }
   }
+  private inflight=0;
   private async dispatch(item:PendingFrame){
     const event:ObserverEvent={kind:'observation',source:'client',sessionEpoch:this.sessionEpoch,direction:item.direction,frameSequence:item.frameSequence,phase:item.phase,payload:{bytes:item.frame.length,offsetStart:item.offsetStart,offsetEnd:item.offsetEnd}};
+    this.inflight+=1;
     let timer:ReturnType<typeof setTimeout>|undefined;
     const timeout=new Promise<void>(resolve=>{ timer=setTimeout(()=>{ this.healthValue=this.healthValue==='healthy'?'degraded':this.healthValue; resolve(); },this.limits.taskTimeoutMs); });
-    await Promise.race([Promise.all([...this.listeners].map(listener=>Promise.resolve().then(()=>listener(event)).catch(()=>undefined))).then(()=>undefined),timeout]);
+    const work=Promise.all([...this.listeners].map(listener=>Promise.resolve().then(()=>listener(event)).catch(()=>undefined))).then(()=>undefined);
+    await Promise.race([work,timeout]);
+    // On timeout the listener may still be running; keep the slot counted until it settles.
+    void work.finally(()=>{ this.inflight=Math.max(0,this.inflight-1); });
     if(timer)clearTimeout(timer);
   }
   private gap(scope:'global'|'domain',reason:string,direction?:ObserverDirection,fromFrame?:string){if(this.healthValue==='healthy')this.healthValue='degraded';this.emit({kind:'observer_gap',source:'client',sessionEpoch:this.sessionEpoch,gap:{scope,reason,direction,fromFrame,toFrame:direction?this.states[direction].frameSequence:undefined}});}

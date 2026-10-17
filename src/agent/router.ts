@@ -84,8 +84,24 @@ export class ToolRouter {
           const implementation = skillImplementations[skill as keyof typeof skillImplementations];
           if (!implementation || !this.executor || !this.store) return { callId: call.id, name: call.name, ok: false, error: 'unsupported-skill' };
           const executeArgs = skill === 'navigate_to' || skill === 'place_one' || skill === 'look_at' || skill === 'dig_one' ? { x: Number(args.x), y: Number(args.y) } : skill === 'send_chat' ? String(args.text) : skill === 'wait_for_condition' ? Number(args.ms) : skill === 'explore_area' ? Number(args.radius) : skill === 'gather_blocks' ? String(args.block) : skill === 'return_to_place' ? String(args.placeId) : undefined;
-          const execution = await this.executor.start('agent', skill, args, (lease, report, signal) => (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs));
+          // The effect row references the execution, so it is written by the executor hook once the
+          // execution exists. Prepared intent is persisted before dispatch; only a confirmed outcome settles it.
+          const sideEffect = skill === 'place_one' || skill === 'send_chat' || skill === 'dig_one' || skill === 'gather_blocks';
+          const effectId = sideEffect ? nextId('effect') : undefined;
+          let effectStarted = false;
+          const execution = await this.executor.start('agent', skill, args, (lease, report, signal) => {
+            if (effectId && !effectStarted) {
+              effectStarted = true;
+              this.store!.addEffect({ effectId, executionId: lease.owner, context: this.bridge.context, status: 'prepared', intent: { kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : 'dig', x: typeof executeArgs === 'object' ? executeArgs?.x : undefined, y: typeof executeArgs === 'object' ? executeArgs?.y : undefined, text: executeArgs, block: skill === 'gather_blocks' ? String(args.block) : undefined } });
+              this.store!.updateEffect(effectId, 'may-have-dispatched');
+            }
+            return (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs);
+          });
           result = execution;
+          if (sideEffect && effectId) {
+            // Only an explicitly confirmed skill settles the effect; unknown/partial stays observable.
+            this.store.updateEffect(effectId, execution.outcome === 'confirmed' ? 'confirmed' : execution.outcome === 'partial' ? 'partial' : 'ambiguous', { executionId: execution.executionId, outcome: execution.outcome });
+          }
           if (execution.outcome === 'ambiguous' || execution.status === 'failed' || execution.status === 'canceled') {
             this.events?.publish(`tool.${call.name}`, { callId: call.id, result }, false);
             return { callId: call.id, name: call.name, ok: false, result, error: execution.reason ?? execution.outcome ?? execution.status };

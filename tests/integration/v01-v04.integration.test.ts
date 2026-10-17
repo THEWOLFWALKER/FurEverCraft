@@ -38,9 +38,16 @@ describe('V01-V04 runtime integration fixtures', () => {
       }
       const recovered = createRuntime({ db, bridge });
       try {
+        const pendingBefore = recovered.store.pendingEffects();
+        // A failed place must leave a durable pending effect rather than silently disappearing.
+        expect(pendingBefore.length).toBeGreaterThan(0);
         const recovery = recovered.session.start();
         expect(recovery.recovered).toBe(true);
+        expect(recovery.reconciled.length).toBeGreaterThan(0);
         expect(recovery.reconciled.every(item => ['ambiguous', 'confirmed'].includes(item.status))).toBe(true);
+        // The ambiguous outcome must never be upgraded to confirmed by recovery.
+        const place = recovered.store.pendingEffects().find(effect => String((effect.intent as { kind?: string })?.kind ?? '').includes('place') || effect.status !== 'confirmed');
+        if (place) expect(['ambiguous', 'confirmed']).toContain(place.status);
       } finally {
         recovered.close();
       }
