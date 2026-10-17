@@ -42,6 +42,12 @@ describe('providers', () => {
   it('enforces SSE byte budgets', async () => {
     await expect(collect(chunks([`data: ${'x'.repeat(MAX_SSE_RECORD_BYTES)}\n\n`]))).rejects.toThrow('provider-sse-record-limit');
     await expect(collect(chunks(['x'.repeat(MAX_SSE_RESPONSE_BYTES + 1)]))).rejects.toThrow('provider-sse-response-limit');
+    await expect(collect(chunks(['data: {"partial":true}']))).rejects.toThrow('provider-stream-truncated');
+  });
+  it('honors Retry-After and caps transient retries at two extra attempts', async () => {
+    let attempts = 0; const waits: number[] = []; const transport: HttpTransport = { async post() { attempts++; const e = new ProviderError('busy', 429, 'test', true); (e as any).retryAfterMs = 1200; if (attempts < 4) throw e; return transportResponse; } };
+    const provider = new OpenAIProvider(transport, 'http://offline', 'model', undefined, { sleep: async ms => { waits.push(ms); } });
+    await expect(provider.complete([], [])).rejects.toThrow('busy'); expect(attempts).toBe(3); expect(waits).toEqual([1200, 1200]);
   });
   it('retries transient HTTP errors at most twice without SDK retry behavior', async () => {
     let attempts = 0; const transport: HttpTransport = { async post() { attempts++; if (attempts < 3) throw new ProviderError('busy', 503, 'test', true); return transportResponse; } };
