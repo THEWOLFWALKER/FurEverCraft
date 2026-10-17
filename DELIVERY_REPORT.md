@@ -1,53 +1,138 @@
-# FurEverCraft 第二阶段交付报告
+# FurEverCraft Phase 2.1 Convergence Delivery Report
 
-状态：已完成可运行的离线第二阶段增量，所有已声称通过的命令均为实际运行结果。真实 Minecraft 服务器、真实客户端输入和付费模型 API 未连接。
+## Status
 
-## 已实现
+C1, C2, and C3 convergence work is in progress. This report distinguishes implemented offline behavior from remaining integration work; it does not claim full completion from test counts. Real Minecraft servers/worlds, paid model APIs, Windows SendInput, and desktop capture were not used.
 
-- `src/contracts`：上下文、执行、输入、效果、时钟和状态合同。
-- `src/state/world.ts`：上下文隔离、不可变快照、gap/unknown 失效。
-- `src/persistence/store.ts`：SQLite WAL、迁移、目标/提案/执行、effect、checkpoint、事件、地点、经历、action receipt。
-- `src/execution/runtime.ts`：资源租约、TTL、过期拒绝、进度、watchdog、取消和提案幂等基础。
-- `src/execution/session.ts`：重启时 pending effect 观察和调和路径。
-- `src/skills/registry.ts` 与 `src/skills/skills.ts`：五项技能 manifest 和模拟实现。
-- `src/agent/router.ts`：结构化工具参数校验、完整工具入口、只读并行/写串行工具循环。
-- `src/providers/openai` 与 `src/providers/anthropic`：请求/响应、SSE、增量工具参数、usage、错误、取消。
-- `src/bridge/protocol/session.ts`：1.20.4/protocol 765 阶段状态机、packet fixture、观察队列和 upstream gate。
-- `src/bridge/windows/driver.ts` 与 `native/windows/FurEverCraft.Helper.ps1`：JSONL helper、PID/HWND 绑定、TTL、去重、heartbeat、dry-run 和退出清理路径。
-- `src/bridge/composite.ts`：协议观察、Windows driver、截图能力的组合和诚实能力声明。
-- `PACKET_OWNERSHIP.md`：阶段、方向、库处理和 fixture 限制。
-- `src/diagnostics`：事件游标、持久关键事件和日志脱敏。
-- 配置：`configs/simulated.json`、`configs/client-offline.example.json`。
-- Node 22 CI：`.github/workflows/offline.yml`。
-- 测试前提规则：`TESTING_RULE.md`，并已写入阶段 `CLAUDE.md`。
+## Baseline and local commits
 
-## 实际验证
+Starting implementation repository: `/home/orca/projects/furevercraft-phase2-handoff`.
+Starting HEAD: `241f94b`, containing the earlier audit remediation commits.
 
-环境：Linux，Node `v20.19.5`，npm `10.8.2`。目标 CI runtime 为 Node 22。
+Convergence commits currently present locally:
 
-已通过：
+- `f0dd68a implement C1 runtime and provider consistency`
+- `36981f7 implement C2 effect recovery persistence`
+- `762280e implement C3 loopback protocol and bridge gates`
+
+Additional integration review changes are being made after those stage commits and should be reviewed and committed separately before the convergence pass is called complete.
+
+## Implemented in this convergence pass
+
+### Shared foundation and C1
+
+- Added `src/execution/factory.ts` as a central runtime assembly entry for bridge, Store, SessionRuntime, ToolRouter, Provider, AgentLoop, and Clock.
+- Added bridge capability interfaces in `src/bridge/capabilities.ts` and moved several runtime/skill paths away from FakeClientBridge concrete typing.
+- Added provider network gating to FetchTransport; production fetch is denied unless explicitly enabled.
+- AgentLoop now works on a cloned history, carries canonical tool-call metadata, checks target revision when configured, and does not reorder the model's original tool-call list when executing writes.
+- Added skill-specific strict argument validation.
+- Added richer skill manifest metadata and injected-clock waiting support.
+- Added provider serializer/network-gate tests.
+
+### C2
+
+- Added effect state validation and guarded transitions in SQLiteStore.
+- Added pending/completed/unknown action receipt lifecycle and replay protection.
+- Applied schema initialization and migration markers transactionally; added effect/checkpoint execution references and foreign-key behavior.
+- Added SessionRuntime lifecycle states, owner/boot identity, recovery failure reporting, and retryable failure state.
+- Recovery no longer uses inventory `< 8`; place reconciliation checks context, intent coordinates, and current target cell. Insufficient or mismatched evidence stays ambiguous.
+- Added filtered EventHub cursor behavior and durable replay tests.
+- Added `tests/unit/c2-recovery-events.test.ts` for receipts, recovery windows, context mismatch, no input replay, and durable/filtered events.
+
+### C3 and Windows convergence
+
+- Added `MinecraftBytePacketTransport` using the installed minecraft-protocol codec and a fragmented loopback byte transport fixture.
+- Added test coverage from encoded packet bytes through fragmented transport to decoded protocol packet observation.
+- ProtocolSession now tracks downstream and upstream phase fields while retaining a compatibility phase accessor.
+- Composite provenance no longer promotes fixture source to client based only on observer presence; gap/degraded observations affect bridge limitations.
+- CLI bridge supports `fixture`, `inspect`, and gated `live` modes. Live mode refuses unless explicit upstream permission exists and then reports unavailable real environment rather than pretending to connect.
+- Windows driver/helper behavior was strengthened by earlier remediation commits: request ID matching, command ID dedup for text and pointer events, disabled cleanup path, binding/input checks, heartbeat and cleanup behavior.
+- Added `bridge:protocol` npm script and CI invocations for demo, doctor, bridge fixture, and inspect.
+
+## Verification actually run
+
+Local environment: Linux, Node `v20.19.5`, npm `10.8.2`. Node 22 is configured in CI but has not been run locally.
+
+At the current convergence checkpoint, the following passed:
 
 ```text
 npm run typecheck
 npm run build
 npm run test:offline
 npm run demo:offline
+npm run doctor -- --profile simulated
+node dist/cli/main.js bridge --mode fixture --config configs/simulated.json
+node dist/cli/main.js bridge --mode inspect --config configs/client-offline.example.json
 ```
 
-- `npm run test:offline`：8 个测试文件，30 个测试通过。
-- `npm run cli -- doctor` 和 `npm run cli -- bridge --config configs/client-offline.example.json`：实际运行成功，默认网络关闭。
+Latest full offline suite result at the time of this report:
 
-测试覆盖：world context/gap、SQLite 重开和 effect/checkpoint、五技能执行、provider/runtime 回归、protocol 阶段和方向、Windows fake transport、Composite bridge、响应错序/输入过期/命令去重。
+```text
+9 test files passed
+42 tests passed
+```
 
-## 测试前提规则
+Six demo scenarios ran and were labelled simulated/fixture. The crash-recovery demo kept insufficiently evidenced work ambiguous.
 
-测试只能基于合同或可观察行为。不能把 fixture 常量当真实客户端事实，不能测试函数自己的硬编码返回值，不能用错误的同步/异步前提断言异步方法。失败时先检查前提，再修实现或修正测试；不能削弱断言、静默跳过或伪造成功。
+## Remaining work before declaring C1/C2/C3 complete
 
-## 未验证边界
+### C1
 
-- 未连接真实 Minecraft 服务器或加入任何世界。
-- 未启动真实 Minecraft 服务端或客户端。
-- 未执行 Windows SendInput 或真实桌面截图。
-- 未调用 OpenAI/Anthropic 付费 API。
-- 协议、Windows helper 和 provider 的真实环境兼容性仍需目标环境单独验证。
-- 模拟二维导航不代表真实 Minecraft 三维导航能力。
+- Finish the persistent readline console and documented command set.
+- Ensure status/doctor operate on the same long-lived Runtime rather than constructing isolated reporting instances.
+- Complete goal revision/decision-generation fencing for every write admission and late provider response.
+- Add full OpenAI assistant `tool_calls`/tool `tool_call_id` and Anthropic assistant `tool_use`/user `tool_result` multi-turn request fixtures, including provider switching.
+- Implement bounded 429/5xx retry budget with cancellation/deadline and no replay of already committed tools.
+- Complete independent versioned knowledge rules and real PNG synthetic capture fixture.
+- Ensure all demos exercise the RuntimeFactory → ToolRouter → Executor path rather than direct helper calls and descriptive labels.
+
+### C2
+
+- Integrate durable intent/dispatch permit and receipt into every external-effect skill at the actual dispatch boundary.
+- Expand crash tests to cover intent persisted before dispatch, effect applied before receipt, observation before checkpoint, disk-write failure, stale checkpoint, repeated finalizer, old epoch and same-world reconnect.
+- Confirm recovery query uses stable world/account/dimension candidate scope and separately validates new observer identity; never restore an old lease.
+- Add goal/execution/checkpoint CAS and ensure stale finalizers cannot overwrite newer revisions.
+- Verify EventHub boot cursor and durable event IDs remain distinct and filtered queries do not manufacture gaps.
+- Ensure memory query is SQL-scoped, bounded and isolated by stable world/account/dimension.
+
+### C3
+
+- Complete public loopback bridge lifecycle with separate downstream listener and upstream connector using injected loopback endpoints; the current byte transport proves codec/framing fixtures but not a full proxy session.
+- Drive phase changes from actual decoded packets/library events, not caller-set transitions.
+- Add compression changes, split/coalesced frames, status-only flow, disconnect/error, backpressure and packet ownership/duplicate suppression tests.
+- Normalize required packet families into domain observations with explicit availability and fixture provenance.
+- Ensure Composite degradation blocks dependent actions after observation gaps and recovers only after explicit resync.
+- Extract helper pre-native-call logic behind a no-op native sink so helper control flow is tested without SendInput or capture.
+- On Linux, report Windows native sink execution as unavailable/unrun; do not substitute FakeHelperTransport-only evidence for helper branch evidence.
+
+### Final verification
+
+After the remaining work, rerun:
+
+```bash
+npm ci
+npm run typecheck
+npm run build
+npm run test:offline
+npm run demo:offline
+npm run doctor -- --profile simulated
+npm run bridge:protocol -- --config configs/simulated.json
+node dist/cli/main.js bridge --mode inspect --config configs/client-offline.example.json
+```
+
+CI must run the same offline commands on Node 22. Record actual results, do not infer Node 22 success from the YAML definition.
+
+## Testing premise rule
+
+Every test must be based on a documented contract, observable behavior, or explicit fixture semantics. Do not assume fixture constants are real Minecraft facts, do not test a function against its own hard-coded return, do not assert asynchronous APIs synchronously, and do not weaken assertions or skip tests to force green. Failure review must first check the test premise and then the implementation. All DB tests use isolated temporary directories and cleanup. Provider tests use injected transports. Protocol tests use loopback endpoints without a game engine. Windows tests do not execute SendInput or desktop capture.
+
+## Unverified boundaries
+
+- No Minecraft server was started or contacted.
+- No Minecraft world was joined.
+- No paid OpenAI or Anthropic API was called.
+- No Windows SendInput was executed.
+- No desktop screenshot was captured.
+- The local host used Node 20; Node 22 is only configured in CI until CI results are observed.
+- Loopback codec tests do not establish live-server compatibility, full proxy correctness, or real-client behavior.
+- Simulated two-dimensional navigation does not establish Minecraft three-dimensional movement behavior.

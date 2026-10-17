@@ -26,9 +26,9 @@ export class SessionRuntime {
   start(): RecoveryResult {
     if (this.started) return { recovered: true, context: this.bridge.context, reconciled: [] };
     this._state = 'starting';
-    this.started = true;
     const reconciled = [] as Array<{ effectId: string; status: string }>;
-    for (const effect of this.store.pendingEffects()) {
+    try {
+      for (const effect of this.store.pendingEffects()) {
       let status = 'ambiguous';
       let evidence: Record<string, unknown> = { source: 'recovery-observation', error: 'snapshot-unavailable' };
       try {
@@ -45,11 +45,18 @@ export class SessionRuntime {
       }
       const effectId = effect.effect_id ?? effect.effectId;
       this.store.updateEffect(effectId, status, evidence);
-      reconciled.push({ effectId, status });
+        reconciled.push({ effectId, status });
+      }
+      this.started = true;
+      this._state = 'running';
+      this.events.publish('runtime.recovered', { executions: this.store.listExecutions().length, effects: reconciled.length, ownerId: this.ownerId }, true);
+      return { recovered: true, context: this.bridge.context, reconciled };
+    } catch (error) {
+      this.started = false;
+      this._state = 'recoverable-failure';
+      this.events.publish('runtime.recovery_failed', { error: error instanceof Error ? error.message : String(error), ownerId: this.ownerId }, true);
+      throw error;
     }
-    this._state = 'running';
-    this.events.publish('runtime.recovered', { executions: this.store.listExecutions().length, effects: reconciled.length, ownerId: this.ownerId }, true);
-    return { recovered: true, context: this.bridge.context, reconciled };
   }
   recover(): RecoveryResult { this.started = false; return this.start(); }
 }

@@ -1,21 +1,12 @@
-# 第二阶段进度
+# Phase 2.1 Convergence Progress
 
-已完成离线实现和积极 review；真实服务器、付费模型和 Windows 实际输入未验证。
+Working through foundation fixes, C1, C2, and C3. Real server/world, paid model API, Windows SendInput and desktop capture remain intentionally untested.
 
-| 任务 | 状态 | 代码与测试证据 |
+| Stream | Status | Evidence |
 |---|---|---|
-| W01 | implemented | 合并上一阶段源码、阶段二文档和测试规则 |
-| W02 | implemented | contracts、skills registry、bridge capability types |
-| W03 | implemented | `src/state/world.ts`, `tests/unit/world.test.ts` |
-| W04 | implemented | `src/persistence/store.ts`, `tests/unit/persistence.test.ts` |
-| W05 | implemented | `src/execution/runtime.ts`, `tests/unit/execution-skills.test.ts` |
-| W06 | implemented | `src/skills/registry.ts`, `src/skills/skills.ts` |
-| W07 | implemented | `src/execution/session.ts`, recovery path and demo |
-| W08 | implemented | OpenAI/Anthropic request/response/stream/cancel code |
-| W09 | implemented | `src/agent/router.ts`, schemas and read/write admission |
-| W10 | implemented | `src/cli/main.ts`, events, redaction, config |
-| W11 | implemented | protocol session and `tests/unit/protocol.test.ts` |
-| W12 | implemented | Windows helper/driver and `tests/unit/windows-driver.test.ts` |
-| W13 | implemented | Composite bridge and `tests/unit/composite.test.ts` |
-| W14 | implemented | Node 22 CI config, offline suite, demo and doctor |
-| W15 | implemented | delivery report and acceptance mapping |
+| Foundation | implemented, integration review ongoing | `src/execution/factory.ts`, bridge capability interface, injected provider gate, shared assembly tests |
+| C1 application/model/tool loop | partial | `src/agent/router.ts`, provider serializers, RuntimeFactory and offline tests; full readline console, goal fencing under CLI session, complete provider switching and retry budget remain open |
+| C2 effects and restart recovery | partial | `src/execution/session.ts`, `src/persistence/store.ts`, `tests/unit/c2-recovery-events.test.ts`; scope/evidence/state tests exist, further fault windows/CAS and dispatch integration review remain |
+| C3 offline byte protocol integration | partial | `MinecraftBytePacketTransport`, fragmented loopback packet test, bridge fixture/inspect CLI modes; independent listeners/upstream connector, library-driven phase/compression lifecycle and full domain normalization remain open |
+| Windows helper/driver | partial | Fake transport tests and PowerShell source; native dry-run sink/state-machine coverage and independent watchdog verification remain open |
+| Final offline verification | in progress | local Node 20.19.5 runs; Node 22 CI configured but not yet observed remotely |
