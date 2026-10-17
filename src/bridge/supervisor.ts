@@ -41,6 +41,7 @@ export class ProcessSupervisor {
   private readonly heartbeatMs: number;
   private readonly ipcTimeoutMs: number;
   private readonly pending = new Map<string, PendingRequest>();
+  private readonly helloWaiters = new Set<(epoch: string) => void>();
 
   constructor(private readonly options: SupervisorOptions) {
     this.now = options.now ?? (() => Date.now());
@@ -69,6 +70,8 @@ export class ProcessSupervisor {
         // change means ownership was taken over and must not be adopted silently.
         if (!this.childEpoch) this.childEpoch = message.sessionEpoch;
         else if (message.sessionEpoch !== this.childEpoch) { this.stateValue = 'failed'; child.kill(); return; }
+        for (const waiter of this.helloWaiters) waiter(this.childEpoch!);
+        this.helloWaiters.clear();
       }
       if (isResponse(message)) {
         const waiter = this.pending.get(message.requestId);
@@ -84,6 +87,17 @@ export class ProcessSupervisor {
     const hello: IpcMessage = { type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch: this.ownerEpoch, bootEpoch: randomUUID(), capabilities: ['control', 'observe'] };
     if (!child.send(hello)) { this.stateValue = 'failed'; throw new Error('supervisor-hello-backpressure'); }
     this.stateValue = 'running';
+  }
+
+  /** Wait for the child's hello so a request is not sent before the session epoch is known. */
+  waitForHello(timeoutMs = this.ipcTimeoutMs): Promise<string> {
+    if (this.childEpoch) return Promise.resolve(this.childEpoch);
+    if (!this.child) return Promise.reject(new Error('supervisor-no-child'));
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => { this.helloWaiters.delete(waiter); reject(new Error('ipc-hello-timeout')); }, timeoutMs);
+      const waiter = (epoch: string) => { clearTimeout(timer); resolve(epoch); };
+      this.helloWaiters.add(waiter);
+    });
   }
 
   /** Send a control request to the child and await its correlated response. */

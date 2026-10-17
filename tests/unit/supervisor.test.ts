@@ -69,6 +69,22 @@ describe('B06 process supervisor', () => {
     await supervisor.stop();
   });
 
+  it('waits for the child hello before allowing a request', async () => {
+    const child = new FakeChild();
+    const supervisor = new ProcessSupervisor({ spawn: () => child, ipcTimeoutMs: 200 });
+    await supervisor.start();
+    const hello = supervisor.waitForHello(100);
+    child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'child-1', bootEpoch: 'b', capabilities: [] });
+    await expect(hello).resolves.toBe('child-1');
+    await supervisor.stop();
+  });
+
+  it('rejects a request when no child is running', async () => {
+    const supervisor = new ProcessSupervisor({ spawn: () => new FakeChild() });
+    await expect(supervisor.request('status')).rejects.toThrow('supervisor-no-child');
+    await supervisor.stop();
+  });
+
   it('adopts the first child epoch and rejects an in-flight identity change', async () => {
     const child = new FakeChild();
     const supervisor = new ProcessSupervisor({ spawn: () => child });
