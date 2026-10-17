@@ -14,10 +14,10 @@ function stateTone(status?: string): 'ok' | 'warn' | 'bad' | 'idle' {
   return 'idle';
 }
 
-function Metric({ label, value: number, hint }: { label: string; value: number | undefined; hint: string }) {
+function Metric({ label, count, hint }: { label: string; count: number | undefined; hint: string }) {
   return (
     <div className="panel metric">
-      <span className="metric-value">{value === undefined ? '--' : value}</span>
+      <span className="metric-value">{count === undefined ? '--' : count}</span>
       <span className="metric-label">{label}</span>
       <span className="sr-only">{hint}</span>
     </div>
@@ -126,10 +126,10 @@ export default function App() {
       </div>
 
       <div className="grid metrics" style={{ marginTop: 16 }}>
-        <Metric label="Active goal revision" value={activeGoal?.revision} hint="Current goal revision or unknown" />
-        <Metric label="Executions" value={executions.length} hint="Persisted executions or unknown" />
-        <Metric label="Pending effects" value={pendingEffects} hint="Effects not yet confirmed or partial" />
-        <Metric label="Places" value={places.length} hint="Remembered places or unknown" />
+        <Metric label="Active goal revision" count={activeGoal?.revision} hint="Current goal revision or unknown" />
+        <Metric label="Executions" count={executions.length} hint="Persisted executions or unknown" />
+        <Metric label="Pending effects" count={pendingEffects} hint="Effects not yet confirmed or partial" />
+        <Metric label="Places" count={places.length} hint="Remembered places or unknown" />
       </div>
 
       <div className="grid two" style={{ marginTop: 16 }}>
