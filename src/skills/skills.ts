@@ -44,7 +44,7 @@ export function placeOne(ctx: SkillContext, target: { x: number; y: number }): S
   try {
     const receipt = ctx.bridge.place(target.x, target.y);
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
-    return { ok: true, outcome: receipt.accepted ? 'confirmed' : 'ambiguous', value: receipt };
+    return { ok: receipt.accepted === true && !receipt.ambiguous, outcome: receipt.accepted && !receipt.ambiguous ? 'confirmed' : 'ambiguous', value: receipt };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
 }
 

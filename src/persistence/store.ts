@@ -17,6 +17,16 @@ export type ActionReceipt = {
 const now = () => new Date().toISOString();
 const json = (value: unknown) => JSON.stringify(value ?? null);
 const parse = <T>(value: unknown): T => JSON.parse(String(value)) as T;
+const canonical = (value: unknown): unknown => Array.isArray(value)
+  ? value.map(canonical)
+  : value && typeof value === 'object'
+    ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)]))
+    : value;
+const sameJson = (left: unknown, right: unknown) => JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+const effectStatuses = ['prepared', 'may-have-dispatched', 'verifying', 'confirmed', 'partial', 'ambiguous'] as const;
+const receiptStatuses = ['pending', 'completed', 'unknown', 'sent', 'ambiguous'] as const;
+const receiptTerminal = new Set(['completed', 'unknown', 'sent', 'ambiguous']);
+const effectRank: Record<string, number> = { prepared: 0, 'may-have-dispatched': 1, verifying: 2, ambiguous: 3, partial: 4, confirmed: 5 };
 
 export class SQLiteStore {
   readonly db: Database.Database;
@@ -30,14 +40,15 @@ export class SQLiteStore {
   }
 
   private migrate() {
-    this.db.exec(`
+    this.db.transaction(() => {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS goals(goal_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, status TEXT NOT NULL,
         body_context TEXT NOT NULL, spec_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS executions(execution_id TEXT PRIMARY KEY, proposal_id TEXT UNIQUE NOT NULL,
         proposal_hash TEXT NOT NULL, goal_id TEXT NOT NULL, skill_id TEXT NOT NULL, skill_version TEXT NOT NULL,
         status TEXT NOT NULL, reason TEXT, outcome TEXT, checkpoint_json TEXT);
-      CREATE TABLE IF NOT EXISTS effects(effect_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, context TEXT NOT NULL,
+      CREATE TABLE IF NOT EXISTS effects(effect_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL REFERENCES executions(execution_id) ON DELETE CASCADE, context TEXT NOT NULL,
         status TEXT NOT NULL, intent_json TEXT NOT NULL, evidence_json TEXT);
       CREATE TABLE IF NOT EXISTS critical_events(event_seq TEXT PRIMARY KEY, event_id TEXT NOT NULL, kind TEXT NOT NULL,
         context TEXT NOT NULL, payload_json TEXT NOT NULL);
@@ -54,6 +65,7 @@ export class SQLiteStore {
     `);
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)').run(now());
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(now());
+    })();
   }
 
   close() { this.db.close(); }
@@ -119,15 +131,33 @@ export class SQLiteStore {
   }
 
   addEffect(e: any) {
+    if (!effectStatuses.includes(e.status)) throw new Error(`invalid-effect-status:${e.status}`);
+    const existing = this.db.prepare('SELECT * FROM effects WHERE effect_id=?').get(e.effectId) as any;
+    if (existing) {
+      if (existing.execution_id !== e.executionId || !sameJson(parse(existing.context), e.context) || !sameJson(parse(existing.intent_json), e.intent)) throw new Error('effect-id-conflict');
+      if ((effectRank[e.status] ?? -1) < (effectRank[existing.status] ?? -1)) return this.getEffect(e.effectId);
+      this.db.prepare('UPDATE effects SET status=?, evidence_json=COALESCE(?, evidence_json) WHERE effect_id=?')
+        .run(e.status, e.evidence === undefined ? null : json(e.evidence), e.effectId);
+      return this.getEffect(e.effectId);
+    }
     this.db.prepare(`INSERT INTO effects(effect_id,execution_id,context,status,intent_json,evidence_json)
-      VALUES (?,?,?,?,?,?) ON CONFLICT(effect_id) DO UPDATE SET context=excluded.context,status=excluded.status,
-      intent_json=excluded.intent_json,evidence_json=excluded.evidence_json`)
-      .run(e.effectId, e.executionId, json(e.context), e.status, json(e.intent), e.evidence === undefined ? null : json(e.evidence));
+      VALUES (?,?,?,?,?,?)`).run(e.effectId, e.executionId, json(e.context), e.status, json(e.intent), e.evidence === undefined ? null : json(e.evidence));
+    return this.getEffect(e.effectId);
+  }
+
+  getEffect(effectId: string) {
+    const row = this.db.prepare('SELECT * FROM effects WHERE effect_id=?').get(effectId) as any;
+    return row ? { ...row, effectId: row.effect_id, executionId: row.execution_id, context: parse(row.context), intent: parse(row.intent_json), evidence: row.evidence_json ? parse(row.evidence_json) : undefined } : undefined;
   }
 
   updateEffect(effectId: string, status: string, evidence?: unknown) {
+    if (!effectStatuses.includes(status as typeof effectStatuses[number])) throw new Error(`invalid-effect-status:${status}`);
+    const current = this.getEffect(effectId);
+    if (!current) throw new Error('effect-not-found');
+    if ((effectRank[status] ?? -1) < (effectRank[current.status] ?? -1)) return current;
     this.db.prepare('UPDATE effects SET status=?, evidence_json=COALESCE(?, evidence_json) WHERE effect_id=?')
       .run(status, evidence === undefined ? null : json(evidence), effectId);
+    return this.getEffect(effectId);
   }
 
   pendingEffects() {
@@ -136,14 +166,32 @@ export class SQLiteStore {
   }
 
   addActionReceipt(receipt: ActionReceipt) {
+    if (!receiptStatuses.includes(receipt.status as typeof receiptStatuses[number])) throw new Error(`invalid-receipt-status:${receipt.status}`);
+    const existing = this.getActionReceipt(receipt.scope, receipt.commandId);
+    if (existing) {
+      if (existing.receipt_id !== receipt.receiptId && existing.status !== 'pending') return existing;
+      if (existing.receipt_id !== receipt.receiptId) throw new Error('receipt-id-conflict');
+      if (existing.status === 'pending' && receipt.status !== 'pending') {
+        this.db.prepare('UPDATE action_receipts SET status=?, result_json=COALESCE(?, result_json), context_json=COALESCE(?, context_json), updated_at=? WHERE scope=? AND command_id=?')
+          .run(receipt.status, receipt.result === undefined ? null : json(receipt.result), receipt.context === undefined ? null : json(receipt.context), now(), receipt.scope, receipt.commandId);
+      }
+      return this.getActionReceipt(receipt.scope, receipt.commandId);
+    }
     const timestamp = now();
     this.db.prepare(`INSERT INTO action_receipts(receipt_id,scope,command_id,status,result_json,context_json,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(scope,command_id) DO UPDATE SET status=excluded.status,
-      result_json=excluded.result_json, context_json=excluded.context_json, updated_at=excluded.updated_at`)
-      .run(receipt.receiptId, receipt.scope, receipt.commandId, receipt.status,
-        receipt.result === undefined ? null : json(receipt.result), receipt.context === undefined ? null : json(receipt.context),
-        receipt.createdAt ?? timestamp, timestamp);
+      VALUES (?,?,?,?,?,?,?,?)`).run(receipt.receiptId, receipt.scope, receipt.commandId, receipt.status,
+        receipt.result === undefined ? null : json(receipt.result), receipt.context === undefined ? null : json(receipt.context), receipt.createdAt ?? timestamp, timestamp);
     return this.getActionReceipt(receipt.scope, receipt.commandId);
+  }
+
+  updateActionReceipt(scope: string, commandId: string, status: string, result?: unknown, context?: unknown) {
+    if (!receiptStatuses.includes(status as typeof receiptStatuses[number])) throw new Error(`invalid-receipt-status:${status}`);
+    const existing = this.getActionReceipt(scope, commandId);
+    if (!existing) throw new Error('receipt-not-found');
+    if (receiptTerminal.has(existing.status) && existing.status !== status) return existing;
+    this.db.prepare('UPDATE action_receipts SET status=?, result_json=COALESCE(?, result_json), context_json=COALESCE(?, context_json), updated_at=? WHERE scope=? AND command_id=?')
+      .run(status, result === undefined ? null : json(result), context === undefined ? null : json(context), now(), scope, commandId);
+    return this.getActionReceipt(scope, commandId);
   }
 
   getActionReceipt(scope: string, commandId: string) {

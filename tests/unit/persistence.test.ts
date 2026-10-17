@@ -16,13 +16,13 @@ describe('SQLiteStore W04 persistence', () => {
     const file = tempDb();
     const first = new SQLiteStore(file);
     first.saveExecution(execution());
-    first.addActionReceipt({ receiptId: 'receipt-1', scope: 'body-1', commandId: 'cmd-1', status: 'sent', result: { accepted: true }, context });
+    first.addActionReceipt({ receiptId: 'receipt-1', scope: 'body-1', commandId: 'cmd-1', status: 'completed', result: { accepted: true }, context });
     first.addEffect({ effectId: 'effect-1', executionId: 'execution-1', context, status: 'may-have-dispatched', intent: { kind: 'click' } });
     first.close();
 
     const second = new SQLiteStore(file);
     expect(second.getExecution('proposal-1')).toMatchObject({ executionId: 'execution-1', proposalHash: 'hash-1' });
-    expect(second.getActionReceipt('body-1', 'cmd-1')).toMatchObject({ status: 'sent', result: { accepted: true } });
+    expect(second.getActionReceipt('body-1', 'cmd-1')).toMatchObject({ status: 'completed', result: { accepted: true } });
     expect(second.pendingEffects()[0]).toMatchObject({ effectId: 'effect-1', status: 'may-have-dispatched', intent: { kind: 'click' } });
     second.updateEffect('effect-1', 'confirmed', { observed: true });
     expect(second.pendingEffects()).toHaveLength(0);

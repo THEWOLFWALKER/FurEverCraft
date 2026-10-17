@@ -7,8 +7,10 @@ export type EventRead = { events: Event[]; gap: boolean; next: string; available
 
 export class EventHub {
   private readonly events: Event[] = [];
+  readonly bootEpoch: string;
   private seq: bigint;
   constructor(private readonly capacity = 1024, private readonly store?: SQLiteStore, private readonly defaultContext?: BodyContext) {
+    this.bootEpoch = nextId('boot');
     this.seq = BigInt(store?.getLatestCriticalSequence() ?? '0');
   }
   publish(kind: string, payload: unknown, durable = false, context: unknown = this.defaultContext) {
@@ -29,9 +31,11 @@ export class EventHub {
     for (const event of [...durable, ...retained]) bySeq.set(event.seq, event);
     const all = [...bySeq.values()].sort((a, b) => (BigInt(a.seq) < BigInt(b.seq) ? -1 : 1));
     const events = all.slice(0, limit);
-    const retainedFirst = this.events.length ? BigInt(this.events[0].seq) : this.seq + 1n;
+    const retainedMatching = this.events.filter(e => !filter || e.kind === filter);
+    const retainedFirst = retainedMatching.length ? BigInt(retainedMatching[0].seq) : this.seq + 1n;
     const durableFirst = durable.length ? BigInt(durable[0].seq) : retainedFirst;
     const available = this.store ? (durableFirst < retainedFirst ? durableFirst : retainedFirst) : retainedFirst;
-    return { events, gap: cursor + 1n < available, next: events.at(-1)?.seq ?? after, availableFrom: available.toString() };
+    const gap = filter && events.length > 0 ? false : cursor + 1n < available;
+    return { events, gap, next: events.at(-1)?.seq ?? after, availableFrom: available.toString() };
   }
 }
