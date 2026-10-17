@@ -15,7 +15,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm run test:offline
-      - run: npm run demo:offline
+      - run: npm run test:v:offline
+      - run: npm run build
       - run: npm run doctor -- --profile simulated
       - run: npm run bridge:protocol -- --config configs/simulated.json
       - run: npm run cli -- bridge --mode inspect --config configs/client-offline.example.json
