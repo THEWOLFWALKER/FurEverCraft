@@ -1,0 +1,3 @@
+import { describe, expect, it } from 'vitest';
+import { GAME_VERSION_PROFILE, assertSupportedProfile, versionProfileSummary } from '../../src/bridge/version-profile.js';
+describe('26.3 version profile',()=>{it('records candidate release and exact compatibility metadata',()=>{expect(GAME_VERSION_PROFILE).toMatchObject({release:'26.3',protocolVersion:777,dataVersion:5023,gameJavaRequirement:'25',inputBackend:'SDL3',status:'candidate'});expect(versionProfileSummary().limitations.length).toBeGreaterThan(0);});it('fails closed for mismatched versions',()=>{expect(()=>assertSupportedProfile({...GAME_VERSION_PROFILE,protocolVersion:765 as 777})).toThrow('unsupported-game-version-profile');});});

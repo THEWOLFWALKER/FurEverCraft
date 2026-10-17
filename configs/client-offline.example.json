@@ -1,7 +1,11 @@
 {
   "profile": "client-offline",
-  "protocolVersion": 765,
-  "minecraftVersion": "1.20.4",
+  "protocolVersion": 777,
+  "dataVersion": 5023,
+  "minecraftVersion": "26.3",
+  "gameJavaRequirement": "25",
+  "inputBackend": "SDL3",
+  "versionProfileStatus": "candidate",
   "targetHost": "127.0.0.1",
   "targetPort": 25565,
   "usernameEnv": "MINECRAFT_USERNAME",
