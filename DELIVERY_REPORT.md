@@ -34,7 +34,7 @@ npm run test:offline
 npm run demo:offline
 ```
 
-- `npm run test:offline`：7 个测试文件，27 个测试通过。
+- `npm run test:offline`：8 个测试文件，30 个测试通过。
 - `npm run cli -- doctor` 和 `npm run cli -- bridge --config configs/client-offline.example.json`：实际运行成功，默认网络关闭。
 
 测试覆盖：world context/gap、SQLite 重开和 effect/checkpoint、五技能执行、provider/runtime 回归、protocol 阶段和方向、Windows fake transport、Composite bridge、响应错序/输入过期/命令去重。
