@@ -16,6 +16,7 @@ describe('offline protocol bridge fixture', () => {
     expect(minecraftDataSummary()).toEqual({
       version: MINECRAFT_VERSION,
       protocol: PROTOCOL_VERSION,
+      kind: 'legacy-codec-fixture',
       phases: ['HANDSHAKE', 'STATUS', 'LOGIN', 'CONFIGURATION', 'PLAY', 'CLOSED'],
     });
   });

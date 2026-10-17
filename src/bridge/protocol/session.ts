@@ -2,8 +2,11 @@ import minecraftData from 'minecraft-data';
 import minecraftProtocol from 'minecraft-protocol';
 
 const { createSerializer, createDeserializer, states } = minecraftProtocol;
-export const MINECRAFT_VERSION = '1.20.4';
-export const PROTOCOL_VERSION = 765;
+// Historical codec fixture only. Current-target metadata is defined by GameVersionProfile.
+export const LEGACY_FIXTURE_VERSION = '1.20.4';
+export const LEGACY_FIXTURE_PROTOCOL = 765;
+export const MINECRAFT_VERSION = LEGACY_FIXTURE_VERSION;
+export const PROTOCOL_VERSION = LEGACY_FIXTURE_PROTOCOL;
 
 export type BridgePhase = 'HANDSHAKE' | 'STATUS' | 'LOGIN' | 'CONFIGURATION' | 'PLAY' | 'CLOSED';
 export type ProtocolDirection = 'downstream' | 'upstream';
@@ -245,6 +248,6 @@ export class OfflineProtocolBridge {
   async close(): Promise<void> { this.session.close(); await Promise.all([this.downstream.close(), this.upstream.close()]); }
 }
 
-export function minecraftDataSummary(): { version: string; protocol: number; phases: BridgePhase[] } {
-  return { version: MINECRAFT_VERSION, protocol: PROTOCOL_VERSION, phases: ['HANDSHAKE', 'STATUS', 'LOGIN', 'CONFIGURATION', 'PLAY', 'CLOSED'] };
+export function minecraftDataSummary(): { version: string; protocol: number; kind: 'legacy-codec-fixture'; phases: BridgePhase[] } {
+  return { version: MINECRAFT_VERSION, protocol: PROTOCOL_VERSION, kind: 'legacy-codec-fixture', phases: ['HANDSHAKE', 'STATUS', 'LOGIN', 'CONFIGURATION', 'PLAY', 'CLOSED'] };
 }
