@@ -53,7 +53,20 @@ describe('W05/W06 execution lifecycle and skills', () => {
     expect(digOne({ ...ctx, bridge: noDig }, { x: 1, y: 0 }).reason).toBe('dig-capability-unavailable');
     const noPlace = new FakeClientBridge(); (noPlace as unknown as { findPlace?: unknown }).findPlace = undefined;
     expect(returnToPlace({ ...ctx, bridge: noPlace }, 'home').reason).toBe('place-navigation-capability-unavailable');
-    expect(collectNearby(ctx).outcome).toBe('failed');
+    const noCollect = new FakeClientBridge(); (noCollect as unknown as { collectNearby?: unknown }).collectNearby = undefined;
+    expect(collectNearby({ ...ctx, bridge: noCollect }).outcome).toBe('failed');
+    const noGather = new FakeClientBridge(); (noGather as unknown as { digBlock?: unknown }).digBlock = undefined;
+    expect(gatherBlocks({ ...ctx, bridge: noGather }, 'stone').outcome).toBe('failed');
+  });
+
+  it('collects and gathers in the simulated body when the capability exists', () => {
+    const bridge = new FakeClientBridge();
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: () => {} };
+    bridge.seedDrop(1, 0, 'stone');
+    expect(collectNearby(ctx)).toMatchObject({ ok: true, outcome: 'confirmed' });
+    bridge.block(0, 1, 'stone');
+    expect(gatherBlocks(ctx, 'stone')).toMatchObject({ ok: true, outcome: 'confirmed' });
+    expect(bridge.cell(0, 1)).toBe('free');
     expect(gatherBlocks(ctx, 'stone').outcome).toBe('failed');
   });
 

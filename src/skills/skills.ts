@@ -3,7 +3,7 @@ import type { Lease, Progress } from '../execution/runtime.js';
 import { navigate } from './navigation.js';
 
 export type SkillContext = { bridge: ClientBridgeCapabilities; lease: Lease; report: (progress: Omit<Progress, 'at'>) => void; isCanceled?: () => boolean; clock?: import('../contracts/index.js').Clock };
-export type SkillResult = { ok: boolean; outcome: 'confirmed' | 'ambiguous' | 'failed' | 'canceled'; value?: unknown; reason?: string };
+export type SkillResult = { ok: boolean; outcome: 'confirmed' | 'partial' | 'ambiguous' | 'failed' | 'canceled'; value?: unknown; reason?: string };
 const canceled = (ctx: SkillContext) => { if (ctx.isCanceled?.()) return true; return false; };
 
 export function navigateTo(ctx: SkillContext, target: { x: number; y: number }, budget = 3): SkillResult {
@@ -89,8 +89,30 @@ export function digOne(ctx: SkillContext, target: { x: number; y: number }): Ski
     return cleared ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'ambiguous', value: result, reason: 'target-still-blocked' };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
 }
-export function collectNearby(ctx: SkillContext): SkillResult { return canceled(ctx) ? { ok: false, outcome: 'canceled' } : { ok: false, outcome: 'failed', reason: 'collection-capability-unavailable' }; }
-export function gatherBlocks(ctx: SkillContext, block: string): SkillResult { return !block ? { ok: false, outcome: 'failed', reason: 'block-required' } : { ok: false, outcome: 'failed', reason: 'gather-capability-unavailable' }; }
+export function collectNearby(ctx: SkillContext): SkillResult {
+  if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  if (!ctx.bridge.collectNearby) return { ok: false, outcome: 'failed', reason: 'collection-capability-unavailable' };
+  ctx.report({ stage: 'dispatch', completed: 0, total: 1 });
+  try {
+    const result = ctx.bridge.collectNearby();
+    ctx.report({ stage: 'verify', completed: 1, total: 1 });
+    return { ok: result.accepted, outcome: result.accepted ? (result.collected > 0 ? 'confirmed' : 'partial') : 'ambiguous', value: result };
+  } catch (error) { return { ok: false, outcome: 'failed', reason: error instanceof Error ? error.message : String(error) }; }
+}
+export function gatherBlocks(ctx: SkillContext, block: string): SkillResult {
+  if (!block) return { ok: false, outcome: 'failed', reason: 'block-required' };
+  if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  if (!ctx.bridge.digBlock || !ctx.bridge.adjacentBlock) return { ok: false, outcome: 'failed', reason: 'gather-capability-unavailable' };
+  ctx.report({ stage: 'dispatch', completed: 0, total: 1 });
+  const target = ctx.bridge.adjacentBlock(block);
+  if (!target) return { ok: false, outcome: 'failed', reason: `no-adjacent-block:${block}` };
+  try {
+    const result = ctx.bridge.digBlock(target.x, target.y, block);
+    ctx.report({ stage: 'verify', completed: 1, total: 1 });
+    const cleared = ctx.bridge.cell(target.x, target.y) !== 'blocked';
+    return cleared ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'ambiguous', value: result, reason: 'target-still-blocked' };
+  } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
+}
 export function returnToPlace(ctx: SkillContext, placeId: string, budget = 3): SkillResult {
   if (!placeId) return { ok: false, outcome: 'failed', reason: 'place-required' };
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };

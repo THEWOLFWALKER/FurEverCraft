@@ -12,7 +12,7 @@ export class FakeClientBridge {
  disconnect(){this.session++;}
  configureFault(op:'walk'|'place'|'snapshot', config?:FakeFaultConfig){if(config)this.faults![op]={...config};else delete this.faults![op];}
  private fault(op:'walk'|'place'|'snapshot'){const c=this.faults?.[op];if(!c)return; if(c.count!==undefined){if(c.count<=0)return;c.count--;} if(c.fault==='delay')this.sleep(c.delayMs??0); if(c.fault==='disconnect'){this.disconnect();throw new Error('bridge-disconnected');} if(c.fault==='failure')throw new Error(c.error??'bridge-failure'); return c.fault;}
- block(x:number,y:number){this.cells.set(`${x},${y}`,'blocked');} setUnknown(x:number,y:number){this.cells.set(`${x},${y}`,'unknown');} cell(x:number,y:number){return this.cells.get(`${x},${y}`)??'unknown';}
+ block(x:number,y:number,type='stone'){this.cells.set(`${x},${y}`,'blocked');this.blockTypes.set(`${x},${y}`,type);} setUnknown(x:number,y:number){this.cells.set(`${x},${y}`,'unknown');} cell(x:number,y:number){return this.cells.get(`${x},${y}`)??'unknown';}
  walk(x:number,y:number){const f=this.fault('walk');if(f==='drop')return;if(this.ui!=='gameplay')throw new Error('ui-conflict');if(Math.abs(x-this.position.x)+Math.abs(y-this.position.y)!==1)throw new Error('non-adjacent');if(this.cell(x,y)!=='free')throw new Error('blocked-or-unknown');this.position={x,y};this.seq++;if(f==='ambiguous')throw new Error('bridge-ambiguous');}
  place(x:number,y:number){const f=this.fault('place');if(f==='drop')return {accepted:false,ambiguous:true,commandId:nextId('place'),seq:this.seq};if(this.inventory<1)throw new Error('empty-inventory');if(Math.abs(x-this.position.x)+Math.abs(y-this.position.y)!==1||this.cell(x,y)!=='free')throw new Error('invalid-place');this.inventory--;this.block(x,y);const r={accepted:true,commandId:nextId('place'),seq:this.seq};return f==='ambiguous'?{...r,ambiguous:true}:r;}
  setUi(ui:UiMode){this.ui=ui;}
@@ -20,7 +20,15 @@ export class FakeClientBridge {
  lookAt(x:number,y:number){const dx=x-this.position.x,dy=y-this.position.y;const yawDegrees=(Math.atan2(-dx,dy)*180/Math.PI+360)%360;this.seq++;return {accepted:true,yawDegrees};}
  dig(x:number,y:number){if(this.ui!=='gameplay')throw new Error('ui-conflict');if(Math.abs(x-this.position.x)+Math.abs(y-this.position.y)!==1)throw new Error('non-adjacent');if(this.cell(x,y)!=='blocked')throw new Error('target-not-blocked');this.cells.set(`${x},${y}`,'free');this.seq++;return {accepted:true,commandId:nextId('dig'),seq:this.seq};}
  private readonly places=new Map<string,{x:number,y:number}>();
+ private readonly blockTypes=new Map<string,string>();
  rememberPlace(placeId:string,x:number,y:number){this.places.set(placeId,{x,y});}
  findPlace(placeId:string){return this.places.get(placeId);}
+ /** Simulated entity drops near the body. Absent unless the fixture seeds them. */
+ private readonly drops:Array<{x:number,y:number,item:string}>=[];
+ seedDrop(x:number,y:number,item='stone'){this.drops.push({x,y,item});}
+ collectNearby(){const nearby=this.drops.filter(drop=>Math.abs(drop.x-this.position.x)+Math.abs(drop.y-this.position.y)<=1);for(const drop of nearby)this.drops.splice(this.drops.indexOf(drop),1);this.inventory+=nearby.length;this.seq++;return {accepted:true,commandId:nextId('collect'),collected:nearby.length,items:nearby.map(drop=>drop.item)};}
+ /** Simulated mining of an adjacent blocked cell of the requested block type. */
+ digBlock(x:number,y:number,block:string){if(this.ui!=='gameplay')throw new Error('ui-conflict');if(Math.abs(x-this.position.x)+Math.abs(y-this.position.y)!==1)throw new Error('non-adjacent');if(this.cell(x,y)!=='blocked')throw new Error('target-not-blocked');if((this.blockTypes.get(`${x},${y}`)??'stone')!==block)throw new Error('wrong-block-type');this.cells.set(`${x},${y}`,'free');this.blockTypes.delete(`${x},${y}`);this.inventory++;this.seq++;return {accepted:true,commandId:nextId('dig'),block};}
+ adjacentBlock(block:string){for(const [key,cell] of this.cells){if(cell!=='blocked')continue;if((this.blockTypes.get(key)??'stone')!==block)continue;const [x,y]=key.split(',').map(Number) as [number,number];if(Math.abs(x-this.position.x)+Math.abs(y-this.position.y)===1)return {x,y};}return undefined;}
  snapshot(gap=false):WorldSnapshot {const f=this.fault('snapshot');const unavailable=f==='drop'||f==='ambiguous';const now=this.seq;const fields: Record<string,{source:'simulated';observedAt:number;expiresAt:number;freshness:'unknown'|'current';available:boolean}> = Object.fromEntries(['position','cells','inventory','ui'].map(k=>[k,{source:'simulated',observedAt:now,expiresAt:now+1,freshness:unavailable?'unknown':'current',available:!unavailable}]));return clone({context:this.context,revision:String(this.seq),position:{...this.position},cells:Object.fromEntries(this.cells),inventory:this.inventory,ui:this.ui,source:'simulated',freshness:unavailable?'unknown':'current',gap:gap||unavailable,fields});}
 }

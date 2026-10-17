@@ -18,6 +18,11 @@ export interface ClientBridgeCapabilities {
   lookAt?(x: number, y: number): { accepted: boolean; yawDegrees: number };
   /** Optional dig. Absent means mining is unavailable in this profile. */
   dig?(x: number, y: number): { accepted: boolean; ambiguous?: boolean; commandId: string };
+  /** Optional typed mining and adjacent-block discovery for gather_blocks. */
+  digBlock?(x: number, y: number, block: string): { accepted: boolean; commandId: string; block: string };
+  adjacentBlock?(block: string): { x: number; y: number } | undefined;
+  /** Optional entity/drop collection for collect_nearby. */
+  collectNearby?(): { accepted: boolean; commandId: string; collected: number; items: string[] };
   /** Optional remembered-place lookup for return_to_place. */
   findPlace?(placeId: string): { x: number; y: number } | undefined;
 }
