@@ -14,4 +14,10 @@ export interface ClientBridgeCapabilities {
   place(x: number, y: number): PlaceReceipt;
   setUi(ui: 'gameplay' | 'chat' | 'inventory'): void;
   dispatchChat?(text: string): { accepted: boolean; ambiguous?: boolean; commandId: string; seq: number };
+  /** Optional oriented look. Absent means the body cannot orient; skills must fail closed. */
+  lookAt?(x: number, y: number): { accepted: boolean; yawDegrees: number };
+  /** Optional dig. Absent means mining is unavailable in this profile. */
+  dig?(x: number, y: number): { accepted: boolean; ambiguous?: boolean; commandId: string };
+  /** Optional remembered-place lookup for return_to_place. */
+  findPlace?(placeId: string): { x: number; y: number } | undefined;
 }

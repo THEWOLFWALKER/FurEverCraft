@@ -3,7 +3,7 @@ import { FakeClientBridge } from '../../src/bridge/fake/index.js';
 import { ManualClock } from '../../src/contracts/index.js';
 import { Executor, InputArbiter } from '../../src/execution/runtime.js';
 import { SQLiteStore } from '../../src/persistence/store.js';
-import { navigateTo, observeUi, placeOne, sendChat, waitForCondition } from '../../src/skills/skills.js';
+import { navigateTo, observeUi, placeOne, sendChat, waitForCondition, lookAt, digOne, returnToPlace, collectNearby, gatherBlocks } from '../../src/skills/skills.js';
 
 describe('W05/W06 execution lifecycle and skills', () => {
   it('deduplicates proposals and reports lifecycle progress', async () => {
@@ -42,6 +42,33 @@ describe('W05/W06 execution lifecycle and skills', () => {
     expect(waitForCondition({ ...ctx, isCanceled: () => true }, 1).outcome).toBe('canceled');
     expect(bridge.inventory).toBe(7);
     expect(bridge.cell(2, 0)).toBe('blocked');
+  });
+
+  it('fails closed for the newer skills when the body cannot support them', async () => {
+    const bridge = new FakeClientBridge();
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: () => {} };
+    const noLook = new FakeClientBridge(); (noLook as unknown as { lookAt?: unknown }).lookAt = undefined;
+    expect(lookAt({ ...ctx, bridge: noLook }, { x: 1, y: 0 }).reason).toContain('orientation-unavailable');
+    const noDig = new FakeClientBridge(); noDig.block(1, 0); (noDig as unknown as { dig?: unknown }).dig = undefined;
+    expect(digOne({ ...ctx, bridge: noDig }, { x: 1, y: 0 }).reason).toBe('dig-capability-unavailable');
+    const noPlace = new FakeClientBridge(); (noPlace as unknown as { findPlace?: unknown }).findPlace = undefined;
+    expect(returnToPlace({ ...ctx, bridge: noPlace }, 'home').reason).toBe('place-navigation-capability-unavailable');
+    expect(collectNearby(ctx).outcome).toBe('failed');
+    expect(gatherBlocks(ctx, 'stone').outcome).toBe('failed');
+  });
+
+  it('supports look_at, dig_one and return_to_place against the simulated body', () => {
+    const bridge = new FakeClientBridge();
+    const progress: string[] = [];
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: (p: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number }) => progress.push(p.stage) };
+    expect(lookAt(ctx, { x: 0, y: 1 })).toMatchObject({ ok: true, outcome: 'confirmed' });
+    bridge.block(1, 0);
+    expect(digOne(ctx, { x: 1, y: 0 })).toMatchObject({ ok: true, outcome: 'confirmed' });
+    expect(bridge.cell(1, 0)).toBe('free');
+    bridge.rememberPlace('home', 2, 0);
+    expect(returnToPlace(ctx, 'home').outcome).toBe('confirmed');
+    expect(bridge.position).toEqual({ x: 2, y: 0 });
+    expect(returnToPlace(ctx, 'missing').reason).toContain('unknown-place');
   });
 
   it('watchdog marks an abandoned execution failed', async () => {
