@@ -25,11 +25,11 @@ describe('Windows helper driver offline contract', () => {
     await driver.getWindowState();
     expect(() => driver.click('left', 'click-1', 1_000)).toThrow('input-expired');
     await expect(driver.typeText('a\0b', 'text-1', 2_000)).rejects.toThrow('invalid-text');
-    const first = await driver.moveRelative(1, 2, 'move-id', 2_000);
-    const second = await driver.moveRelative(1, 2, 'move-id', 2_000);
-    expect(first).toEqual({ command: 'moveRelative', dryRun: true });
-    expect(second).toEqual({ duplicate: true });
-    expect(transport.requests.filter(request => request.command === 'moveRelative')).toHaveLength(1);
+    const firstText = await driver.typeText('hello', 'text-id', 2_000);
+    const secondText = await driver.typeText('hello', 'text-id', 2_000);
+    expect(firstText).toEqual({ command: 'typeText', dryRun: true });
+    expect(secondText).toEqual({ duplicate: true });
+    expect(transport.requests.filter(request => request.command === 'typeText')).toHaveLength(1);
     now = 2_000;
     expect(() => driver.setHeldInputs({}, 3, 2_000)).toThrow('input-expired');
     await driver.shutdown();
