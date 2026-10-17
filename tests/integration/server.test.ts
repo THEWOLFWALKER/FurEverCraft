@@ -109,7 +109,7 @@ describe('control server offline integration', () => {
   it('streams a snapshot, durable command event, and honors cursor headers', async () => {
     const runtime = createRuntime();
     try {
-      const server = createControlServer(runtime, { maxSseEvents: 1, heartbeatMs: 60_000, pollMs: 10 });
+      const server = createControlServer(runtime, { maxSseEvents: 8, heartbeatMs: 60_000, pollMs: 10 });
       const { baseUrl, close } = await listen(server);
       try {
         const command = await fetch(`${baseUrl}/api/v1/commands`, {
@@ -122,19 +122,22 @@ describe('control server offline integration', () => {
         expect(stream.status).toBe(200);
         expect(stream.headers.get('content-type')).toContain('text/event-stream');
         const reader = stream.body!.getReader();
-        const body = await readUntil(reader, text => text.includes('\n\n'));
+        const body = await readUntil(reader, text => text.includes('event: runtime.pausing'));
         await reader.cancel();
         streamController.abort();
         expect(body).toContain('event: snapshot');
-        expect(body).not.toContain('event: runtime.pausing');
-        expect(body).toMatch(/id: 1\n/);
-        expect(JSON.parse(body.match(/event: snapshot\ndata: (.+)\n\n/)![1]!)).toMatchObject({ paused: true, cursor: '1', gap: false });
+        // Snapshot watermark precedes every replayed event so resume cannot skip or duplicate ids.
+        expect(body.indexOf('event: snapshot')).toBeLessThan(body.indexOf('event: runtime.pausing'));
+        const snapshotId = Number(body.match(/id: (\d+)\nevent: snapshot/)![1]);
+        const eventId = Number(body.match(/id: (\d+)\nevent: runtime.pausing/)![1]);
+        expect(eventId).toBeGreaterThan(snapshotId);
+        expect(JSON.parse(body.match(/event: snapshot\ndata: (.+)\n\n/)![1]!)).toMatchObject({ paused: true, cursor: String(snapshotId), gap: false });
 
         const replayController = new AbortController();
-        const replay = await fetch(`${baseUrl}/events`, { headers: { 'last-event-id': '1' }, signal: replayController.signal });
+        const replay = await fetch(`${baseUrl}/events`, { headers: { 'last-event-id': String(eventId) }, signal: replayController.signal });
         expect(replay.status).toBe(200);
         const replayReader = replay.body!.getReader();
-        const replayBody = await readUntil(replayReader, text => text.includes('\n\n'));
+        const replayBody = await readUntil(replayReader, text => text.includes('event: snapshot'));
         await replayReader.cancel();
         replayController.abort();
         expect(replayBody).toContain('event: snapshot');

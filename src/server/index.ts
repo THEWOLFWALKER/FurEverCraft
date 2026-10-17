@@ -116,9 +116,9 @@ function startEvents(control: Control, request: IncomingMessage, response: Serve
 
   const initial = control.events(cursor, options.maxSseEvents);
   if (initial.gap) emit('gap', { gap: true, availableFrom: initial.availableFrom, cursor: initial.scannedCursor }, initial.scannedCursor);
-  const snapshotCursor = initial.events[0]?.seq ?? cursor;
-  const snapshot = { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor: snapshotCursor, gap: initial.gap };
-  emit('snapshot', snapshot, initial.scannedCursor);
+  // The snapshot reflects everything already consumed up to `cursor`; replay follows strictly ascending ids.
+  const snapshot = { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor, gap: initial.gap };
+  emit('snapshot', snapshot, cursor);
   for (const event of initial.events) { if (!emit(event.kind, event.payload, event.seq)) break; cursor = event.seq; }
   if (initial.events.length) cursor = initial.next;
 
@@ -130,7 +130,13 @@ function startEvents(control: Control, request: IncomingMessage, response: Serve
       for (const event of read.events) { if (!emit(event.kind, event.payload, event.seq)) return; cursor = event.seq; }
     } catch { finish(); }
   }, options.pollMs);
-  heartbeat = setInterval(() => { if (!closed) response.write(`: heartbeat ${Date.now()}\n\n`); }, options.heartbeatMs);
+  heartbeat = setInterval(() => {
+    if (closed || response.writableNeedDrain) return;
+    const frame = `: heartbeat\n\n`;
+    if (bytes + Buffer.byteLength(frame) > options.maxSseBytes) { finish(); return; }
+    bytes += Buffer.byteLength(frame);
+    response.write(frame);
+  }, options.heartbeatMs);
   request.on('aborted', finish);
   request.on('close', finish);
   response.on('close', finish);

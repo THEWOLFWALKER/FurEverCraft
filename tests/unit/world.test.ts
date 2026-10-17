@@ -4,21 +4,28 @@ import { WorldState } from '../../src/state/world.js';
 
 describe('W03 world state and fake bridge contracts', () => {
   const context = { serverProfileId:'simulated', worldGenerationId:'world-1', connectionEpoch:'1', bodyEpoch:'1', dimension:'overworld' } as const;
-  const observation = (bridge: FakeClientBridge, sequence: string, observedAt=0) => ({ ...bridge.snapshot(), observedAt, sequence, sourceEpoch: bridge.sessionEpoch, ttl: 100 });
+  const observation = (bridge: FakeClientBridge, sequence: string, observedAt=0, baseline:'full'|'delta'='delta') => ({ ...bridge.snapshot(), observedAt, sequence, sourceEpoch: bridge.sessionEpoch, ttl: 100, baseline });
   it('keeps queries immutable and rejects session mismatch', () => {
     const bridge = new FakeClientBridge(); const state = new WorldState(context, () => 10);
-    state.apply(observation(bridge, '1')); const view = state.snapshot(); view.position.x = 99; view.cells['1,1'] = 'blocked';
+    state.apply(observation(bridge, '1', 0, 'full')); const view = state.snapshot(); view.position.x = 99; view.cells['1,1'] = 'blocked';
     expect(state.snapshot().position.x).toBe(0); expect(state.snapshot().cells['1,1']).toBe('free');
     expect(() => state.apply({ ...observation(bridge, '2'), context:{ ...context, dimension:'nether' } })).toThrow('world-context-mismatch');
   });
-  it('marks sequence gaps and only invalidates the affected projection', () => {
+  it('marks sequence gaps and invalidates affected cells', () => {
     const bridge = new FakeClientBridge(); const state = new WorldState(context);
-    state.apply(observation(bridge, '1')); bridge.block(1, 1); const next = state.apply(observation(bridge, '3'));
+    state.apply(observation(bridge, '1', 0, 'full')); bridge.block(1, 1); const next = state.apply(observation(bridge, '3'));
     expect(next.gap).toBe(true); expect(next.cells['1,1']).toBe('unknown'); expect(next.position).toEqual({x:0,y:0});
   });
-  it('marks expired fields stale', () => {
+  it('marks expired fields stale at read time', () => {
     const bridge = new FakeClientBridge(); const state = new WorldState(context, () => 500);
-    const result = state.apply(observation(bridge, '1', 0)); expect(result.fields.position.freshness).toBe('stale'); expect(result.fields.position.available).toBe(false);
+    const result = state.apply(observation(bridge, '1', 0, 'full')); expect(result.fields.position.freshness).toBe('stale'); expect(result.fields.position.available).toBe(false);
+  });
+  it('does not treat a delta without a baseline as complete until a full snapshot arrives', () => {
+    const bridge = new FakeClientBridge(); const state = new WorldState(context);
+    const delta = state.apply(observation(bridge, '1'));
+    expect(delta.gap).toBe(true); expect(Object.values(delta.cells).every(cell => cell === 'unknown')).toBe(true);
+    const full = state.apply(observation(bridge, '9', 0, 'full'));
+    expect(full.gap).toBe(false); expect(full.cells['1,1']).toBe('free');
   });
   it('injects delayed, failed, dropped, disconnected and ambiguous effects', () => {
     let delayed = 0; const bridge = new FakeClientBridge(12, { delay: ms => { delayed += ms; }, faults: { walk:{fault:'delay',delayMs:7}, place:{fault:'ambiguous'} } });
