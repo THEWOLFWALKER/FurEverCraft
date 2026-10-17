@@ -20,6 +20,41 @@
 
 - 测试不得建立在错误或未经合同支持的前提上。每个断言必须对应真实实现、公开合同或明确夹具语义；禁止为了通过测试把 fixture 行为、模拟常量或不存在的能力当作生产事实。测试失败时先审查前提和实现边界，再修改代码；不得通过削弱断言、静默跳过或伪造成功消除失败。
 
+## 当前架构依据
+
+当前开发批次以 v0.2 设计和 `NEXT_BATCH.md` 为准；旧 phase2 的 1.20.4/protocol 765 terminating-proxy 设计已退役为历史，不可作为当前实现目标。当前目标 Minecraft Java 26.3；身体接入路线是原始 TCP Relay + 只读 Observer sidecar，不是双端终止代理或第二玩家。
+
+本批授权范围完整包含 F01-F06、B01-B06、U01-U04、M01-M05、A01-A05、V01-V04。按依赖连续实施，不在单条链路后停下，不缩成最小演示；缺外部验证环境只限制对应验证，不阻塞独立代码和离线工作。
+
+真实服务器/世界、付费模型 API、真实 Windows SendInput、桌面截图、游戏资产下载仍禁止。离线 loopback 无游戏引擎协议夹具允许。实现可以有 gated live code，但默认所有外部能力关闭。
+
+在准确更新以下冲突节后，保留原文件其余内容作为迁移历史和未冲突约束：
+
+- `DECISIONS.md` 已将 legacy 决策标为 history；
+- README 的当前入口与游戏版本以 v0.2 为准；
+- package scripts 以 NEXT_BATCH 最终命令清单为目标，实际未实现命令不得报告已可用。
+
+## 持续交付规则
+
+- 先记录实际本地 HEAD/工作区状态，沿用已有 C1/C2/C3 修复，不重建、不 reset、不覆盖用户改动。
+- 按基础修复 → C1 → C2 → C3 → V 的顺序完成，允许独立子项交错，但每条链路需完整证据后再关闭。
+- 每个阶段提交可 review 的本地 Git commit；不要自行 push。
+- 测试必须基于合同/可观察行为，使用临时隔离 DB、注入 transport 和虚拟时间；不得用假常量证明产品能力。
+- Node 22 CI 配置不等于 CI 已运行通过；报告本机版本和实际结果。
+- 最终报告按 F/B/U/M/A/V 编号列 implemented-offline、implemented-unverified、blocked、not-implemented；区分实现状态与验证状态。
+
+## 版本和范围纠偏
+
+当前设计权威是 `docs/design/*-v0.2.md` 与 `NEXT_BATCH.md`。目标 Minecraft Java 26.3；生产身体链路是原始 TCP Relay + 只读 Observer sidecar，不是应用层终止代理、不是第二玩家。旧 `DECISIONS.md` 中 1.20.4/765 和 terminating proxy 只保留作历史，不得作为当前能力。
+
+本批完整授权 F01-F06、B01-B06、U01-U04、M01-M05、A01-A05、V01-V04。按依赖持续完成，不在一条链路后停止，不缩减成最小 demo。基础修复、C1/C2/C3 和离线验证都属于本批。
+
+允许使用不冲突的子代理并行；主代理必须整合、review 并跑完整离线验证。提交按可 review 阶段组织，但不擅自 push/deploy/open PR。
+
+禁止真实 Minecraft 服务器/世界、付费模型 API、实际 SendInput、桌面截图和游戏资产下载。127.0.0.1 无游戏引擎 fixtures、注入 transport 与本地依赖/codegen 获取允许。缺真实环境只影响对应验证，不阻塞独立代码实现。外部 gates 独立且默认 false。
+
+报告须按 F/B/U/M/A/V 标明实现状态与验证状态；CI 配置不等于 CI 已通过，loopback/codec fixture 不等于 live compatibility。遵守 `TESTING_RULE.md`，测试前提须对应合同、异步行为必须 await、测试 DB 隔离清理、unknown/ambiguous 不升级成功。
+
 ## 不变量
 
 - 唯一真实客户端为身体，无客户端 Mod/注入、无服务端组件、普通玩家权限。

@@ -1,136 +1,58 @@
-# FurEverCraft Phase 2.1 Convergence Delivery Report
+# FurEverCraft v0.2 Development Batch – Readiness Report
 
-## Status
+Status: v0.2 design and implementation batch synchronized; implementation has not started. The previous phase2.1 convergence commits are preserved as the working baseline, not treated as proof of v0.2 completion.
 
-C1, C2, and C3 convergence work is in progress. This report distinguishes implemented offline behavior from remaining integration work; it does not claim full completion from test counts. Real Minecraft servers/worlds, paid model APIs, Windows SendInput, and desktop capture were not used.
+## Stable baseline
 
-## Baseline and local commits
+Repository: `/home/orca/projects/furevercraft-phase2-handoff`
+Starting HEAD: `c345159` before documentation alignment; local baseline includes the prior convergence chain through `2eb776d`.
+Starting worktree: clean before documentation sync.
+Current architecture authority: `docs/design/minecraft-agent-top-level-design-v0.2.md`, `docs/design/minecraft-agent-client-bridge-contracts-v0.2.md`, `docs/design/minecraft-agent-motion-navigation-recovery-v0.2.md`, and `NEXT_BATCH.md`.
 
-Starting implementation repository: `/home/orca/projects/furevercraft-phase2-handoff`.
-Starting HEAD: `241f94b`, containing the earlier audit remediation commits.
+## Documents synchronized
 
-Convergence commits currently present locally:
+- Added the three v0.2 design documents under `docs/design/`.
+- Added the 26.3 proxy route research under `docs/research/`.
+- Added `NEXT_BATCH.md` with the full F01-F06/B01-B06/U01-U04/M01-M05/A01-A05/V01-V04 delivery scope.
+- Replaced `START_HERE.md` with the current full-batch brief.
+- Marked legacy `DECISIONS.md` 1.20.4/protocol 765 terminating-proxy material as historical and superseded.
+- Updated root `README.md` to identify v0.2 current authority, the 26.3 raw-relay + read-only observer route, hard boundaries, and intended commands.
+- Updated `CLAUDE.md` and `AGENTS.md` with v0.2 priority, complete scope, subagent allowance, review discipline, and test premise rules.
+- Updated `PROGRESS.md` with F/B/U/M/A/V task groups and separate implementation/verification evidence columns.
 
-- `f0dd68a implement C1 runtime and provider consistency`
-- `36981f7 implement C2 effect recovery persistence`
-- `2eb776d integrate convergence verification and recovery lifecycle`
+## Prior baseline verification (not v0.2 evidence)
 
-## Implemented in this convergence pass
+At the prior phase2.1 checkpoint on Linux/Node 20.19.5, `npm run typecheck`, `npm run build`, `npm run test:offline`, six-scenario offline demo, simulated doctor, bridge fixture, and bridge inspect had passed; test result then was 9 files / 42 tests. This is historical evidence only. It does not prove Minecraft 26.3, raw TCP relay, web/control service, 3D motor, Node 22, or live integration.
 
-### Shared foundation and C1
+## Current v0.2 scope
 
-- Added `src/execution/factory.ts` as a central runtime assembly entry for bridge, Store, SessionRuntime, ToolRouter, Provider, AgentLoop, and Clock.
-- Added bridge capability interfaces in `src/bridge/capabilities.ts` and moved several runtime/skill paths away from FakeClientBridge concrete typing.
-- Added provider network gating to FetchTransport; production fetch is denied unless explicitly enabled.
-- AgentLoop now works on a cloned history, carries canonical tool-call metadata, checks target revision when configured, and does not reorder the model's original tool-call list when executing writes.
-- Added skill-specific strict argument validation.
-- Added richer skill manifest metadata and injected-clock waiting support.
-- Added provider serializer/network-gate tests.
+All 30 tasks are authorized and remain in scope:
 
-### C2
+- F01-F06: RuntimeFactory/Clock/owner, execution and admission, durable effects, Store/state/event corrections, providers, docs/rules.
+- B01-B06: fixed 26.3 version manifest, raw TCP Relay, bounded sidecar Observer, domain projection, Windows gateway contract, IPC/Supervisor/CLI assembly.
+- U01-U04: shared ControlService, Fastify API/SSE/auth, React control UI, simultaneous CLI/web CAS and tests.
+- M01-M05: sparse 3D projection, local action graph/A*, supported primitive closures, independent SimulatedBody, progress/recovery controller.
+- A01-A05: autonomous task loop, knowledge/spatial/episodic memory, eleven skills, session supervision/auth coordination, bounded capture/capability/long-run policies.
+- V01-V04: 14 integrated scenarios, crash/write/soak tests, trace/replay/docs, Node 22 CI and coordinated review.
 
-- Added effect state validation and guarded transitions in SQLiteStore.
-- Added pending/completed/unknown action receipt lifecycle and replay protection.
-- Applied schema initialization and migration markers transactionally; added effect/checkpoint execution references and foreign-key behavior.
-- Added SessionRuntime lifecycle states, owner/boot identity, recovery failure reporting, and retryable failure state.
-- Recovery no longer uses inventory `< 8`; place reconciliation checks context, intent coordinates, and current target cell. Insufficient or mismatched evidence stays ambiguous.
-- Added filtered EventHub cursor behavior and durable replay tests.
-- Added `tests/unit/c2-recovery-events.test.ts` for receipts, recovery windows, context mismatch, no input replay, and durable/filtered events.
+## Hard boundaries
 
-### C3 and Windows convergence
+No real Minecraft server/world, no game server, no paid model API, no actual Windows SendInput, no desktop capture, no game asset download. Loopback fixtures have no game engine. Production live code must remain explicitly gated; default network/model/OS/capture permissions are false.
 
-- Added `MinecraftBytePacketTransport` using the installed minecraft-protocol codec and a fragmented loopback byte transport fixture.
-- Added test coverage from encoded packet bytes through fragmented transport to decoded protocol packet observation.
-- ProtocolSession now tracks downstream and upstream phase fields while retaining a compatibility phase accessor.
-- Composite provenance no longer promotes fixture source to client based only on observer presence; gap/degraded observations affect bridge limitations.
-- CLI bridge supports `fixture`, `inspect`, and gated `live` modes. Live mode refuses unless explicit upstream permission exists and then reports unavailable real environment rather than pretending to connect.
-- Windows driver/helper behavior was strengthened by earlier remediation commits: request ID matching, command ID dedup for text and pointer events, disabled cleanup path, binding/input checks, heartbeat and cleanup behavior.
-- Added `bridge:protocol` npm script and CI invocations for demo, doctor, bridge fixture, and inspect.
+Tests must use contract-correct premises, explicit fixture provenance, awaited async assertions, isolated temporary DBs, and assert ambiguous/unknown/cleanup behavior. Do not infer completion from test count or demo labels. Do not push unless separately authorized.
 
-## Verification actually run
+## Next action
 
-Local environment: Linux, Node `v20.19.5`, npm `10.8.2`. Node 22 is configured in CI but has not been run locally.
+Begin with F01 shared RuntimeFactory, one injected Clock and bridge-neutral contracts; then progress through C1/F, C2, B/U, M/A, and V dependencies. Commit reviewable local increments, continuously update `PROGRESS.md`, and continue through all achievable tasks before final review.
 
-At the current convergence checkpoint, the following passed:
+## Truth-state matrix
 
-```text
-npm run typecheck
-npm run build
-npm run test:offline
-npm run demo:offline
-npm run doctor -- --profile simulated
-node dist/cli/main.js bridge --mode fixture --config configs/simulated.json
-node dist/cli/main.js bridge --mode inspect --config configs/client-offline.example.json
-```
-
-Latest full offline suite result at the time of this report:
-
-```text
-9 test files passed
-42 tests passed
-```
-
-Six demo scenarios ran and were labelled simulated/fixture. The crash-recovery demo kept insufficiently evidenced work ambiguous.
-
-## Remaining work before declaring C1/C2/C3 complete
-
-### C1
-
-- Finish the persistent readline console and documented command set.
-- Ensure status/doctor operate on the same long-lived Runtime rather than constructing isolated reporting instances.
-- Complete goal revision/decision-generation fencing for every write admission and late provider response.
-- Add full OpenAI assistant `tool_calls`/tool `tool_call_id` and Anthropic assistant `tool_use`/user `tool_result` multi-turn request fixtures, including provider switching.
-- Implement bounded 429/5xx retry budget with cancellation/deadline and no replay of already committed tools.
-- Complete independent versioned knowledge rules and real PNG synthetic capture fixture.
-- Ensure all demos exercise the RuntimeFactory → ToolRouter → Executor path rather than direct helper calls and descriptive labels.
-
-### C2
-
-- Integrate durable intent/dispatch permit and receipt into every external-effect skill at the actual dispatch boundary.
-- Expand crash tests to cover intent persisted before dispatch, effect applied before receipt, observation before checkpoint, disk-write failure, stale checkpoint, repeated finalizer, old epoch and same-world reconnect.
-- Confirm recovery query uses stable world/account/dimension candidate scope and separately validates new observer identity; never restore an old lease.
-- Add goal/execution/checkpoint CAS and ensure stale finalizers cannot overwrite newer revisions.
-- Verify EventHub boot cursor and durable event IDs remain distinct and filtered queries do not manufacture gaps.
-- Ensure memory query is SQL-scoped, bounded and isolated by stable world/account/dimension.
-
-### C3
-
-- Complete public loopback bridge lifecycle with separate downstream listener and upstream connector using injected loopback endpoints; the current byte transport proves codec/framing fixtures but not a full proxy session.
-- Drive phase changes from actual decoded packets/library events, not caller-set transitions.
-- Add compression changes, split/coalesced frames, status-only flow, disconnect/error, backpressure and packet ownership/duplicate suppression tests.
-- Normalize required packet families into domain observations with explicit availability and fixture provenance.
-- Ensure Composite degradation blocks dependent actions after observation gaps and recovers only after explicit resync.
-- Extract helper pre-native-call logic behind a no-op native sink so helper control flow is tested without SendInput or capture.
-- On Linux, report Windows native sink execution as unavailable/unrun; do not substitute FakeHelperTransport-only evidence for helper branch evidence.
-
-### Final verification
-
-After the remaining work, rerun:
-
-```bash
-npm ci
-npm run typecheck
-npm run build
-npm run test:offline
-npm run demo:offline
-npm run doctor -- --profile simulated
-npm run bridge:protocol -- --config configs/simulated.json
-node dist/cli/main.js bridge --mode inspect --config configs/client-offline.example.json
-```
-
-CI must run the same offline commands on Node 22. Record actual results, do not infer Node 22 success from the YAML definition.
-
-## Testing premise rule
-
-Every test must be based on a documented contract, observable behavior, or explicit fixture semantics. Do not assume fixture constants are real Minecraft facts, do not test a function against its own hard-coded return, do not assert asynchronous APIs synchronously, and do not weaken assertions or skip tests to force green. Failure review must first check the test premise and then the implementation. All DB tests use isolated temporary directories and cleanup. Provider tests use injected transports. Protocol tests use loopback endpoints without a game engine. Windows tests do not execute SendInput or desktop capture.
-
-## Unverified boundaries
-
-- No Minecraft server was started or contacted.
-- No Minecraft world was joined.
-- No paid OpenAI or Anthropic API was called.
-- No Windows SendInput was executed.
-- No desktop screenshot was captured.
-- The local host used Node 20; Node 22 is only configured in CI until CI results are observed.
-- Loopback codec tests do not establish live-server compatibility, full proxy correctness, or real-client behavior.
-- Simulated two-dimensional navigation does not establish Minecraft three-dimensional movement behavior.
+| Surface | State | Evidence |
+|---|---|---|
+| Code baseline | verified-current | local branch/history at `c345159` before documentation sync |
+| Runtime production state | out-of-scope for this doc-sync step | no code changes in this step |
+| Docs | changed-and-verified | v0.2 docs copied from checksum-verified archive; root authority references updated |
+| Rules | changed-and-verified | `CLAUDE.md`, `AGENTS.md`, `START_HERE.md` align to full v0.2 batch |
+| Memory | not-applicable | no memory write requested or made |
+| Workspace | verified-current | source archive checksum verified; no cleanup/deletion performed |
+| Remote publication | pending | this documentation sync has not been pushed |
