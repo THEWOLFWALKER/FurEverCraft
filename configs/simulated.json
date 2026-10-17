@@ -1,0 +1,10 @@
+{
+  "profile": "simulated",
+  "allowModelNetwork": false,
+  "allowMinecraftUpstream": false,
+  "allowOsInput": false,
+  "allowScreenCapture": false,
+  "provider": "scripted",
+  "serverProfileId": "simulated",
+  "worldGenerationId": "world-1"
+}

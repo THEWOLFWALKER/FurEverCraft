@@ -1,0 +1,17 @@
+{
+  "profile": "client-offline",
+  "protocolVersion": 765,
+  "minecraftVersion": "1.20.4",
+  "targetHost": "127.0.0.1",
+  "targetPort": 25565,
+  "usernameEnv": "MINECRAFT_USERNAME",
+  "allowModelNetwork": false,
+  "allowMinecraftUpstream": false,
+  "allowOsInput": false,
+  "allowScreenCapture": false,
+  "windowsHelper": {
+    "scriptPath": "native/windows/FurEverCraft.Helper.ps1",
+    "heartbeatIntervalMs": 2000,
+    "dryRun": true
+  }
+}
