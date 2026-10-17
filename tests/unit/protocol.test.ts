@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   LoopbackFixtureTransport,
+  LoopbackByteTransport,
+  MinecraftBytePacketTransport,
+  createLoopbackBytePair,
   OfflineProtocolBridge,
   ProtocolSession,
   PROTOCOL_VERSION,
@@ -47,6 +50,24 @@ describe('offline protocol bridge fixture', () => {
     await bridge.start();
     await expect(bridge.forward({ name: 'chat', direction: 'downstream', phase: 'PLAY', params: {} })).rejects.toThrow('packet-phase-mismatch');
     await expect(bridge.forward({ name: 'not_a_packet', direction: 'downstream', phase: 'HANDSHAKE', params: {} })).rejects.toThrow('unknown-packet');
+  });
+
+  it('decodes a real minecraft-protocol packet through fragmented loopback bytes', async () => {
+    const pair = createLoopbackBytePair([1, 1, 2, 3]);
+    const session = new ProtocolSession('byte-session');
+    const decoder = new MinecraftBytePacketTransport('left', pair.left, 'downstream', () => 'HANDSHAKE');
+    const encoder = new MinecraftBytePacketTransport('right', pair.right, 'downstream', () => 'HANDSHAKE');
+    const decoded: unknown[] = [];
+    decoder.onPacket(packet => decoded.push(packet));
+    await encoder.send({ name: 'set_protocol', direction: 'downstream', phase: 'HANDSHAKE', params: { protocolVersion: PROTOCOL_VERSION, serverHost: 'localhost', serverPort: 25565, nextState: 2 } });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(decoded).toHaveLength(1);
+    expect(decoded[0]).toMatchObject({ name: 'set_protocol', direction: 'downstream', phase: 'HANDSHAKE' });
+    const observation = session.observe('packet:set_protocol', 'downstream', decoded[0]);
+    expect(observation.source).toBe('fixture');
+    expect(observation.payload).toMatchObject({ name: 'set_protocol' });
+    await decoder.close();
+    await encoder.close();
   });
 
   it('emits normalized epochs and an explicit gap on observation overflow', () => {

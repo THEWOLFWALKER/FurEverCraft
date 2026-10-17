@@ -1,5 +1,7 @@
 import minecraftData from 'minecraft-data';
+import minecraftProtocol from 'minecraft-protocol';
 
+const { createSerializer, createDeserializer, states } = minecraftProtocol;
 export const MINECRAFT_VERSION = '1.20.4';
 export const PROTOCOL_VERSION = 765;
 
@@ -32,6 +34,84 @@ export interface PacketTransport {
   close(): Promise<void>;
 }
 
+export interface ByteTransport {
+  write(chunk: Uint8Array): Promise<void>;
+  onData(listener: (chunk: Uint8Array) => void): () => void;
+  close(): Promise<void>;
+}
+
+function writeVarInt(value: number): Buffer {
+  const bytes: number[] = [];
+  let current = value >>> 0;
+  do { let next = current & 0x7f; current >>>= 7; if (current !== 0) next |= 0x80; bytes.push(next); } while (current !== 0);
+  return Buffer.from(bytes);
+}
+
+function readVarInt(buffer: Buffer): { value: number; size: number } | undefined {
+  let value = 0;
+  for (let index = 0; index < Math.min(buffer.length, 5); index += 1) {
+    value |= (buffer[index] & 0x7f) << (7 * index);
+    if ((buffer[index] & 0x80) === 0) return { value: value >>> 0, size: index + 1 };
+  }
+  return undefined;
+}
+
+/** Encodes real minecraft-protocol packet bodies into framed bytes and decodes fragmented input. */
+export class MinecraftBytePacketTransport implements PacketTransport {
+  private readonly listeners = new Set<(packet: BridgePacket) => void>();
+  private input = Buffer.alloc(0);
+  private closed = false;
+  constructor(readonly name: string, private readonly byteTransport: ByteTransport, private readonly direction: ProtocolDirection, private readonly phase: () => BridgePhase) {
+    this.byteTransport.onData(chunk => this.consume(Buffer.from(chunk)));
+  }
+  onPacket(listener: (packet: BridgePacket) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+  async send(packet: BridgePacket): Promise<void> {
+    if (this.closed) throw new Error(`transport-closed:${this.name}`);
+    const serializer = createSerializer({ state: stateFor(packet.phase), isServer: packet.direction === 'upstream', version: MINECRAFT_VERSION, customPackets: {} });
+    const body = serializer.createPacketBuffer({ name: packet.name, params: packet.params ?? {} });
+    await this.byteTransport.write(Buffer.concat([writeVarInt(body.length), body]));
+  }
+  private consume(chunk: Buffer) {
+    if (this.closed) return;
+    this.input = Buffer.concat([this.input, chunk]);
+    while (true) {
+      const length = readVarInt(this.input); if (!length || this.input.length < length.size + length.value) return;
+      const body = this.input.subarray(length.size, length.size + length.value); this.input = this.input.subarray(length.size + length.value);
+      const parser = createDeserializer({ state: stateFor(this.phase()), isServer: this.direction === 'downstream', version: MINECRAFT_VERSION, customPackets: {}, noErrorLogging: true } as Parameters<typeof createDeserializer>[0] & { noErrorLogging?: boolean });
+      parser.on('data', (decoded: { data: { name: number | string; params?: Record<string, unknown> } }) => {
+        const mappings = packetNames(this.phase(), this.direction);
+        const name = typeof decoded.data.name === 'number' ? [...mappings][decoded.data.name] : decoded.data.name;
+        if (!name) return;
+        for (const listener of this.listeners) listener({ name, params: decoded.data.params, direction: this.direction, phase: this.phase() });
+      });
+      parser.write(body); parser.end();
+    }
+  }
+  async close() { this.closed = true; await this.byteTransport.close(); }
+}
+
+export class LoopbackByteTransport implements ByteTransport {
+  closed = false;
+  private readonly listeners = new Set<(chunk: Uint8Array) => void>();
+  constructor(readonly name: string, private peer?: LoopbackByteTransport, private readonly fragmentSizes: number[] = []) {}
+  connect(peer: LoopbackByteTransport) { this.peer = peer; }
+  onData(listener: (chunk: Uint8Array) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+  async write(chunk: Uint8Array) {
+    if (this.closed) throw new Error(`transport-closed:${this.name}`);
+    if (!this.peer) return;
+    let offset = 0; let index = 0;
+    while (offset < chunk.length) { const size = this.fragmentSizes[index++] ?? chunk.length - offset; const part = chunk.slice(offset, offset + size); offset += size; for (const listener of this.peer.listeners) listener(part); }
+  }
+  async close() { this.closed = true; }
+}
+
+export function createLoopbackBytePair(fragmentSizes = [1, 2, 3]): { left: LoopbackByteTransport; right: LoopbackByteTransport } {
+  const left = new LoopbackByteTransport('left', undefined, fragmentSizes);
+  const right = new LoopbackByteTransport('right', left, fragmentSizes);
+  left.connect(right);
+  return { left, right };
+}
+
 type Observer = (observation: NormalizedObservation) => void;
 type QueueEntry = { observation: NormalizedObservation; delivered: boolean };
 
@@ -44,9 +124,11 @@ const protocolStates: Record<BridgePhase, string> = {
   HANDSHAKE: 'handshaking', STATUS: 'status', LOGIN: 'login', CONFIGURATION: 'configuration', PLAY: 'play', CLOSED: 'play'
 };
 
+function stateFor(phase: BridgePhase) { const key = phase === 'HANDSHAKE' ? 'HANDSHAKING' : phase; return states[key as keyof typeof states] ?? states.PLAY; }
 function packetNames(phase: BridgePhase, direction: ProtocolDirection): Set<string> {
-  if (phase === 'CLOSED') return new Set();
-  const state = mcData.protocol[protocolStates[phase] as keyof typeof mcData.protocol] as { toServer: { types: Record<string, unknown> }; toClient: { types: Record<string, unknown> } };
+  const normalizedPhase = phase === ('HANDSHAKING' as BridgePhase) ? 'HANDSHAKE' : phase;
+  if (normalizedPhase === 'CLOSED') return new Set();
+  const state = mcData.protocol[protocolStates[normalizedPhase] as keyof typeof mcData.protocol] as { toServer: { types: Record<string, unknown> }; toClient: { types: Record<string, unknown> } };
   const definition = direction === 'downstream' ? state.toServer.types.packet : state.toClient.types.packet;
   const container = definition as ['container', Array<{ name: string; type: unknown }>];
   const fields = container[1] ?? [];
@@ -60,7 +142,10 @@ const stateTransitions: Record<BridgePhase, BridgePhase[]> = {
 };
 
 export class ProtocolSession {
-  phase: BridgePhase = 'HANDSHAKE';
+  readonly source = 'fixture' as const;
+  downstreamPhase: BridgePhase = 'HANDSHAKE';
+  upstreamPhase: BridgePhase = 'HANDSHAKE';
+
   private sequence = 0n;
   private readonly observers = new Set<Observer>();
   private readonly queue: QueueEntry[] = [];
@@ -72,9 +157,13 @@ export class ProtocolSession {
     private readonly observationCapacity = 128,
   ) {}
 
-  transition(next: BridgePhase): void {
-    if (!stateTransitions[this.phase].includes(next)) throw new Error(`invalid-phase-transition:${this.phase}->${next}`);
-    this.phase = next;
+  get phase(): BridgePhase { return this.downstreamPhase; }
+  set phase(value: BridgePhase) { this.downstreamPhase = value; this.upstreamPhase = value; }
+
+  transition(next: BridgePhase, direction: ProtocolDirection = 'downstream'): void {
+    const current = direction === 'downstream' ? this.downstreamPhase : this.upstreamPhase;
+    if (!stateTransitions[current].includes(next)) throw new Error(`invalid-phase-transition:${current}->${next}`);
+    if (direction === 'downstream') this.downstreamPhase = next; else this.upstreamPhase = next;
   }
 
   validatePacket(packet: BridgePacket): void {

@@ -66,8 +66,9 @@ export class WindowsHelperDriver {
   private sequence = 0;
   private bound = false;
   private state?: WindowState;
+  private boundIdentity?: { pid: number; hwnd: string };
   private heartbeatTimer?: ReturnType<typeof setInterval>;
-  private lastHeartbeat = 0;
+  private lastReleaseAt = Number.NEGATIVE_INFINITY;
   private readonly now: () => number;
   private readonly heartbeatMs: number;
   private readonly completedCommands = new Set<string>();
@@ -82,25 +83,24 @@ export class WindowsHelperDriver {
     if (response.requestId !== requestId) throw new Error('helper-response-id-mismatch');
     if (!response.ok) throw new Error(response.error ?? 'helper-error'); return response.result;
   }
-  private assertInputAllowed() { if (!this.bound) throw new Error('window-not-actionable'); if (!this.state) throw new Error('window-state-required'); if (!this.state.exists || !this.state.focused || !this.state.visible) throw new Error('window-not-actionable'); }
+  private assertInputAllowed() { if (!this.bound) throw new Error('window-not-actionable'); if (!this.state) throw new Error('window-state-required'); if (!this.state.exists || !this.state.focused || !this.state.visible || this.state.pid !== this.boundIdentity?.pid || this.state.hwnd !== this.boundIdentity?.hwnd) throw new Error('window-not-actionable'); }
   private assertFresh(leaseUntil: number) { if (leaseUntil <= this.now()) throw new Error('input-expired'); this.assertInputAllowed(); }
-  private startWatchdog() { this.stopWatchdog(); this.lastHeartbeat = this.now(); this.heartbeatTimer = setInterval(() => { if (this.now() - this.lastHeartbeat > this.heartbeatMs * 2) void this.releaseOwnedInputs().catch(() => undefined); }, this.heartbeatMs); }
+  private startWatchdog() { this.stopWatchdog(); this.heartbeatTimer = setInterval(() => { if (this.now() - this.lastReleaseAt > this.heartbeatMs * 2) { this.lastReleaseAt = this.now(); void this.releaseOwnedInputs().catch(() => undefined); } }, this.heartbeatMs); }
   private stopWatchdog() { if (this.heartbeatTimer) clearInterval(this.heartbeatTimer); this.heartbeatTimer = undefined; }
   probe() { return this.command('probe'); }
-  async bindWindow(pid: number, hwnd: string) { if (!Number.isInteger(pid) || pid <= 0 || !hwnd) throw new Error('window-identity-required'); const result = await this.command('bindWindow', { pid, hwnd }); this.bound = true; this.state = { exists: true, focused: true, visible: true, pid, hwnd }; this.startWatchdog(); return result; }
+  async bindWindow(pid: number, hwnd: string) { if (!Number.isInteger(pid) || pid <= 0 || !hwnd) throw new Error('window-identity-required'); const result = await this.command('bindWindow', { pid, hwnd }); this.bound = true; this.boundIdentity = { pid, hwnd }; this.state = { exists: true, focused: true, visible: true, pid, hwnd }; this.lastReleaseAt = this.now(); this.startWatchdog(); return result; }
   async getWindowState() {
     if (!this.bound) throw new Error('window-not-bound');
     const raw = await this.command('getWindowState') as Partial<WindowState>;
-    // Minimal dry-run helpers may omit state fields; only explicit false is non-actionable.
     const state: WindowState = {
-      exists: raw.exists !== false,
-      focused: raw.focused !== false,
-      visible: raw.visible !== false,
-      ...(raw.pid === undefined ? {} : { pid: raw.pid }),
-      ...(raw.hwnd === undefined ? {} : { hwnd: raw.hwnd }),
+      exists: raw.exists === true,
+      focused: raw.focused === true,
+      visible: raw.visible === true,
+      ...(raw.pid === undefined ? { pid: this.boundIdentity?.pid } : { pid: raw.pid }),
+      ...(raw.hwnd === undefined ? { hwnd: this.boundIdentity?.hwnd } : { hwnd: raw.hwnd }),
     };
     this.state = state;
-    if (!state.exists || !state.focused || !state.visible) await this.releaseOwnedInputs();
+    if (!state.exists || !state.focused || !state.visible || state.pid !== this.boundIdentity?.pid || state.hwnd !== this.boundIdentity?.hwnd) await this.releaseOwnedInputs();
     return state;
   }
   moveRelative(dx: number, dy: number, commandId: string, leaseUntil: number, generation = 0) {
@@ -113,7 +113,7 @@ export class WindowsHelperDriver {
     this.assertCommandId(commandId); if (!['left', 'right', 'middle'].includes(button)) throw new Error('invalid-mouse-button'); this.assertFresh(leaseUntil);
     return this.command('click', { button, commandId, leaseUntil, generation }).then(result => { this.markCommand(commandId); return result; });
   }
-  setHeldInputs(inputs: Record<string, boolean>, generation: number, leaseUntil: number) { this.assertFresh(leaseUntil); return this.command('setHeldInputs', { inputs, generation, leaseUntil }); }
+  setHeldInputs(inputs: Record<string, boolean>, generation: number, leaseUntil: number) { if (Object.entries(inputs).some(([key, value]) => !/^[0-9]{1,3}$/.test(key) || !Number.isInteger(Number(key)) || Number(key) > 255 || typeof value !== 'boolean')) throw new Error('invalid-held-input'); if (!Number.isInteger(generation) || generation < 0) throw new Error('invalid-generation'); this.assertFresh(leaseUntil); return this.command('setHeldInputs', { inputs, generation, leaseUntil }); }
   async typeText(text: string, commandId: string, leaseUntil: number, generation = 0) {
     const duplicate = this.commandIdResult(commandId); if (duplicate) return duplicate;
     this.assertCommandId(commandId); if (text.includes('\0')) throw new Error('invalid-text'); this.assertFresh(leaseUntil);
@@ -123,6 +123,6 @@ export class WindowsHelperDriver {
   private assertFinite(...values: number[]) { if (values.some(value => !Number.isFinite(value))) throw new Error('invalid-input'); }
   captureWindow() { if (!this.enabled) throw new Error('os-input-disabled'); if (!this.bound) throw new Error('window-not-bound'); return this.command('captureWindow'); }
   releaseOwnedInputs() { return this.command('releaseOwnedInputs'); }
-  async heartbeat() { this.lastHeartbeat = this.now(); return this.command('heartbeat'); }
-  async shutdown() { this.stopWatchdog(); if (this.enabled && this.bound) await this.releaseOwnedInputs(); this.bound = false; this.state = undefined; await this.command('shutdown'); await this.transport.close(); }
+  async heartbeat() { this.lastReleaseAt = this.now(); return this.command('heartbeat'); }
+  async shutdown() { this.stopWatchdog(); if (this.enabled && this.bound) await this.releaseOwnedInputs(); this.bound = false; this.boundIdentity = undefined; this.state = undefined; await this.command('shutdown'); await this.transport.close(); }
 }

@@ -13,7 +13,7 @@ export const ClientBridgeProfileSchema = z.object({
   observationLimit: z.number().int().positive().max(10_000).default(256),
 });
 export type ClientBridgeProfile = z.input<typeof ClientBridgeProfileSchema>;
-type ProtocolObserver = Pick<ProtocolSession, 'subscribe'> & { readonly sessionEpoch?: string };
+type ProtocolObserver = Pick<ProtocolSession, 'subscribe'> & { readonly sessionEpoch?: string; readonly source?: 'fixture' | 'client' };
 type WindowState = { focused?: boolean; visible?: boolean; minimized?: boolean; [key: string]: unknown };
 type CaptureResult = { data?: string; mimeType?: string; source?: string; limitation?: string; [key: string]: unknown };
 
@@ -36,11 +36,12 @@ export class CompositeClientBridge {
   private readonly unsubscribe?: () => void;
   private bound = false;
   private sensitive = false;
+  private degraded = false;
   private closed = false;
 
   constructor(private readonly options: CompositeClientBridgeOptions) {
     this.profile = ClientBridgeProfileSchema.parse(options.profile);
-    const source = this.profile.profile === 'simulated' ? 'simulated' : options.protocol ? 'client' : 'fixture';
+    const source = this.profile.profile === 'simulated' ? 'simulated' : options.protocol?.source ?? 'fixture';
     const limitations: string[] = [];
     if (!options.protocol) limitations.push('protocol-observer-unavailable');
     if (!this.profile.allowOsInput || !options.windows) limitations.push('native-input-disabled');
@@ -75,7 +76,7 @@ export class CompositeClientBridge {
   async heartbeat() { this.requireOpen(); if (!this.options.windows) throw new Error('window-health-unavailable'); return this.options.windows.heartbeat(); }
   async releaseOwnedInputs() { if (!this.options.windows) return undefined; return this.options.windows.releaseOwnedInputs(); }
   async shutdown() { if (this.closed) return; this.closed = true; this.unsubscribe?.(); try { await this.releaseOwnedInputs(); } finally { if (this.options.windows) await this.options.windows.shutdown(); } }
-  private record(observation: NormalizedObservation) { if (this.sensitive) return; if (this.observations.length >= this.profile.observationLimit) this.observations.shift(); this.observations.push(observation); }
+  private record(observation: NormalizedObservation) { if (this.sensitive) return; if (observation.kind === 'observation_gap' || observation.availability !== 'available') { this.degraded = true; if (!this.capabilities.limitations.includes('observation-gap')) this.capabilities.limitations.push('observation-gap'); } if (this.observations.length >= this.profile.observationLimit) this.observations.shift(); this.observations.push(observation); }
   private requireOpen() { if (this.closed) throw new Error('bridge-closed'); }
   private requireAction(capability: 'nativeInput' | 'screenCapture') { this.requireOpen(); if (!this.capabilities[capability]) throw new Error(`${capability}-disabled`); }
   private async assertWindowUsable() { if (!this.bound) throw new Error('window-not-bound'); const state = await this.options.windows!.getWindowState() as WindowState; if (state.focused === false || state.visible === false || state.minimized === true) { await this.options.windows!.releaseOwnedInputs(); throw new Error('window-not-usable'); } }

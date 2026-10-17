@@ -19,7 +19,7 @@ describe('Windows helper driver offline contract', () => {
 
   it('rejects expired leases and NUL text, deduplicates effects and validates response IDs', async () => {
     let now = 1_000;
-    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: { command: request.command, dryRun: true } }));
+    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: request.command === 'getWindowState' ? { exists: true, focused: true, visible: true, pid: 12, hwnd: '0xc' } : { command: request.command, dryRun: true } }));
     const driver = new WindowsHelperDriver(transport, true, () => now);
     await driver.bindWindow(12, '0xc');
     await driver.getWindowState();
