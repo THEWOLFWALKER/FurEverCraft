@@ -85,8 +85,10 @@ export class MinecraftBytePacketTransport implements PacketTransport {
       parser.on('data', (decoded: { data: { name: number | string; params?: Record<string, unknown> } }) => {
         const mappings = packetNames(this.phase(), this.direction);
         const name = typeof decoded.data.name === 'number' ? [...mappings][decoded.data.name] : decoded.data.name;
-        if (!name) return;
-        for (const listener of this.listeners) listener({ name, params: decoded.data.params, direction: this.direction, phase: this.phase() });
+        // Never silently drop an unmapped packet: surface it as an explicit unknown observation.
+        const resolved = name ?? 'unknown_packet';
+        const params = name ? decoded.data.params : { packetId: decoded.data.name, reason: 'unmapped-packet-id' };
+        for (const listener of this.listeners) listener({ name: resolved, params, direction: this.direction, phase: this.phase() });
       });
       parser.write(body); parser.end();
     }
