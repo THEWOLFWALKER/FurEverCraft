@@ -1,0 +1,24 @@
+import type { BodyContext, Clock, InputPlan } from '../contracts/index.js';
+
+export type Pose3D = { x: number; y: number; z: number; yaw: number; pitch: number };
+export type BlockPos = { x: number; y: number; z: number };
+export type Aabb = { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number };
+export type ShapeKind = 'full_cube' | 'lower_slab' | 'upper_slab' | 'air' | 'unsupported';
+export type CellKnowledge = 'free' | 'blocked' | 'unknown' | 'unsupported';
+export type FixtureSource = 'simulated' | 'fixture';
+export type ValidationProfile = { id: string; registryVersion: string; source: FixtureSource; approximate: boolean };
+export type BlockObservation = { pos: BlockPos; cell: CellKnowledge; shape: ShapeKind; source: FixtureSource; observedAt: number; revision: string; validation: ValidationProfile };
+export type VoxelSnapshot = { context: BodyContext; revision: string; blocks: ReadonlyMap<string, BlockObservation>; source: FixtureSource; freshness: 'current' | 'stale' | 'unknown' };
+export type GeometryStatus = 'clear' | 'blocked' | 'unknown' | 'unsupported';
+export type GeometryResult = { status: GeometryStatus; dependencies: string[]; reason?: string };
+export type ActionKind = 'walk' | 'slab_step' | 'jump_short' | 'controlled_drop';
+export type ActionEdge = { edgeId: string; kind: ActionKind; from: BlockPos; to: BlockPos; primitiveVersion: string; dependencies: string[]; snapshotRevision: string; risk: 'normal' | 'elevated' };
+export type PlanStatus = 'COMPLETE' | 'PARTIAL' | 'NEEDS_OBSERVATION' | 'BUDGET_EXHAUSTED' | 'NO_PATH_IN_KNOWN_GRAPH' | 'UNSUPPORTED_TRANSITION';
+export type PlanResult = { status: PlanStatus; edges: ActionEdge[]; expanded: number; snapshotRevision: string; stableEndpoint?: Pose3D; dependencies: string[]; reason?: string };
+export type InputPlan3D = InputPlan & { ownerToken: string; deadline: number; snapshotRevision: string; heldSet: readonly string[]; delta: { forward?: number; strafe?: number; yaw?: number; jump?: boolean } };
+export type InputReceipt = { commandId: string; accepted: boolean; reason?: string; observedRevision: string };
+export type BodyObservation = { context: BodyContext; pose: Pose3D; velocity: { x: number; y: number; z: number }; supported: boolean; revision: string; source: 'simulated'; gap: boolean };
+export type BodyCorrection = { pose: Pose3D; reason: string; revision: string };
+export type BodyReader = { read(): BodyObservation };
+export type InputGateway = { submit(plan: InputPlan3D): InputReceipt; release(ownerToken: string): void };
+export type MotorDeps = { context: BodyContext; clock: Clock; reader: BodyReader; input: InputGateway };

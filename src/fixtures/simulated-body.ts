@@ -1,0 +1,12 @@
+import type { BodyContext, Clock } from '../contracts/index.js';
+import type { InputPlan3D, InputReceipt, Pose3D, BodyObservation, BodyCorrection, InputGateway, BodyReader } from '../motor/types.js';
+import type { SparseVoxelWorld } from '../motor/geometry.js';
+export class SimulatedBody implements InputGateway, BodyReader {
+ private pose:Pose3D={x:.5,y:1,z:.5,yaw:0,pitch:0}; private velocity={x:0,y:0,z:0}; private supported=true; private revision=0; private owner?:string; private active=new Map<string,InputPlan3D>(); private correction?:BodyCorrection;
+ constructor(readonly context:BodyContext, readonly world:SparseVoxelWorld, readonly clock:Clock) {}
+ submit(plan:InputPlan3D):InputReceipt { const now=this.clock.now(); if(plan.context.connectionEpoch!==this.context.connectionEpoch||plan.context.bodyEpoch!==this.context.bodyEpoch)return{commandId:plan.commandId,accepted:false,reason:'context-mismatch',observedRevision:String(this.revision)};if(now>plan.deadline||now-plan.generatedAt>plan.maxAge)return{commandId:plan.commandId,accepted:false,reason:'input-expired',observedRevision:String(this.revision)};if(this.owner&&this.owner!==plan.ownerToken)return{commandId:plan.commandId,accepted:false,reason:'old-owner',observedRevision:String(this.revision)};this.owner=plan.ownerToken;this.active.set(plan.commandId,plan);return{commandId:plan.commandId,accepted:true,observedRevision:String(this.revision)}; }
+ release(ownerToken:string):void {if(this.owner===ownerToken){this.active.clear();this.owner=undefined;}}
+ injectCorrection(correction:BodyCorrection):void {this.correction=correction;}
+ tick():BodyObservation {if(this.correction){this.pose={...this.correction.pose};this.correction=undefined;this.revision++;}const input=[...this.active.values()].at(-1);if(input){const speed=.1;const next={...this.pose,x:this.pose.x+(input.delta.forward??0)*speed,z:this.pose.z+(input.delta.strafe??0)*speed,yaw:this.pose.yaw+(input.delta.yaw??0)};const collision=this.world.queryAabb({minX:next.x-.35,minY:next.y,minZ:next.z-.35,maxX:next.x+.35,maxY:next.y+1.8,maxZ:next.z+.35});if(collision.status==='clear'){this.pose=next;this.velocity={x:(input.delta.forward??0)*speed,y:0,z:(input.delta.strafe??0)*speed};}this.revision++;}return this.read();}
+ read():BodyObservation{return{context:this.context,pose:{...this.pose},velocity:{...this.velocity},supported:this.supported,revision:String(this.revision),source:'simulated',gap:false};}
+}
