@@ -10,19 +10,23 @@ Current local branch: `main`
 
 ## Baseline and commits
 
-The audit target was `main@712008be77ad4f1278f9beb5deb5e47200522428`.
+The original audit target was `main@712008be77ad4f1278f9beb5deb5e47200522428`.
 
-Remediation commits now present locally:
+The current local convergence history includes:
 
-- `fdda759` — `fix audited runtime provider and bridge safety issues`
-- `24756f1` — `align async tests with runtime contracts`
-- `ea69461` — `update remediation test evidence`
+- `f0dd68a` — C1 runtime/provider consistency and RuntimeFactory
+- `36981f7` — C2 effect recovery persistence
+- `762280e` — C3 loopback protocol and bridge gates
+- `2eb776d` — convergence verification, recovery lifecycle, CI and report alignment
 
-The phase-two feature commits before remediation remain:
+Earlier remediation commits remain in the same ancestry:
 
-- `712008b` — six offline demo scenarios
-- `e37ceae` — verified bridge and doctor command documentation
-- `fcc68dd` — phase-two offline runtime and bridge
+- `fdda759` — audited runtime/provider/bridge safety fixes
+- `24756f1` — async test premise corrections
+- `ea69461` — remediation evidence update
+- `241f94b` — planning-agent handoff document
+
+The current code branch is local `main` at `2eb776d`. Remote publication status must be checked separately; a local commit is not evidence of a pushed, merged, deployed, or live-verified state.
 
 ## Verification performed after remediation
 
@@ -210,7 +214,7 @@ The 200-item audit mixes different categories. The planning agent should not tre
 - Simulated two-dimensional navigation is not expected to prove real three-dimensional Minecraft physics.
 - The audit's numeric ranges cannot be independently mapped to source because no numbered 001–200 source list exists in the repository; use the audit text plus code/contract evidence rather than inventing a mapping.
 
-## Recommended next work order
+## Remaining work before declaring the convergence complete
 
 1. Add a per-audit-item classification table: fixed, confirmed-unfixed, design-gap, false-premise, unverified, or test-gap.
 2. Finish bridge-neutral runtime injection so ToolRouter can use Composite/real-profile capability interfaces without direct FakeClientBridge coupling.

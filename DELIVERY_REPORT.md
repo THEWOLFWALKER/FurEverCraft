@@ -13,9 +13,7 @@ Convergence commits currently present locally:
 
 - `f0dd68a implement C1 runtime and provider consistency`
 - `36981f7 implement C2 effect recovery persistence`
-- `762280e implement C3 loopback protocol and bridge gates`
-
-Additional integration review changes are being made after those stage commits and should be reviewed and committed separately before the convergence pass is called complete.
+- `2eb776d integrate convergence verification and recovery lifecycle`
 
 ## Implemented in this convergence pass
 
