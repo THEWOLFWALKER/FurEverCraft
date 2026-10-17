@@ -22,6 +22,25 @@ describe('providers', () => {
     expect((calls[1] as any).system).toBe('rules');
   });
 
+  it('rejects real fetch unless the model network gate is explicitly enabled', async () => {
+    const { FetchTransport } = await import('../../src/providers/openai/index.js');
+    await expect(new FetchTransport().post('https://example.invalid', {}, {})).rejects.toThrow('model-network-disabled');
+  });
+
+  it('serializes canonical assistant tool calls and tool results', async () => {
+    const calls: unknown[] = [];
+    const transport: HttpTransport = { async post(_url, body) { calls.push(body); return { choices: [{ message: { content: null, tool_calls: [] }, finish_reason: 'stop' }] }; } };
+    await new OpenAIProvider(transport, 'http://offline', 'model').complete([
+      { role: 'user', content: 'lookup' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call-1', name: 'lookup', arguments: '{"q":"x"}' }] },
+      { role: 'tool', toolCallId: 'call-1', content: '{"ok":true}' },
+    ], []);
+    expect((calls[0] as any).messages).toEqual([
+      { role: 'user', content: 'lookup' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":"x"}' } }] },
+      { role: 'tool', tool_call_id: 'call-1', content: '{"ok":true}' },
+    ]);
+  });
   it('pairs interleaved streamed tool fragments and surfaces provider errors', async () => {
     const transport: HttpTransport = { async post() { return {}; }, async postStream(_url, _body) { return chunks([
       'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"one","arguments":"{\\"x\\":"}}]}}]}\n\n',

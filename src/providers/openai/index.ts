@@ -9,12 +9,16 @@ export class ProviderError extends Error {
   constructor(message: string, readonly status?: number, readonly provider?: string, readonly retryable = false) { super(message); this.name = 'ProviderError'; }
 }
 export class FetchTransport implements HttpTransport {
+  constructor(private readonly options: { allowModelNetwork?: boolean } = {}) {}
+  private assertNetworkAllowed() { if (!this.options.allowModelNetwork) throw new ProviderError('model-network-disabled', undefined, undefined, false); }
   async post(url: string, body: unknown, headers: Record<string, string>, signal?: AbortSignal) {
+    this.assertNetworkAllowed();
     const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal });
     if (!r.ok) throw new ProviderError(`provider-http-${r.status}`, r.status, undefined, r.status === 408 || r.status === 429 || r.status >= 500);
     return r.json();
   }
   async postStream(url: string, body: unknown, headers: Record<string, string>, signal?: AbortSignal) {
+    this.assertNetworkAllowed();
     const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream', ...headers }, body: JSON.stringify(body), signal });
     if (!r.ok) throw new ProviderError(`provider-http-${r.status}`, r.status, undefined, r.status === 408 || r.status === 429 || r.status >= 500);
     if (!r.body) throw new ProviderError('provider-empty-stream');
@@ -49,6 +53,19 @@ export async function* parseSSE(chunks: AsyncIterable<StreamChunk>): AsyncGenera
   if (buffer.trim()) yield* emit(buffer);
 }
 
+export function openAIMessages(messages: ModelMessage[]): unknown[] {
+  return messages.map(message => {
+    if (message.role === 'assistant' && message.toolCalls?.length) return {
+      role: 'assistant', content: message.content || null,
+      tool_calls: message.toolCalls.map(call => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } })),
+    };
+    if (message.role === 'tool') return {
+      role: 'tool', tool_call_id: message.toolCallId ?? '', content: typeof message.content === 'string' ? message.content : JSON.stringify(message.content),
+    };
+    return { role: message.role, content: typeof message.content === 'string' ? message.content : JSON.stringify(message.content) };
+  });
+}
+
 export function openAITools(tools: unknown[]): unknown[] {
   return tools.map((tool: any) => tool?.type === 'function' ? tool : { type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters ?? { type: 'object', properties: {} } } });
 }
@@ -72,13 +89,13 @@ export class OpenAIProvider implements ModelProvider {
   private active?: AbortController;
   constructor(private transport: HttpTransport, private baseUrl: string, private model: string, private key?: string) {}
   async complete(messages: ModelMessage[], tools: unknown[], signal?: AbortSignal): Promise<ModelResponse> {
-    const r: any = await this.transport.post(`${this.baseUrl}/chat/completions`, { model: this.model, messages, tools: openAITools(tools) }, this.key ? { authorization: `Bearer ${this.key}` } : {}, signal);
+    const r: any = await this.transport.post(`${this.baseUrl}/chat/completions`, { model: this.model, messages: openAIMessages(messages), tools: openAITools(tools) }, this.key ? { authorization: `Bearer ${this.key}` } : {}, signal);
     const c = r.choices?.[0]; return { text: c?.message?.content ?? undefined, toolCalls: (c?.message?.tool_calls ?? []).map((x: any) => ({ id: x.id, name: x.function?.name, arguments: x.function?.arguments ?? '' })), stopReason: c?.finish_reason ?? 'unknown', usage: r.usage ? { inputTokens: r.usage.prompt_tokens, outputTokens: r.usage.completion_tokens } : undefined };
   }
   async stream(messages: ModelMessage[], tools: unknown[], signal?: AbortSignal) {
     if (!this.transport.postStream) throw new ProviderError('openai-stream-unavailable', undefined, 'openai');
     const own = new AbortController(); this.active = own; const relay = () => own.abort(); signal?.addEventListener('abort', relay, { once: true });
-    try { const chunks = await this.transport.postStream(`${this.baseUrl}/chat/completions`, { model: this.model, messages, tools: openAITools(tools), stream: true, stream_options: { include_usage: true } }, this.key ? { authorization: `Bearer ${this.key}` } : {}, own.signal); return await new OpenAIStreamDecoder().decode(chunks); }
+    try { const chunks = await this.transport.postStream(`${this.baseUrl}/chat/completions`, { model: this.model, messages: openAIMessages(messages), tools: openAITools(tools), stream: true, stream_options: { include_usage: true } }, this.key ? { authorization: `Bearer ${this.key}` } : {}, own.signal); return await new OpenAIStreamDecoder().decode(chunks); }
     finally { signal?.removeEventListener('abort', relay); if (this.active === own) this.active = undefined; }
   }
   cancel() { this.active?.abort(); }

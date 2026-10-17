@@ -7,7 +7,8 @@ export function anthropicTools(tools: unknown[]): unknown[] {
 function anthropicMessages(messages: ModelMessage[]): { system?: string; messages: unknown[] } {
   const system = messages.filter(m => m.role === 'system').map(m => String(m.content)).join('\n');
   const mapped = messages.filter(m => m.role !== 'system').map(m => {
-    if (m.role === 'tool') return { role: 'user', content: [{ type: 'tool_result', tool_use_id: (m.content as any)?.toolCallId ?? (m.content as any)?.callId ?? '', content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }] };
+    if (m.role === 'assistant' && m.toolCalls?.length) return { role: 'assistant', content: [...(m.content ? [{ type: 'text', text: String(m.content) }] : []), ...m.toolCalls.map(call => ({ type: 'tool_use', id: call.id, name: call.name, input: JSON.parse(call.arguments || '{}') }))] };
+    if (m.role === 'tool') return { role: 'user', content: [{ type: 'tool_result', tool_use_id: m.toolCallId ?? '', content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }] };
     return { role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content };
   });
   return { ...(system ? { system } : {}), messages: mapped };

@@ -5,6 +5,7 @@ import { SQLiteStore } from '../persistence/store.js';
 import { SessionRuntime } from '../execution/session.js';
 import { placeOne, sendChat, navigateTo } from '../skills/skills.js';
 import { ProtocolSession } from '../bridge/protocol/session.js';
+import { createRuntime } from '../execution/factory.js';
 import { redact } from '../diagnostics/redaction.js';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -34,8 +35,8 @@ export function main(argv = process.argv) {
   const program = new Command();
   program.name('minecraft-agent').option('--profile <profile>', 'profile', 'simulated').option('--db <path>', 'SQLite path');
   program.command('demo').option('--db <path>').option('--scenario <scenario>').action((options) => runDemo(options.db, options.scenario));
-  program.command('status').action(() => console.log(JSON.stringify({ simulated: true, status: 'idle' })));
-  program.command('doctor').action((_, command) => console.log(JSON.stringify({ profile: command.parent?.opts().profile ?? 'simulated', simulated: true, network: 'disabled', credentials: 'not-required-offline', capabilities: { capture_view: 'synthetic-only' } })));
+  program.command('status').action(() => { const runtime = new SessionRuntime(new FakeClientBridge(), new SQLiteStore(':memory:')); try { console.log(JSON.stringify(redact({ simulated: true, status: runtime.store.listGoals().some(g => g.status === 'active') ? 'active' : 'idle', goals: runtime.store.listGoals(), executions: runtime.store.listExecutions() }))); } finally { runtime.store.close(); } });
+  program.command('doctor').action((_, command) => { const profile = command.parent?.opts().profile ?? 'simulated'; const runtime = createRuntime({ profile }); try { console.log(JSON.stringify(redact({ profile, simulated: profile === 'simulated', network: 'disabled', credentials: 'not-required-offline', capabilities: { capture_view: 'synthetic-only' }, status: runtime.session.start() }))); } finally { runtime.close(); } });
   program.command('bridge').option('--config <path>', 'profile config').action((options) => { const file = resolve(options.config ?? 'configs/client-offline.example.json'); const config = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; console.log(JSON.stringify(redact({ bridge: 'offline-protocol', config, network: config.allowMinecraftUpstream === true ? 'enabled-by-explicit-config' : 'disabled' }))); });
   program.command('goal:revise').requiredOption('--id <goalId>').requiredOption('--revision <revision>').requiredOption('--change <change>').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(redact(store.reviseGoal(options.id, Number(options.revision), options.change)))); } finally { store.close(); } });
   program.command('events').option('--cursor <cursor>', 'cursor', '0').option('--limit <limit>', '100').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(new SessionRuntime(new FakeClientBridge(), store).events.read(options.cursor, Number(options.limit)))); } finally { store.close(); } });

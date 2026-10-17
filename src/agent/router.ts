@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { nextId } from '../contracts/index.js';
 import type { ModelMessage, ModelProvider, ToolCall } from '../providers/scripted/index.js';
-import type { FakeClientBridge } from '../bridge/fake/index.js';
+import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { Executor } from '../execution/runtime.js';
 import { skillImplementations } from '../skills/skills.js';
@@ -46,7 +46,7 @@ const argsByTool: Record<string, z.ZodTypeAny> = {
 
 export class ToolRouter {
   private readonly executor?: Executor;
-  constructor(private readonly bridge: FakeClientBridge, private readonly store?: SQLiteStore, private readonly events?: EventHub) {
+  constructor(private readonly bridge: ClientBridgeCapabilities, private readonly store?: SQLiteStore, private readonly events?: EventHub) {
     if (store) this.executor = new Executor(bridge, store);
   }
   async invoke(call: ToolCall): Promise<z.infer<typeof ToolCallResultSchema>> {
@@ -103,18 +103,25 @@ export class ToolRouter {
 
 export class AgentLoop {
   constructor(private readonly provider: ModelProvider, private readonly router: ToolRouter, private readonly maxTurns = 8) {}
-  async run(messages: ModelMessage[], tools: ToolDefinition[] = defaultTools, signal?: AbortSignal) {
+  async run(messages: ModelMessage[], tools: ToolDefinition[] = defaultTools, signal?: AbortSignal, options: { goalId?: string; goalRevision?: number; store?: SQLiteStore } = {}) {
+    const history = messages.map(message => structuredClone(message));
     const trace: unknown[] = [];
     for (let turn = 0; turn < this.maxTurns; turn++) {
-      if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
-      const response = await this.provider.complete(messages, tools, signal); trace.push(response);
+      if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
+      if (options.goalId && options.store) {
+        const goal = options.store.getGoal(options.goalId);
+        if (!goal || (options.goalRevision !== undefined && goal.revision !== options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace };
+      }
+      const response = await this.provider.complete(history, tools, signal); trace.push(response);
       if (!response.toolCalls?.length) return { response, trace };
       const reads = response.toolCalls.filter(call => ['get_state','get_inventory','query_local_world','capture_view','find_skills','get_execution','read_events','query_memory','query_knowledge'].includes(call.name));
       const writes = response.toolCalls.filter(call => !reads.includes(call));
-      const results = [...await Promise.all(reads.map(call => this.router.invoke(call))), ...await writes.reduce(async (chain, call) => [...await chain, await this.router.invoke(call)], Promise.resolve([] as Awaited<ReturnType<ToolRouter['invoke']>>[]))];
-      if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
-      messages.push({ role: 'assistant', content: response.text ?? '', toolCalls: response.toolCalls });
-      for (const result of results) messages.push({ role: 'tool', toolCallId: result.callId, content: JSON.stringify(result) });
+      const byId = new Map<string, Awaited<ReturnType<ToolRouter['invoke']>>>();
+      for (const result of await Promise.all(reads.map(call => this.router.invoke(call)))) byId.set(result.callId, result);
+      for (const call of writes) byId.set(call.id, await this.router.invoke(call));
+      if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
+      history.push({ role: 'assistant', content: response.text ?? '', toolCalls: response.toolCalls });
+      for (const call of response.toolCalls) { const result = byId.get(call.id); if (result) history.push({ role: 'tool', toolCallId: result.callId, content: JSON.stringify(result) }); }
     }
     return { response: { stopReason: 'max-turns', text: '' }, trace };
   }

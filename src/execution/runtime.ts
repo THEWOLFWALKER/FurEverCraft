@@ -1,6 +1,6 @@
 import { nextId, type Clock, type Execution } from '../contracts/index.js';
 import { ManualClock } from '../contracts/index.js';
-import type { FakeClientBridge } from '../bridge/fake/index.js';
+import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { findSkill, type SkillId } from '../skills/registry.js';
 
@@ -61,7 +61,7 @@ export class Executor {
   private readonly active = new Map<string, { lease: Lease; watchdog?: string; canceled: boolean; token: symbol }>();
 
   constructor(
-    private readonly bridge: FakeClientBridge,
+    private readonly bridge: ClientBridgeCapabilities,
     private readonly store: SQLiteStore,
     private readonly arbiter = new InputArbiter(),
     options: ExecutorOptions = {},
