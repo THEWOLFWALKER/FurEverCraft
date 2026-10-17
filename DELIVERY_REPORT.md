@@ -1,58 +1,68 @@
-# FurEverCraft v0.2 Development Batch – Readiness Report
+# FurEverCraft v0.2 Delivery Report
 
-Status: v0.2 design and implementation batch synchronized; implementation has not started. The previous phase2.1 convergence commits are preserved as the working baseline, not treated as proof of v0.2 completion.
+## Status
 
-## Stable baseline
+A substantial offline implementation of the v0.2 batch is complete and verified on loopback fixtures. It is not a claim of live Minecraft 26.3, Windows, or paid-API compatibility. Real servers/worlds, paid model APIs, actual SendInput and desktop capture were not used.
 
-Repository: `/home/orca/projects/furevercraft-phase2-handoff`
-Starting HEAD: `c345159` before documentation alignment; local baseline includes the prior convergence chain through `2eb776d`.
-Starting worktree: clean before documentation sync.
-Current architecture authority: `docs/design/minecraft-agent-top-level-design-v0.2.md`, `docs/design/minecraft-agent-client-bridge-contracts-v0.2.md`, `docs/design/minecraft-agent-motion-navigation-recovery-v0.2.md`, and `NEXT_BATCH.md`.
+Current HEAD after this pass: `279fd8d` (plus documentation commits).
 
-## Documents synchronized
+## What is implemented
 
-- Added the three v0.2 design documents under `docs/design/`.
-- Added the 26.3 proxy route research under `docs/research/`.
-- Added `NEXT_BATCH.md` with the full F01-F06/B01-B06/U01-U04/M01-M05/A01-A05/V01-V04 delivery scope.
-- Replaced `START_HERE.md` with the current full-batch brief.
-- Marked legacy `DECISIONS.md` 1.20.4/protocol 765 terminating-proxy material as historical and superseded.
-- Updated root `README.md` to identify v0.2 current authority, the 26.3 raw-relay + read-only observer route, hard boundaries, and intended commands.
-- Updated `CLAUDE.md` and `AGENTS.md` with v0.2 priority, complete scope, subagent allowance, review discipline, and test premise rules.
-- Updated `PROGRESS.md` with F/B/U/M/A/V task groups and separate implementation/verification evidence columns.
+### Foundation and providers (F)
+- One `createRuntime` assembly (`src/execution/factory.ts`) with a single injected `Clock`, Store, Session, Executor, Router, provider, AgentLoop and ControlService.
+- Executor: owner token, AbortSignal propagation, resource leases with resource-scoped generation, lease/watchdog renewal on progress, no ambiguous→confirmed promotion, terminal-state protection.
+- Store: transactional migrations, effect state guards, action receipt lifecycle, checkpoint persistence, context-scoped queries.
+- WorldState: schema-validated updates, read-time TTL, sticky gap cleared only by a full baseline, all cells unknown after a gap, immutable listener notifications.
+- EventHub: `{bootEpoch, sequence}` cursor, filtered reads without manufactured gaps, validated limits.
+- Providers: canonical history (text/image/tool/termination), OpenAI and Anthropic serializers with correct tool pairing, UTF-8 SSE across arbitrary byte chunks, record/response/tool-argument limits, truncation rejection, `Retry-After`-aware bounded retry, cancellation fence, `allowModelNetwork` gate.
 
-## Prior baseline verification (not v0.2 evidence)
+### Bridge (B)
+- `src/bridge/version-profile.ts`: 26.3 / protocol 777 / data 5023 candidate metadata with explicit limitations.
+- `src/bridge/relay/raw.ts`: raw TCP byte relay with handshake rewrite (protocol/nextState validated), correct `write=false` backpressure + drain resume, hard limit, bounded close flush, half-close propagation, EOF session cleanup, retryable startup.
+- `src/bridge/observer/bounded.ts`: async bounded dispatch queue with concurrency/timeout, per-frame byte offsets, sticky global unknown, explicit gap events.
+- `src/bridge/ipc/endpoint.ts`: versioned protocol, session-epoch fencing (stale responses cannot settle requests), bounded pending, listener cleanup.
+- `src/bridge/protocol/domain.ts`: packet→domain projection; unsupported packets become explicit `unknown` observations, never silent drops.
+- Windows driver/helper: request-ID matching, command-ID dedup, disabled-safe cleanup, binding/input checks (Linux-tested via `FakeHelperTransport` only).
 
-At the prior phase2.1 checkpoint on Linux/Node 20.19.5, `npm run typecheck`, `npm run build`, `npm run test:offline`, six-scenario offline demo, simulated doctor, bridge fixture, and bridge inspect had passed; test result then was 9 files / 42 tests. This is historical evidence only. It does not prove Minecraft 26.3, raw TCP relay, web/control service, 3D motor, Node 22, or live integration.
+### Control surface (U)
+- `src/control/service.ts`: shared ControlService with canonical payload hashing, durable requestId dedupe, CAS conflicts, goal set/revise, message, chat, pause/resume/stop/cancel/save/quit; stop cancels non-terminal executions; save persists a checkpoint.
+- `src/server/index.ts`: JSON API, SSE snapshot+consistent ascending cursor, bounds, same-origin static hosting of the built UI.
+- `web/`: React + Vite control console using the calm blue-white design tokens, truthful unknown (`--`) states, live SSE feed, capability-gated actions, responsive breakpoints.
+- CLI: `serve`, `attach`, `demo`, `status`, `doctor`, `bridge` (fixture/inspect/live-gated).
 
-## Current v0.2 scope
+### Motor, autonomy and verification (M/A/V)
+- `src/motor/*` + `src/fixtures/*`: sparse 3D voxel world, swept-collision A*, primitives, independent simulated body, no-progress/recovery controller.
+- `src/autonomous/*`: GoalManager/TaskScheduler, knowledge/spatial/episodic memory, session supervisor, bounded capture history.
+- Eleven skills registered; `look_at`, `dig_one`, `return_to_place` implemented against simulated capabilities and fail closed when the capability is absent.
+- `src/diagnostics/trace.ts` bounded trace.
+- Tests: unit, integration, soak (60 virtual minutes) and trace suites.
 
-All 30 tasks are authorized and remain in scope:
+## Verified commands (local Linux, Node 20.19.5, npm 10.8.2)
 
-- F01-F06: RuntimeFactory/Clock/owner, execution and admission, durable effects, Store/state/event corrections, providers, docs/rules.
-- B01-B06: fixed 26.3 version manifest, raw TCP Relay, bounded sidecar Observer, domain projection, Windows gateway contract, IPC/Supervisor/CLI assembly.
-- U01-U04: shared ControlService, Fastify API/SSE/auth, React control UI, simultaneous CLI/web CAS and tests.
-- M01-M05: sparse 3D projection, local action graph/A*, supported primitive closures, independent SimulatedBody, progress/recovery controller.
-- A01-A05: autonomous task loop, knowledge/spatial/episodic memory, eleven skills, session supervision/auth coordination, bounded capture/capability/long-run policies.
-- V01-V04: 14 integrated scenarios, crash/write/soak tests, trace/replay/docs, Node 22 CI and coordinated review.
+```text
+npm run typecheck            pass
+npm run build                pass
+npm run build:web            pass
+npm run test:offline         21 files / 94 tests pass
+npm run test:v:offline       integration + soak + trace pass
+npm run demo:offline         6 scenarios pass
+npm run doctor -- --profile simulated   pass
+npm run bridge:protocol -- --config configs/simulated.json   pass (fixture, loopback)
+npm run test:web             web typecheck + vite build pass
+```
 
-## Hard boundaries
+Loopback smoke: `serve` served the built UI (200 text/html), `/api/v1/status` returned running, `goal.set` returned terminal, and the JS asset loaded (200).
 
-No real Minecraft server/world, no game server, no paid model API, no actual Windows SendInput, no desktop capture, no game asset download. Loopback fixtures have no game engine. Production live code must remain explicitly gated; default network/model/OS/capture permissions are false.
+## Honest limits / not implemented
 
-Tests must use contract-correct premises, explicit fixture provenance, awaited async assertions, isolated temporary DBs, and assert ambiguous/unknown/cleanup behavior. Do not infer completion from test count or demo labels. Do not push unless separately authorized.
+- Minecraft codec remains the legacy 1.20.4/765 fixture. The 26.3 adapter is candidate metadata only; no live 26.3 packet decoding is claimed.
+- Raw relay verified on loopback sockets only; no real upstream connection.
+- No child-process Supervisor; IPC endpoint exists but process orchestration is not implemented.
+- `collect_nearby` and `gather_blocks` intentionally fail closed (no capability).
+- No Playwright browser E2E; the web build and same-origin serving are verified but not driven by a browser.
+- Node 22 CI is configured (Linux verify + Windows helper static parse) but has not been observed passing on GitHub.
+- Real Windows SendInput/capture, paid model APIs and real Minecraft remain unverified.
 
-## Next action
+## Testing discipline
 
-Begin with F01 shared RuntimeFactory, one injected Clock and bridge-neutral contracts; then progress through C1/F, C2, B/U, M/A, and V dependencies. Commit reviewable local increments, continuously update `PROGRESS.md`, and continue through all achievable tasks before final review.
-
-## Truth-state matrix
-
-| Surface | State | Evidence |
-|---|---|---|
-| Code baseline | verified-current | local branch/history at `c345159` before documentation sync |
-| Runtime production state | out-of-scope for this doc-sync step | no code changes in this step |
-| Docs | changed-and-verified | v0.2 docs copied from checksum-verified archive; root authority references updated |
-| Rules | changed-and-verified | `CLAUDE.md`, `AGENTS.md`, `START_HERE.md` align to full v0.2 batch |
-| Memory | not-applicable | no memory write requested or made |
-| Workspace | verified-current | source archive checksum verified; no cleanup/deletion performed |
-| Remote publication | pending | this documentation sync has not been pushed |
+Every assertion is grounded in a contract or observable behavior. Fixture provenance is preserved (`fixture`/`simulated`), async tests use `await`/`rejects`, databases use isolated temp paths, and unknown/ambiguous/failure/cleanup paths are asserted. No assertion was weakened to force green; several tests were corrected where their premise (not the implementation) was wrong.

@@ -23,7 +23,7 @@ Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Sta
 | M01-M05 3D state/motor | implemented-offline (partial) | `src/motor/*`, `src/fixtures/*`; not wired into production runtime | `tests/unit/m01-m05.test.ts` |
 | A01 GoalManager/TaskScheduler | implemented-offline | `src/autonomous/tasks.ts` | `tests/unit/autonomous.test.ts` |
 | A02 knowledge/spatial/episodic memory | implemented-offline | `src/autonomous/memory.ts` | `tests/unit/autonomous.test.ts` |
-| A03 eleven skills | partial | registry has 11; six new skills return unavailable without capability | `tests/unit/autonomous.test.ts` |
+| A03 eleven skills | implemented-offline (partial) | registry has 11; look_at/dig_one/return_to_place implemented against simulated capabilities and fail closed when absent; collect_nearby/gather_blocks intentionally unavailable | `tests/unit/execution-skills.test.ts` |
 | A04 session/auth | implemented-offline | `src/autonomous/session.ts` secretRef only | `tests/unit/autonomous.test.ts` |
 | A05 capture/long-run bounds | implemented-offline | bounded capture history | `tests/unit/autonomous.test.ts` |
 | V01 integrated scenarios | partial | `tests/integration/v01-v04.integration.test.ts`, server tests | 5 integration tests |
