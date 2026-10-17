@@ -171,7 +171,8 @@ export class ProtocolSession {
   }
 
   validatePacket(packet: BridgePacket): void {
-    if (packet.phase !== this.phase) throw new Error(`packet-phase-mismatch:${packet.name}:${packet.phase}/${this.phase}`);
+    const expected = packet.direction === 'downstream' ? this.downstreamPhase : this.upstreamPhase;
+    if (packet.phase !== expected) throw new Error(`packet-phase-mismatch:${packet.name}:${packet.direction}:${packet.phase}/${expected}`);
     if (!packetNames(packet.phase, packet.direction).has(packet.name)) throw new Error(`unknown-packet:${packet.phase}:${packet.direction}:${packet.name}`);
   }
 
@@ -235,7 +236,8 @@ export class OfflineProtocolBridge {
     if (this.session.phase !== 'HANDSHAKE') throw new Error(`cannot-start:${this.session.phase}`);
   }
 
-  transition(next: BridgePhase): void { this.session.transition(next); }
+  /** Fixture-level lifecycle: advances both directions together. For independent per-direction phases use `session.transition(next, direction)`. */
+  transition(next: BridgePhase): void { this.session.phase = next; }
 
   async forward(packet: BridgePacket): Promise<NormalizedObservation> {
     if (this.session.phase === 'CLOSED') throw new Error('session-closed');
