@@ -26,12 +26,14 @@ export function sendChat(ctx: SkillContext, text: string): SkillResult {
   if (!text) return { ok: false, outcome: 'failed', reason: 'text-required' };
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
   ctx.report({ stage: 'dispatch', completed: 0, total: 1 });
+  let enteredChat = false;
   try {
     ctx.bridge.setUi('chat');
+    enteredChat = true;
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
-    ctx.bridge.setUi('gameplay');
     return { ok: true, outcome: 'confirmed', value: { sent: true, text } };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
+  finally { if (enteredChat) { try { ctx.bridge.setUi('gameplay'); } catch { /* preserve ambiguous result */ } } }
 }
 
 export function placeOne(ctx: SkillContext, target: { x: number; y: number }): SkillResult {

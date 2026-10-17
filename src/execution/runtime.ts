@@ -1,4 +1,4 @@
-import { hashProposal, nextId, type Clock, type Execution } from '../contracts/index.js';
+import { nextId, type Clock, type Execution } from '../contracts/index.js';
 import { ManualClock } from '../contracts/index.js';
 import type { FakeClientBridge } from '../bridge/fake/index.js';
 import type { SQLiteStore } from '../persistence/store.js';
@@ -11,20 +11,22 @@ export type ExecutorOptions = { clock?: Clock; leaseTtl?: number; watchdogTtl?: 
 
 export class InputArbiter {
   private leases = new Map<string, Lease>();
+  private resourceGeneration = new Map<string, number>();
   private generation = 0;
   constructor(private readonly now: () => number = () => Date.now()) {}
   acquire(owner: string, resources: string[], ttl = 1000): Lease {
     this.releaseExpired();
+    const unique = [...new Set(resources)];
     for (const lease of this.leases.values()) {
-      if (lease.resources.some(r => resources.includes(r))) throw new Error('resource-busy');
+      if (lease.resources.some(r => unique.includes(r))) throw new Error('resource-busy');
     }
-    const lease = { leaseId: nextId('lease'), owner, resources: [...new Set(resources)], until: this.now() + ttl, generation: ++this.generation };
+    const lease = { leaseId: nextId('lease'), owner, resources: unique, until: this.now() + ttl, generation: ++this.generation };
     this.leases.set(lease.leaseId, lease);
     return lease;
   }
   validate(leaseId: string, owner: string): Lease {
     const lease = this.leases.get(leaseId);
-    if (!lease || lease.owner !== owner || lease.until <= this.now() || lease.generation !== this.generation) throw new Error('lease-invalid');
+    if (!lease || lease.owner !== owner || lease.until <= this.now() || lease.resources.some(r => (this.resourceGeneration.get(r) ?? 0) > lease.generation)) throw new Error('lease-invalid');
     return lease;
   }
   renew(leaseId: string, owner: string, ttl: number): Lease {
@@ -34,18 +36,29 @@ export class InputArbiter {
   }
   release(leaseId: string) { this.leases.delete(leaseId); }
   preempt(owner: string) {
-    this.generation++;
-    for (const [id, lease] of this.leases) if (lease.owner !== owner) this.leases.delete(id);
+    for (const [id, lease] of this.leases) {
+      if (lease.owner !== owner) {
+        this.leases.delete(id);
+        for (const resource of lease.resources) this.resourceGeneration.set(resource, (this.resourceGeneration.get(resource) ?? 0) + 1);
+      }
+    }
   }
   private releaseExpired() { for (const [id, lease] of this.leases) if (lease.until <= this.now()) this.leases.delete(id); }
 }
+
+const canonicalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonicalize(v)]));
+  return value;
+};
+const canonicalProposalHash = (value: unknown) => JSON.stringify(canonicalize(value));
 
 export class Executor {
   private readonly clock: Clock;
   private readonly leaseTtl: number;
   private readonly watchdogTtl: number;
   private readonly progressByExecution = new Map<string, Progress>();
-  private readonly active = new Map<string, { lease: Lease; watchdog?: string; canceled: boolean }>();
+  private readonly active = new Map<string, { lease: Lease; watchdog?: string; canceled: boolean; token: symbol }>();
 
   constructor(
     private readonly bridge: FakeClientBridge,
@@ -62,9 +75,9 @@ export class Executor {
     return findSkill(skillId)?.resources ?? (skillId === 'send_chat' ? ['ui', 'textEntry'] : ['movement', 'view', 'hands']);
   }
 
-  start(goalId: string, skillId: string, args: Record<string, unknown>, fn: (lease: Lease, report: (p: Omit<Progress, 'at'>) => void) => unknown): Execution {
+  async start(goalId: string, skillId: string, args: Record<string, unknown>, fn: (lease: Lease, report: (p: Omit<Progress, 'at'>) => void) => unknown | Promise<unknown>): Promise<Execution> {
     const proposalId = String(args.proposalId ?? nextId('proposal'));
-    const proposalHash = hashProposal({ skillId, args });
+    const proposalHash = canonicalProposalHash({ skillId, args });
     const existing = this.store.getExecution?.(proposalId);
     if (existing) {
       if (existing.proposalHash !== proposalHash) throw new Error('proposal-id-conflict');
@@ -75,7 +88,7 @@ export class Executor {
     let lease: Lease;
     try { lease = this.arbiter.acquire(execution.executionId, this.resourcesFor(skillId), this.leaseTtl); }
     catch (error) { execution.status = 'failed'; execution.reason = error instanceof Error ? error.message : String(error); this.store.saveExecution(execution); return execution; }
-    const active: { lease: Lease; watchdog?: string; canceled: boolean } = { lease, canceled: false };
+    const active: { lease: Lease; watchdog?: string; canceled: boolean; token: symbol } = { lease, canceled: false, token: Symbol(execution.executionId) };
     this.active.set(execution.executionId, active);
     const report = (p: Omit<Progress, 'at'>) => {
       this.assertLive(execution.executionId);
@@ -86,9 +99,15 @@ export class Executor {
     try {
       execution.status = 'running'; this.store.saveExecution(execution); report({ stage: 'prepare', completed: 0 });
       active.watchdog = this.clock.schedule(this.clock.now() + this.watchdogTtl, () => {
-        if (this.active.has(execution.executionId)) { active.canceled = true; execution.status = 'failed'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); }
+        if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; execution.status = 'failed'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); }
       });
-      fn(lease, report);
+      const skillResult = await fn(lease, report);
+      if (skillResult && typeof skillResult === 'object' && 'outcome' in skillResult) {
+        const outcome = String((skillResult as { outcome: string }).outcome);
+        if (outcome === 'canceled') throw new Error('execution-canceled');
+        if (outcome === 'failed') throw new Error(String((skillResult as { reason?: string }).reason ?? 'skill-failed'));
+        execution.outcome = outcome;
+      }
       this.assertLive(execution.executionId);
       execution.status = 'verifying'; this.store.saveExecution(execution); report({ stage: 'verify', completed: 1, total: 1 });
       execution.status = 'succeeded'; execution.outcome = 'confirmed';
@@ -98,15 +117,21 @@ export class Executor {
       else { execution.status = 'failed'; execution.reason = error instanceof Error ? error.message : String(error); }
     } finally {
       if (active.watchdog) this.clock.cancel(active.watchdog);
-      this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); this.store.saveExecution(execution);
+      if (this.active.get(execution.executionId)?.token === active.token) {
+        this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); this.store.saveExecution(execution);
+      }
     }
     return execution;
   }
 
   cancel(executionId: string) {
+    const execution = this.store.getExecution(executionId);
+    if (!execution || ['succeeded', 'failed', 'canceled'].includes(execution.status)) return execution;
     const active = this.active.get(executionId);
-    if (active) { active.canceled = true; this.store.updateExecutionStatus?.(executionId, 'stopping', 'cancel-requested'); }
-    this.store.updateExecutionStatus?.(executionId, 'canceled', 'canceled');
+    if (!active) return execution;
+    active.canceled = true;
+    this.store.updateExecutionStatus?.(executionId, 'stopping', 'cancel-requested');
+    return this.store.getExecution(executionId);
   }
   progress(executionId: string) { return this.progressByExecution.get(executionId); }
   watchdog(executionId: string) { const active = this.active.get(executionId); if (active) { active.canceled = true; this.arbiter.release(active.lease.leaseId); this.active.delete(executionId); this.store.updateExecutionStatus?.(executionId, 'failed', 'watchdog-timeout'); } }

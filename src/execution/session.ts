@@ -16,10 +16,23 @@ export class SessionRuntime {
     this.started = true;
     const reconciled = [] as Array<{ effectId: string; status: string }>;
     for (const effect of this.store.pendingEffects()) {
-      const snapshot = this.bridge.snapshot();
-      const status = effect.intent?.kind === 'place' && snapshot.inventory < 8 ? 'confirmed' : 'ambiguous';
-      this.store.updateEffect(effect.effect_id, status, { source: 'recovery-observation', revision: snapshot.revision });
-      reconciled.push({ effectId: effect.effect_id, status });
+      let status = 'ambiguous';
+      let evidence: Record<string, unknown> = { source: 'recovery-observation', error: 'snapshot-unavailable' };
+      try {
+        const snapshot = this.bridge.snapshot();
+        const sameContext = JSON.stringify(effect.context) === JSON.stringify(snapshot.context);
+        const intent = effect.intent as { kind?: string; x?: number; y?: number };
+        if (sameContext && intent.kind === 'place' && Number.isInteger(intent.x) && Number.isInteger(intent.y)) {
+          const cell = snapshot.cells[`${intent.x},${intent.y}`];
+          status = cell === 'blocked' ? 'confirmed' : 'ambiguous';
+        }
+        evidence = { source: 'recovery-observation', revision: snapshot.revision, contextMatched: sameContext, intent };
+      } catch (error) {
+        evidence = { ...evidence, message: error instanceof Error ? error.message : String(error) };
+      }
+      const effectId = effect.effect_id ?? effect.effectId;
+      this.store.updateEffect(effectId, status, evidence);
+      reconciled.push({ effectId, status });
     }
     this.events.publish('runtime.recovered', { executions: this.store.listExecutions().length, effects: reconciled.length }, true);
     return { recovered: true, context: this.bridge.context, reconciled };

@@ -54,7 +54,10 @@ while ($line = [Console]::In.ReadLine()) {
   $request = $null
   try {
     $request = $line | ConvertFrom-Json
-    if (-not $request.requestId) { throw 'requestId-required' }
+    if ($null -eq $request -or $request.PSObject.Properties.Name -notcontains 'requestId' -or [string]::IsNullOrWhiteSpace([string]$request.requestId)) { throw 'requestId-required' }
+    if ($request.PSObject.Properties.Name -notcontains 'command' -or [string]::IsNullOrWhiteSpace([string]$request.command)) { throw 'command-required' }
+    if (@('moveRelative','click','typeText') -contains [string]$request.command -and ($request.PSObject.Properties.Name -notcontains 'commandId' -or [string]::IsNullOrWhiteSpace([string]$request.commandId))) { throw 'commandId-required' }
+    if (@('setHeldInputs','moveRelative','click','typeText') -contains [string]$request.command -and $request.PSObject.Properties.Name -notcontains 'leaseUntil') { throw 'leaseUntil-required' }
     $result = switch ($request.command) {
       'probe' { @{ supported=$true; dryRun=$DryRun; platform='windows'; inputBackend='SendInput'; captureBackend='OS-window-capture' } }
       'bindWindow' {
@@ -86,7 +89,7 @@ while ($line = [Console]::In.ReadLine()) {
       'click' {
         Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if(-not $seen.Add([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
         $flags=switch([string]$request.button){'left'{0x0002 -bor 0x0004};'right'{0x0008 -bor 0x0010};'middle'{0x0020 -bor 0x0040};default{throw 'invalid-mouse-button'}}
-        if(-not $DryRun){$down=$flags -band 0xffff;$up=$flags -shr 16;[FurEverCraftNative]::Mouse(0,0,[uint32]$down);[FurEverCraftNative]::Mouse(0,0,[uint32]$up)}; @{accepted=$true;commandId=$request.commandId}
+        if(-not $DryRun){$down=switch([string]$request.button){'left'{0x0002};'right'{0x0008};'middle'{0x0020};default{throw 'invalid-mouse-button'}};$up=switch([string]$request.button){'left'{0x0004};'right'{0x0010};'middle'{0x0040};default{throw 'invalid-mouse-button'}};[FurEverCraftNative]::Mouse(0,0,[uint32]$down);[FurEverCraftNative]::Mouse(0,0,[uint32]$up)}; @{accepted=$true;commandId=$request.commandId}
       }
       'typeText' {
         Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if(-not $seen.Add([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}

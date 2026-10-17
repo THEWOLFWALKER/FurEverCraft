@@ -74,7 +74,7 @@ export class CompositeClientBridge {
   }
   async heartbeat() { this.requireOpen(); if (!this.options.windows) throw new Error('window-health-unavailable'); return this.options.windows.heartbeat(); }
   async releaseOwnedInputs() { if (!this.options.windows) return undefined; return this.options.windows.releaseOwnedInputs(); }
-  async shutdown() { if (this.closed) return; this.closed = true; this.unsubscribe?.(); await this.releaseOwnedInputs(); if (this.options.windows) await this.options.windows.shutdown(); }
+  async shutdown() { if (this.closed) return; this.closed = true; this.unsubscribe?.(); try { await this.releaseOwnedInputs(); } finally { if (this.options.windows) await this.options.windows.shutdown(); } }
   private record(observation: NormalizedObservation) { if (this.sensitive) return; if (this.observations.length >= this.profile.observationLimit) this.observations.shift(); this.observations.push(observation); }
   private requireOpen() { if (this.closed) throw new Error('bridge-closed'); }
   private requireAction(capability: 'nativeInput' | 'screenCapture') { this.requireOpen(); if (!this.capabilities[capability]) throw new Error(`${capability}-disabled`); }

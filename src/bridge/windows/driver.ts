@@ -40,14 +40,26 @@ export class JsonlHelperTransport implements HelperTransport {
   }
   send(request: HelperRequest, signal?: AbortSignal): Promise<HelperResponse> {
     if (this.closed) return Promise.reject(new Error('helper-closed'));
+    if (signal?.aborted) return Promise.reject(new Error('helper-aborted'));
+    if (this.pending.has(request.requestId)) return Promise.reject(new Error('duplicate-request-id'));
     return new Promise((resolve, reject) => {
       const abort = () => { this.pending.delete(request.requestId); reject(new Error('helper-aborted')); };
       signal?.addEventListener('abort', abort, { once: true });
-      this.pending.set(request.requestId, { resolve: value => { signal?.removeEventListener('abort', abort); resolve(value); }, reject });
-      this.process.stdin.write(`${JSON.stringify(request)}\n`);
+      this.pending.set(request.requestId, { resolve: value => { signal?.removeEventListener('abort', abort); resolve(value); }, reject: error => { signal?.removeEventListener('abort', abort); reject(error); } });
+      try { this.process.stdin.write(`${JSON.stringify(request)}\n`); }
+      catch (error) { this.pending.delete(request.requestId); signal?.removeEventListener('abort', abort); reject(error instanceof Error ? error : new Error(String(error))); }
     });
   }
-  async close() { if (this.closed) return; this.closed = true; this.lines.close(); this.process.stdin.end(); this.process.kill(); }
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    const error = new Error('helper-closed');
+    for (const waiter of this.pending.values()) waiter.reject(error);
+    this.pending.clear();
+    this.lines.close();
+    this.process.stdin.end();
+    this.process.kill();
+  }
 }
 
 export class WindowsHelperDriver {
@@ -63,9 +75,11 @@ export class WindowsHelperDriver {
   private commandIdResult(commandId: string) { return this.completedCommands.has(commandId) ? { duplicate: true } : undefined; }
   private markCommand(commandId: string) { this.completedCommands.add(commandId); }
   private async command(command: HelperCommand, fields: Record<string, unknown> = {}) {
-    if (!this.enabled && !['probe', 'shutdown'].includes(command)) throw new Error('os-input-disabled');
-    const response = await this.transport.send({ requestId: `${command}_${++this.sequence}`, command, ...fields });
-    if (response.requestId !== `${command}_${this.sequence}`) throw new Error('helper-response-id-mismatch');
+    // Safety operations remain available even when OS input is disabled.
+    if (!this.enabled && !['probe', 'releaseOwnedInputs', 'shutdown'].includes(command)) throw new Error('os-input-disabled');
+    const requestId = `${command}_${++this.sequence}`;
+    const response = await this.transport.send({ requestId, command, ...fields });
+    if (response.requestId !== requestId) throw new Error('helper-response-id-mismatch');
     if (!response.ok) throw new Error(response.error ?? 'helper-error'); return response.result;
   }
   private assertInputAllowed() { if (!this.bound) throw new Error('window-not-actionable'); if (!this.state) throw new Error('window-state-required'); if (!this.state.exists || !this.state.focused || !this.state.visible) throw new Error('window-not-actionable'); }
@@ -89,10 +103,24 @@ export class WindowsHelperDriver {
     if (!state.exists || !state.focused || !state.visible) await this.releaseOwnedInputs();
     return state;
   }
-  moveRelative(dx: number, dy: number, commandId: string, leaseUntil: number, generation = 0) { const duplicate = this.commandIdResult(commandId); if (duplicate) return Promise.resolve(duplicate); this.assertFresh(leaseUntil); this.markCommand(commandId); return this.command('moveRelative', { dx, dy, commandId, leaseUntil, generation }); }
-  click(button: string, commandId: string, leaseUntil: number, generation = 0) { const duplicate = this.commandIdResult(commandId); if (duplicate) return Promise.resolve(duplicate); this.assertFresh(leaseUntil); this.markCommand(commandId); return this.command('click', { button, commandId, leaseUntil, generation }); }
+  moveRelative(dx: number, dy: number, commandId: string, leaseUntil: number, generation = 0) {
+    const duplicate = this.commandIdResult(commandId); if (duplicate) return Promise.resolve(duplicate);
+    this.assertCommandId(commandId); this.assertFinite(dx, dy); this.assertFresh(leaseUntil);
+    return this.command('moveRelative', { dx, dy, commandId, leaseUntil, generation }).then(result => { this.markCommand(commandId); return result; });
+  }
+  click(button: string, commandId: string, leaseUntil: number, generation = 0) {
+    const duplicate = this.commandIdResult(commandId); if (duplicate) return Promise.resolve(duplicate);
+    this.assertCommandId(commandId); if (!['left', 'right', 'middle'].includes(button)) throw new Error('invalid-mouse-button'); this.assertFresh(leaseUntil);
+    return this.command('click', { button, commandId, leaseUntil, generation }).then(result => { this.markCommand(commandId); return result; });
+  }
   setHeldInputs(inputs: Record<string, boolean>, generation: number, leaseUntil: number) { this.assertFresh(leaseUntil); return this.command('setHeldInputs', { inputs, generation, leaseUntil }); }
-  async typeText(text: string, commandId: string, leaseUntil: number, generation = 0) { if (text.includes('\0')) throw new Error('invalid-text'); await this.assertFresh(leaseUntil); return this.command('typeText', { text, commandId, leaseUntil, generation }); }
+  async typeText(text: string, commandId: string, leaseUntil: number, generation = 0) {
+    const duplicate = this.commandIdResult(commandId); if (duplicate) return duplicate;
+    this.assertCommandId(commandId); if (text.includes('\0')) throw new Error('invalid-text'); this.assertFresh(leaseUntil);
+    const result = await this.command('typeText', { text, commandId, leaseUntil, generation }); this.markCommand(commandId); return result;
+  }
+  private assertCommandId(commandId: string) { if (!commandId || commandId.length > 256) throw new Error('command-id-required'); }
+  private assertFinite(...values: number[]) { if (values.some(value => !Number.isFinite(value))) throw new Error('invalid-input'); }
   captureWindow() { if (!this.enabled) throw new Error('os-input-disabled'); if (!this.bound) throw new Error('window-not-bound'); return this.command('captureWindow'); }
   releaseOwnedInputs() { return this.command('releaseOwnedInputs'); }
   async heartbeat() { this.lastHeartbeat = this.now(); return this.command('heartbeat'); }
