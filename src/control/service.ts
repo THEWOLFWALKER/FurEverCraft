@@ -22,8 +22,10 @@ const terminal = new Set(['succeeded', 'failed', 'canceled']);
 export class ControlService {
   private paused = false;
   private stopping = false;
-  constructor(private runtime: RuntimeAssembly, private readonly providerMetadata: ProviderMetadata = { provider: 'unknown', configured: true, transport: 'unknown' }) {}
-  attach(runtime: RuntimeAssembly) { this.runtime = runtime; }
+  private attached?: RuntimeAssembly;
+  constructor(runtime?: RuntimeAssembly, private readonly providerMetadata: ProviderMetadata = { provider: 'unknown', configured: true, transport: 'unknown' }) { this.attached = runtime; }
+  attach(runtime: RuntimeAssembly) { this.attached = runtime; }
+  private get runtime(): RuntimeAssembly { if (!this.attached) throw new Error('control-not-attached'); return this.attached; }
 
   status() {
     const goal = this.runtime.store.listGoals().find(item => item.status === 'active' || item.status === 'paused');
@@ -72,11 +74,22 @@ export class ControlService {
       case 'chat': { const p = ChatPayloadSchema.parse(payload); const result = await this.runtime.router.invoke({ id: request.requestId, name: 'send_chat', arguments: JSON.stringify({ text: p.text }) }); return { requestId: request.requestId, command: request.command, state: result.ok ? 'terminal' : 'unknown', result, payloadHash: '' }; }
       case 'pause': this.paused = true; this.runtime.session.events.publish('runtime.pausing', {}, true); return { requestId: request.requestId, command: request.command, state: 'terminal', result: { paused: true }, payloadHash: '' };
       case 'resume': this.paused = false; this.stopping = false; return { requestId: request.requestId, command: request.command, state: 'terminal', result: { paused: false }, payloadHash: '' };
-      case 'stop': this.stopping = true; this.paused = true; return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true }, payloadHash: '' };
-      case 'cancel': { const p = CancelPayloadSchema.parse(payload); const execution = this.runtime.store.getExecution(p.executionId); if (!execution) return { requestId: request.requestId, command: request.command, state: 'unknown', code: 'execution-not-found', payloadHash: '' }; this.runtime.router.invoke({ id: request.requestId, name: 'cancel_execution', arguments: JSON.stringify(p) }); return { requestId: request.requestId, command: request.command, state: terminal.has(execution.status) ? 'terminal' : 'accepted', result: this.runtime.store.getExecution(p.executionId), payloadHash: '' }; }
-      case 'save': { const result = this.runtime.store.getLatestCheckpoint('runtime') ?? { checkpointId: `runtime-${Date.now()}`, executionId: 'runtime', revision: 0, payload: this.status() }; return { requestId: request.requestId, command: request.command, state: 'terminal', result, payloadHash: '' }; }
-      case 'quit': this.stopping = true; return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true }, payloadHash: '' };
+      case 'stop': { this.stopping = true; this.paused = true; this.runtime.scheduler.close(); const canceled = await this.cancelActiveExecutions(); this.runtime.session.events.publish('runtime.stopping', { reason: 'stop', canceled }, true); return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled }, payloadHash: '' }; }
+      case 'cancel': { const p = CancelPayloadSchema.parse(payload); const execution = this.runtime.store.getExecution(p.executionId); if (!execution) return { requestId: request.requestId, command: request.command, state: 'unknown', code: 'execution-not-found', payloadHash: '' }; const invoke = await this.runtime.router.invoke({ id: request.requestId, name: 'cancel_execution', arguments: JSON.stringify(p) }); const after = this.runtime.store.getExecution(p.executionId); return { requestId: request.requestId, command: request.command, state: terminal.has(after?.status ?? '') ? 'terminal' : invoke.ok ? 'accepted' : 'unknown', code: invoke.ok ? undefined : invoke.error, result: after, payloadHash: '' }; }
+      case 'save': { const checkpoint = { checkpointId: `runtime-${this.runtime.clock.now()}`, executionId: 'runtime', revision: (this.runtime.store.getLatestCheckpoint('runtime')?.revision ?? 0) + 1, payload: this.status() }; this.runtime.store.saveCheckpoint(checkpoint); return { requestId: request.requestId, command: request.command, state: 'terminal', result: checkpoint, payloadHash: '' }; }
+      case 'quit': { this.stopping = true; this.paused = true; this.runtime.session.events.publish('runtime.shutdown-requested', {}, true); return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true }, payloadHash: '' }; }
     }
+  }
+
+  /** Best-effort stop of every non-terminal execution; failures are reported, not thrown. */
+  private async cancelActiveExecutions(): Promise<string[]> {
+    const canceled: string[] = [];
+    for (const execution of this.runtime.store.listExecutions()) {
+      if (terminal.has(execution.status)) continue;
+      try { await this.runtime.router.invoke({ id: `stop-${execution.executionId}`, name: 'cancel_execution', arguments: JSON.stringify({ executionId: execution.executionId }) }); canceled.push(execution.executionId); }
+      catch { /* best-effort: continue stopping the remaining executions */ }
+    }
+    return canceled;
   }
 }
 

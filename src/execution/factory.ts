@@ -47,7 +47,7 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
   const provider = options.provider ?? createProvider(options);
   const router = new ToolRouter(bridge, store, session.events, executor, new MemoryService(store), () => clock.now());
   const loop = new AgentLoop(provider, router);
-  const providerName = options.modelProvider ?? 'scripted';
+  const providerName = options.modelProvider ?? inferProviderName(provider);
   const providerMetadata: ProviderMetadata = {
     provider: providerName,
     configured: !(provider instanceof UnavailableProvider),
@@ -55,14 +55,21 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     networkEnabled: options.allowModelNetwork ?? false,
     transport: options.provider ? 'fixture' : provider instanceof UnavailableProvider ? 'unavailable' : 'network',
   };
-  const control = new ControlService(undefined as unknown as RuntimeAssembly, providerMetadata);
+  const control = new ControlService(undefined, providerMetadata);
   const goalManager = new GoalManager(store, session.events);
   const scheduler = new TaskScheduler(session.events, async () => undefined, 25);
   const sessionSupervisor = new SessionSupervisor(session.events);
   let closed = false;
-  const assembly = { bridge, store, session, router, provider, loop, clock, control, goalManager, scheduler, sessionSupervisor, close() { if (closed) return; closed = true; scheduler.close(); void sessionSupervisor.stop(); try { store.close(); } finally { if (lockKey) activeRuntimes.delete(lockKey); } } } as RuntimeAssembly;
+  const assembly = { bridge, store, session, router, provider, loop, clock, control, goalManager, scheduler, sessionSupervisor, close() { if (closed) return; closed = true; scheduler.close(); void sessionSupervisor.stop(); const shutdown = (bridge as { shutdown?: () => Promise<void> }).shutdown; if (typeof shutdown === 'function') void shutdown.call(bridge).catch(() => undefined); try { store.close(); } finally { if (lockKey) activeRuntimes.delete(lockKey); } } } as RuntimeAssembly;
   control.attach(assembly);
   return assembly;
+}
+
+function inferProviderName(provider: ModelProvider): 'scripted' | 'openai' | 'anthropic' {
+  const name = provider.constructor?.name ?? '';
+  if (name.startsWith('Anthropic')) return 'anthropic';
+  if (name.startsWith('OpenAI')) return 'openai';
+  return 'scripted';
 }
 
 function createProvider(options: RuntimeFactoryOptions): ModelProvider {

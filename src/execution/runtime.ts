@@ -136,7 +136,7 @@ export class Executor {
     const execution = this.store.getExecution(executionId);
     if (!execution || ['succeeded', 'failed', 'canceled'].includes(execution.status)) return execution;
     const active = this.active.get(executionId);
-    if (!active) return execution;
+    if (!active) { this.store.updateExecutionStatus?.(executionId, 'canceled', 'cancel-requested-no-active-owner'); return this.store.getExecution(executionId); }
     active.canceled = true;
     active.controller.abort();
     this.store.updateExecutionStatus?.(executionId, 'stopping', 'cancel-requested');

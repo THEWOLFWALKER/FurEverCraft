@@ -31,4 +31,27 @@ describe('U01 ControlService', () => {
       expect(chat.state).not.toBe('accepted');
     } finally { runtime.close(); }
   });
+
+  it('persists a checkpoint on save and reports it on reload', async () => {
+    const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
+    try {
+      const saved = await runtime.control.command({ requestId: 's1', command: 'save', payload: {} });
+      expect(saved.state).toBe('terminal');
+      const stored = runtime.store.getLatestCheckpoint('runtime');
+      expect(stored?.revision).toBe(1);
+      expect(stored?.checkpoint_id).toBe((saved.result as { checkpointId?: string }).checkpointId);
+    } finally { runtime.close(); }
+  });
+
+  it('stop cancels non-terminal executions instead of only flagging', async () => {
+    const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
+    try {
+      runtime.store.saveExecution({ executionId: 'exec-running', proposalId: 'prop-running', proposalHash: 'h', goalId: 'g1', skillId: 'navigate_to', skillVersion: '1.0.0', status: 'running' });
+      const stopped = await runtime.control.command({ requestId: 'stop', command: 'stop', payload: {} });
+      expect(stopped.state).toBe('accepted');
+      expect((stopped.result as { canceled?: string[] }).canceled).toContain('exec-running');
+      expect(runtime.store.getExecution('exec-running')?.status).toBe('canceled');
+      expect(runtime.control.status().stopping).toBe(true);
+    } finally { runtime.close(); }
+  });
 });
