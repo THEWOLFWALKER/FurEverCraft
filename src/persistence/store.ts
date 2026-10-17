@@ -10,6 +10,7 @@ export type ActionReceipt = {
   status: string;
   result?: unknown;
   context?: unknown;
+  payloadHash?: string;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -60,11 +61,14 @@ export class SQLiteStore {
         event_refs_json TEXT NOT NULL, summary_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS action_receipts(
         receipt_id TEXT PRIMARY KEY, scope TEXT NOT NULL, command_id TEXT NOT NULL, status TEXT NOT NULL,
-        result_json TEXT, context_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        result_json TEXT, context_json TEXT, payload_hash TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         UNIQUE(scope, command_id));
     `);
+    const receiptColumns = this.db.prepare('PRAGMA table_info(action_receipts)').all() as Array<{ name: string }>;
+    if (!receiptColumns.some(column => column.name === 'payload_hash')) this.db.exec('ALTER TABLE action_receipts ADD COLUMN payload_hash TEXT');
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)').run(now());
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(now());
+    this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(now());
     })();
   }
 
@@ -76,9 +80,13 @@ export class SQLiteStore {
 
   saveGoal(goal: { goalId: string; revision: number; status: string; text: string; context?: unknown }) {
     const timestamp = now();
+    const current = this.getGoal(goal.goalId);
+    if (!current && goal.revision !== 0 && goal.revision !== 1) throw new Error('goal-revision-conflict:0');
+    if (current && goal.revision !== current.revision && goal.revision !== current.revision + 1) throw new Error(`goal-revision-conflict:${current.revision}`);
     this.db.prepare(`INSERT INTO goals(goal_id,revision,status,body_context,spec_json,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?) ON CONFLICT(goal_id) DO UPDATE SET revision=excluded.revision,
-      status=excluded.status, body_context=excluded.body_context, spec_json=excluded.spec_json, updated_at=excluded.updated_at`)
+      status=excluded.status, body_context=excluded.body_context, spec_json=excluded.spec_json, updated_at=excluded.updated_at
+      WHERE goals.revision=excluded.revision-1 OR goals.revision=excluded.revision`)
       .run(goal.goalId, goal.revision, goal.status, json(goal.context ?? 'simulated'), json({ text: goal.text }), timestamp, timestamp);
   }
 
@@ -167,8 +175,10 @@ export class SQLiteStore {
 
   addActionReceipt(receipt: ActionReceipt) {
     if (!receiptStatuses.includes(receipt.status as typeof receiptStatuses[number])) throw new Error(`invalid-receipt-status:${receipt.status}`);
+    const payloadHash = receipt.payloadHash ?? (receipt.result === undefined ? undefined : JSON.stringify(canonical(receipt.result)));
     const existing = this.getActionReceipt(receipt.scope, receipt.commandId);
     if (existing) {
+      if (existing.payloadHash && receipt.payloadHash && existing.payloadHash !== receipt.payloadHash) throw new Error('command-payload-conflict');
       if (existing.receipt_id !== receipt.receiptId && existing.status !== 'pending') return existing;
       if (existing.receipt_id !== receipt.receiptId) throw new Error('receipt-id-conflict');
       if (existing.status === 'pending' && receipt.status !== 'pending') {
@@ -178,9 +188,9 @@ export class SQLiteStore {
       return this.getActionReceipt(receipt.scope, receipt.commandId);
     }
     const timestamp = now();
-    this.db.prepare(`INSERT INTO action_receipts(receipt_id,scope,command_id,status,result_json,context_json,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?)`).run(receipt.receiptId, receipt.scope, receipt.commandId, receipt.status,
-        receipt.result === undefined ? null : json(receipt.result), receipt.context === undefined ? null : json(receipt.context), receipt.createdAt ?? timestamp, timestamp);
+    this.db.prepare(`INSERT INTO action_receipts(receipt_id,scope,command_id,status,result_json,context_json,payload_hash,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(receipt.receiptId, receipt.scope, receipt.commandId, receipt.status,
+        receipt.result === undefined ? null : json(receipt.result), receipt.context === undefined ? null : json(receipt.context), payloadHash ?? null, receipt.createdAt ?? timestamp, timestamp);
     return this.getActionReceipt(receipt.scope, receipt.commandId);
   }
 
@@ -196,7 +206,7 @@ export class SQLiteStore {
 
   getActionReceipt(scope: string, commandId: string) {
     const row = this.db.prepare('SELECT * FROM action_receipts WHERE scope=? AND command_id=?').get(scope, commandId) as any;
-    return row ? { ...row, result: row.result_json ? parse(row.result_json) : undefined, context: row.context_json ? parse(row.context_json) : undefined } : undefined;
+      return row ? { ...row, result: row.result_json ? parse(row.result_json) : undefined, context: row.context_json ? parse(row.context_json) : undefined, payloadHash: row.payload_hash ?? undefined } : undefined;
   }
 
   hasActionReceipt(scope: string, commandId: string) { return this.getActionReceipt(scope, commandId) !== undefined; }
@@ -222,6 +232,20 @@ export class SQLiteStore {
   listExecutions() {
     return (this.db.prepare('SELECT execution_id FROM executions ORDER BY execution_id').all() as { execution_id: string }[])
       .map(row => this.getExecution(row.execution_id)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+  }
+
+  listEffects(executionId?: string) {
+    const rows = (executionId
+      ? this.db.prepare('SELECT * FROM effects WHERE execution_id=? ORDER BY effect_id').all(executionId)
+      : this.db.prepare('SELECT * FROM effects ORDER BY effect_id').all()) as any[];
+    return rows.map(row => ({ ...row, effectId: row.effect_id, executionId: row.execution_id, context: parse(row.context), intent: parse(row.intent_json), evidence: row.evidence_json ? parse(row.evidence_json) : undefined }));
+  }
+
+  listActionReceipts(scope?: string) {
+    const rows = (scope
+      ? this.db.prepare('SELECT * FROM action_receipts WHERE scope=? ORDER BY created_at').all(scope)
+      : this.db.prepare('SELECT * FROM action_receipts ORDER BY created_at').all()) as any[];
+    return rows.map(row => ({ ...row, result: row.result_json ? parse(row.result_json) : undefined, context: row.context_json ? parse(row.context_json) : undefined, payloadHash: row.payload_hash ?? undefined }));
   }
 
   listGoals() {

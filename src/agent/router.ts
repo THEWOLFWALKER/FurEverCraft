@@ -84,7 +84,7 @@ export class ToolRouter {
           const implementation = skillImplementations[skill as keyof typeof skillImplementations];
           if (!implementation || !this.executor || !this.store) return { callId: call.id, name: call.name, ok: false, error: 'unsupported-skill' };
           const executeArgs = skill === 'navigate_to' || skill === 'place_one' || skill === 'look_at' || skill === 'dig_one' ? { x: Number(args.x), y: Number(args.y) } : skill === 'send_chat' ? String(args.text) : skill === 'wait_for_condition' ? Number(args.ms) : skill === 'explore_area' ? Number(args.radius) : skill === 'gather_blocks' ? String(args.block) : skill === 'return_to_place' ? String(args.placeId) : undefined;
-          const execution = await this.executor.start('agent', skill, args, (lease, report) => (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report, isCanceled: () => false }, executeArgs));
+          const execution = await this.executor.start('agent', skill, args, (lease, report, signal) => (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs));
           result = execution;
           if (execution.outcome === 'ambiguous' || execution.status === 'failed' || execution.status === 'canceled') {
             this.events?.publish(`tool.${call.name}`, { callId: call.id, result }, false);
@@ -94,7 +94,7 @@ export class ToolRouter {
         }
         case 'send_chat': {
           if (!this.executor || !this.store) return { callId: call.id, name: call.name, ok: false, error: 'executor-unavailable' };
-          result = await this.executor.start('agent', 'send_chat', { text: args.text }, (lease, report) => skillImplementations.send_chat({ bridge: this.bridge, lease, report, isCanceled: () => false }, String(args.text)));
+          result = await this.executor.start('agent', 'send_chat', { text: args.text }, (lease, report, signal) => skillImplementations.send_chat({ bridge: this.bridge, lease, report, isCanceled: () => signal.aborted }, String(args.text)));
           if ((result as any).outcome === 'ambiguous' || (result as any).status === 'failed' || (result as any).status === 'canceled') {
             this.events?.publish(`tool.${call.name}`, { callId: call.id, result }, false);
             return { callId: call.id, name: call.name, ok: false, result, error: (result as any).reason ?? (result as any).outcome ?? (result as any).status };
@@ -126,11 +126,12 @@ export class AgentLoop {
       }
       const response = await this.provider.complete(history, tools, signal); trace.push(response);
       if (!response.toolCalls?.length) return { response, trace };
-      const reads = response.toolCalls.filter(call => ['get_state','get_inventory','query_local_world','capture_view','find_skills','get_execution','read_events','query_memory','query_knowledge'].includes(call.name));
-      const writes = response.toolCalls.filter(call => !reads.includes(call));
+      if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
       const byId = new Map<string, Awaited<ReturnType<ToolRouter['invoke']>>>();
-      for (const result of await Promise.all(reads.map(call => this.router.invoke(call)))) byId.set(result.callId, result);
-      for (const call of writes) byId.set(call.id, await this.router.invoke(call));
+      for (const call of response.toolCalls) {
+        if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
+        byId.set(call.id, await this.router.invoke(call));
+      }
       if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
       history.push({ role: 'assistant', content: response.text ?? '', toolCalls: response.toolCalls });
       for (const call of response.toolCalls) { const result = byId.get(call.id); if (result) history.push({ role: 'tool', toolCallId: result.callId, content: JSON.stringify(result) }); }

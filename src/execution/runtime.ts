@@ -1,5 +1,4 @@
-import { nextId, type Clock, type Execution } from '../contracts/index.js';
-import { ManualClock } from '../contracts/index.js';
+import { nextId, type Clock, type Execution, SystemClock } from '../contracts/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { findSkill, type SkillId } from '../skills/registry.js';
@@ -58,24 +57,27 @@ export class Executor {
   private readonly leaseTtl: number;
   private readonly watchdogTtl: number;
   private readonly progressByExecution = new Map<string, Progress>();
-  private readonly active = new Map<string, { lease: Lease; watchdog?: string; canceled: boolean; token: symbol }>();
+  private readonly active = new Map<string, { lease: Lease; watchdog?: string; canceled: boolean; controller: AbortController; token: symbol }>();
 
   constructor(
     private readonly bridge: ClientBridgeCapabilities,
     private readonly store: SQLiteStore,
-    private readonly arbiter = new InputArbiter(),
+    arbiter: InputArbiter | undefined = undefined,
     options: ExecutorOptions = {},
   ) {
-    this.clock = options.clock ?? new ManualClock();
+    this.clock = options.clock ?? new SystemClock();
+    this.arbiter = arbiter ?? new InputArbiter(() => this.clock.now());
     this.leaseTtl = options.leaseTtl ?? 1000;
     this.watchdogTtl = options.watchdogTtl ?? this.leaseTtl;
   }
+
+  private readonly arbiter: InputArbiter;
 
   resourcesFor(skillId: string): string[] {
     return findSkill(skillId)?.resources ?? (skillId === 'send_chat' ? ['ui', 'textEntry'] : ['movement', 'view', 'hands']);
   }
 
-  async start(goalId: string, skillId: string, args: Record<string, unknown>, fn: (lease: Lease, report: (p: Omit<Progress, 'at'>) => void) => unknown | Promise<unknown>): Promise<Execution> {
+  async start(goalId: string, skillId: string, args: Record<string, unknown>, fn: (lease: Lease, report: (p: Omit<Progress, 'at'>) => void, signal: AbortSignal) => unknown | Promise<unknown>): Promise<Execution> {
     const proposalId = String(args.proposalId ?? nextId('proposal'));
     const proposalHash = canonicalProposalHash({ skillId, args });
     const existing = this.store.getExecution?.(proposalId);
@@ -88,7 +90,7 @@ export class Executor {
     let lease: Lease;
     try { lease = this.arbiter.acquire(execution.executionId, this.resourcesFor(skillId), this.leaseTtl); }
     catch (error) { execution.status = 'failed'; execution.reason = error instanceof Error ? error.message : String(error); this.store.saveExecution(execution); return execution; }
-    const active: { lease: Lease; watchdog?: string; canceled: boolean; token: symbol } = { lease, canceled: false, token: Symbol(execution.executionId) };
+    const active: { lease: Lease; watchdog?: string; canceled: boolean; controller: AbortController; token: symbol } = { lease, canceled: false, controller: new AbortController(), token: Symbol(execution.executionId) };
     this.active.set(execution.executionId, active);
     const report = (p: Omit<Progress, 'at'>) => {
       this.assertLive(execution.executionId);
@@ -101,7 +103,7 @@ export class Executor {
       active.watchdog = this.clock.schedule(this.clock.now() + this.watchdogTtl, () => {
         if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; execution.status = 'failed'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); }
       });
-      const skillResult = await fn(lease, report);
+      const skillResult = await fn(lease, report, active.controller.signal);
       if (skillResult && typeof skillResult === 'object' && 'outcome' in skillResult) {
         const outcome = String((skillResult as { outcome: string }).outcome);
         if (outcome === 'canceled') throw new Error('execution-canceled');
@@ -110,7 +112,13 @@ export class Executor {
       }
       this.assertLive(execution.executionId);
       execution.status = 'verifying'; this.store.saveExecution(execution); report({ stage: 'verify', completed: 1, total: 1 });
-      execution.status = 'succeeded'; execution.outcome = 'confirmed';
+      if (execution.outcome === 'ambiguous' || execution.outcome === 'partial') {
+        execution.status = 'suspended';
+      } else if (execution.outcome === 'confirmed') {
+        execution.status = 'succeeded';
+      } else {
+        execution.status = 'succeeded'; execution.outcome = 'not-applicable';
+      }
     } catch (error) {
       if (execution.status === 'failed') { /* watchdog or external failure already recorded */ }
       else if (active.canceled || (error instanceof Error && error.message === 'execution-canceled')) { execution.status = 'canceled'; execution.reason = 'canceled'; }
@@ -130,6 +138,7 @@ export class Executor {
     const active = this.active.get(executionId);
     if (!active) return execution;
     active.canceled = true;
+    active.controller.abort();
     this.store.updateExecutionStatus?.(executionId, 'stopping', 'cancel-requested');
     return this.store.getExecution(executionId);
   }
