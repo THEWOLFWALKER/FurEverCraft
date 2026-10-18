@@ -68,7 +68,8 @@ export class WindowsHelperDriver {
   private state?: WindowState;
   private boundIdentity?: { pid: number; hwnd: string };
   private heartbeatTimer?: ReturnType<typeof setInterval>;
-  private lastReleaseAt = Number.NEGATIVE_INFINITY;
+  private lastHeartbeatAt = Number.NEGATIVE_INFINITY;
+  private releasedForStaleHeartbeat = false;
   private readonly now: () => number;
   private readonly heartbeatMs: number;
   private readonly completedCommands = new Set<string>();
@@ -85,7 +86,13 @@ export class WindowsHelperDriver {
   }
   private assertInputAllowed() { if (!this.bound) throw new Error('window-not-actionable'); if (!this.state) throw new Error('window-state-required'); if (!this.state.exists || !this.state.focused || !this.state.visible || this.state.pid !== this.boundIdentity?.pid || this.state.hwnd !== this.boundIdentity?.hwnd) throw new Error('window-not-actionable'); }
   private assertFresh(leaseUntil: number) { if (leaseUntil <= this.now()) throw new Error('input-expired'); this.assertInputAllowed(); }
-  private startWatchdog() { this.stopWatchdog(); this.heartbeatTimer = setInterval(() => { if (this.now() - this.lastReleaseAt > this.heartbeatMs * 2) { this.lastReleaseAt = this.now(); void this.releaseOwnedInputs().catch(() => undefined); } }, this.heartbeatMs); }
+  // Liveness is the caller's heartbeat confirmation, not a release timestamp: releasing once
+  // per missed window must not repeat while the link stays stale, and active input alone
+  // must not trigger a release.
+  private startWatchdog() { this.stopWatchdog(); this.heartbeatTimer = setInterval(() => {
+    const stale = this.now() - this.lastHeartbeatAt > this.heartbeatMs * 2;
+    if (stale && !this.releasedForStaleHeartbeat) { this.releasedForStaleHeartbeat = true; void this.releaseOwnedInputs().catch(() => undefined); }
+  }, this.heartbeatMs); }
   private stopWatchdog() { if (this.heartbeatTimer) clearInterval(this.heartbeatTimer); this.heartbeatTimer = undefined; }
   probe() { return this.command('probe'); }
   async bindWindow(pid: number, hwnd: string) {
@@ -95,7 +102,7 @@ export class WindowsHelperDriver {
     if (!result || result.bound !== true) throw new Error('window-bind-unconfirmed');
     if (result.pid !== undefined && Number(result.pid) !== pid) throw new Error('window-pid-mismatch');
     if (result.hwnd !== undefined && String(result.hwnd).toLowerCase() !== String(hwnd).toLowerCase()) throw new Error('window-hwnd-mismatch');
-    this.bound = true; this.boundIdentity = { pid, hwnd }; this.state = { exists: true, focused: true, visible: true, pid, hwnd }; this.lastReleaseAt = this.now(); this.startWatchdog(); return result;
+    this.bound = true; this.boundIdentity = { pid, hwnd }; this.state = { exists: true, focused: true, visible: true, pid, hwnd }; this.lastHeartbeatAt = this.now(); this.releasedForStaleHeartbeat = false; this.startWatchdog(); return result;
   }
   async getWindowState() {
     if (!this.bound) throw new Error('window-not-bound');
@@ -134,6 +141,6 @@ export class WindowsHelperDriver {
   private assertFinite(...values: number[]) { if (values.some(value => !Number.isFinite(value))) throw new Error('invalid-input'); }
   captureWindow() { if (!this.enabled) throw new Error('os-input-disabled'); if (!this.bound) throw new Error('window-not-bound'); return this.command('captureWindow'); }
   releaseOwnedInputs() { return this.command('releaseOwnedInputs'); }
-  async heartbeat() { this.lastReleaseAt = this.now(); return this.command('heartbeat'); }
+  async heartbeat() { const result = await this.command('heartbeat'); this.lastHeartbeatAt = this.now(); this.releasedForStaleHeartbeat = false; return result; }
   async shutdown() { this.stopWatchdog(); let releaseError: unknown; try { if (this.enabled && this.bound) await this.releaseOwnedInputs(); } catch (error) { releaseError = error; } finally { this.bound = false; this.boundIdentity = undefined; this.state = undefined; } try { await this.command('shutdown'); } finally { await this.transport.close(); } if (releaseError) throw releaseError; }
 }

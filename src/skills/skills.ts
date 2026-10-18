@@ -28,7 +28,9 @@ export function sendChat(ctx: SkillContext, text: string): SkillResult {
   ctx.report({ stage: 'dispatch', completed: 0, total: 1 });
   let enteredChat = false;
   try {
-    const receipt: { accepted: boolean; ambiguous?: boolean; commandId: string; seq: number; text?: string } = ctx.bridge.dispatchChat ? ctx.bridge.dispatchChat(text) : (() => { ctx.bridge.setUi('chat'); return { accepted: true, commandId: `chat_${Date.now()}`, seq: 0, text }; })();
+    // Without a real dispatch path the text is never sent; switching the UI alone is not a send.
+    if (!ctx.bridge.dispatchChat) return { ok: false, outcome: 'failed', reason: 'chat-dispatch-unavailable' };
+    const receipt: { accepted: boolean; ambiguous?: boolean; commandId: string; seq: number; text?: string } = ctx.bridge.dispatchChat(text);
     enteredChat = true;
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
     // Delivery acceptance is not world confirmation: only an explicit non-ambiguous receipt is confirmed.

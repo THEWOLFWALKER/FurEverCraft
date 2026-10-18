@@ -116,12 +116,13 @@ export class Executor {
     try {
       execution.status = 'running'; this.store.saveExecution(execution); report({ stage: 'prepare', completed: 0 });
       const skillResult = await fn(lease, report, active.controller.signal);
-      if (skillResult && typeof skillResult === 'object' && 'outcome' in skillResult) {
-        const outcome = String((skillResult as { outcome: string }).outcome);
-        if (outcome === 'canceled') throw new Error('execution-canceled');
-        if (outcome === 'failed') throw new Error(String((skillResult as { reason?: string }).reason ?? 'skill-failed'));
-        execution.outcome = outcome;
-      }
+      // Only a closed set of outcomes may settle an execution; an absent or unknown outcome is
+      // not success and must not be promoted to confirmed.
+      const outcome = skillResult && typeof skillResult === 'object' && 'outcome' in skillResult ? String((skillResult as { outcome: string }).outcome) : 'ambiguous';
+      if (outcome === 'canceled') throw new Error('execution-canceled');
+      if (outcome === 'failed') throw new Error(String((skillResult as { reason?: string }).reason ?? 'skill-failed'));
+      if (!['confirmed', 'partial', 'ambiguous'].includes(outcome)) execution.outcome = 'ambiguous';
+      else execution.outcome = outcome;
       this.assertLive(execution.executionId);
       execution.status = 'verifying'; this.store.saveExecution(execution); report({ stage: 'verify', completed: 1, total: 1 });
       if (execution.outcome === 'ambiguous' || execution.outcome === 'partial') {
@@ -129,7 +130,8 @@ export class Executor {
       } else if (execution.outcome === 'confirmed') {
         execution.status = 'succeeded';
       } else {
-        execution.status = 'succeeded'; execution.outcome = 'not-applicable';
+        // An unknown outcome is observable ambiguity, never a silent success.
+        execution.status = 'suspended'; execution.outcome = 'ambiguous';
       }
     } catch (error) {
       if (execution.status === 'failed') { /* watchdog or external failure already recorded */ }

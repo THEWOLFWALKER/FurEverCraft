@@ -91,7 +91,14 @@ export class ProcessSupervisor {
     child.on('error', () => { if (this.child === child && this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; });
     const hello: IpcMessage = { type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch: this.ownerEpoch, bootEpoch: randomUUID(), capabilities: ['control', 'observe'] };
     if (!child.send(hello)) { this.stateValue = 'failed'; throw new Error('supervisor-hello-backpressure'); }
-    this.stateValue = 'running';
+    // Do not claim running until the child confirms its session with a hello.
+    this.stateValue = 'starting';
+    void this.promoteWhenReady();
+  }
+
+  private async promoteWhenReady() {
+    try { await this.waitForHello(); if (this.stateValue === 'starting' && this.child) this.stateValue = 'running'; }
+    catch { if (this.stateValue === 'starting') this.stateValue = 'failed'; }
   }
 
   /** Wait for the child's hello so a request is not sent before the session epoch is known. */
@@ -123,11 +130,10 @@ export class ProcessSupervisor {
     });
   }
 
-  /** Called on each heartbeat. Returns whether the owner link is still alive. */
+  /** Returns whether the owner link is still alive. Live only while the child keeps sending traffic; a local caller cannot self-renew it. */
   heartbeat(): boolean {
     if (this.stateValue !== 'running') return false;
-    this.lastHeartbeat = this.now();
-    return true;
+    return this.now() - this.lastHeartbeat <= this.ownerLossMs;
   }
 
   /** Explicit owner-loss check driven by the caller's clock. */

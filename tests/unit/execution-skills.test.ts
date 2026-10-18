@@ -9,7 +9,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
   it('deduplicates proposals and reports lifecycle progress', async () => {
     const store = new SQLiteStore(':memory:');
     const executor = new Executor(new FakeClientBridge(), store);
-    const first = await executor.start('g', 'observe_ui', { proposalId: 'p1' }, (_lease, report) => report({ stage: 'dispatch', completed: 1, total: 1 }));
+    const first = await executor.start('g', 'observe_ui', { proposalId: 'p1' }, (_lease, report) => { report({ stage: 'dispatch', completed: 1, total: 1 }); return { outcome: 'confirmed' }; });
     const duplicate = await executor.start('g', 'observe_ui', { proposalId: 'p1' }, () => { throw new Error('must not run'); });
     expect(first.status).toBe('succeeded');
     expect(duplicate.executionId).toBe(first.executionId);
@@ -99,7 +99,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
     const store = new SQLiteStore(':memory:');
     const clock = new ManualClock();
     const executor = new Executor(new FakeClientBridge(), store, undefined, { clock, watchdogTtl: 5 });
-    const execution = await executor.start('g', 'observe_ui', { proposalId: 'watch' }, () => { clock.advance(6); });
+    const execution = await executor.start('g', 'observe_ui', { proposalId: 'watch' }, () => { clock.advance(6); return { outcome: 'confirmed' }; });
     expect(store.getExecution(execution.executionId)?.reason).toBe('watchdog-timeout');
     store.close();
   });
@@ -114,6 +114,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
       report({ stage: 'dispatch', completed: 2 });
       clock.advance(4);
       report({ stage: 'dispatch', completed: 3 });
+      return { outcome: 'confirmed' };
     });
     expect(execution.status).toBe('succeeded');
     expect(store.getExecution(execution.executionId)?.status).toBe('succeeded');

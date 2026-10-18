@@ -21,8 +21,18 @@ export class SystemClock implements Clock {
   now() { return performance.now(); }
   schedule(at: number, fn: () => void) {
     const id = nextId('timer');
-    const timer = setTimeout(() => { this.timers.delete(id); fn(); }, Math.max(0, at - this.now()));
-    this.timers.set(id, timer);
+    // setTimeout overflows for delays above 2^31-1 ms and fires immediately; clamp to the
+    // maximum and re-arm so long TTLs do not collapse into an instant timeout.
+    const MAX_DELAY = 2_147_483_647;
+    const arm = () => {
+      const remaining = Math.max(0, at - this.now());
+      const timer = setTimeout(() => {
+        if (at - this.now() > 0) { arm(); return; }
+        this.timers.delete(id); fn();
+      }, Math.min(remaining, MAX_DELAY));
+      this.timers.set(id, timer);
+    };
+    arm();
     return id;
   }
   cancel(id: string) { const timer = this.timers.get(id); if (timer) clearTimeout(timer); this.timers.delete(id); }

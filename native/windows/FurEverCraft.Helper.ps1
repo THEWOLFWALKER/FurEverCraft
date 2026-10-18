@@ -83,17 +83,17 @@ while ($line = [Console]::In.ReadLine()) {
         @{accepted=$true;generation=$generation}
       }
       'moveRelative' {
-        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if(-not $seen.Add([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
-        if(-not $DryRun){[FurEverCraftNative]::Mouse([int]$request.dx,[int]$request.dy,0x0001)}; @{accepted=$true;commandId=$request.commandId}
+        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if($seen.Contains([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
+        if(-not $DryRun){[FurEverCraftNative]::Mouse([int]$request.dx,[int]$request.dy,0x0001)}; [void]$seen.Add([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
       }
       'click' {
-        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if(-not $seen.Add([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
+        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if($seen.Contains([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
         $flags=switch([string]$request.button){'left'{0x0002 -bor 0x0004};'right'{0x0008 -bor 0x0010};'middle'{0x0020 -bor 0x0040};default{throw 'invalid-mouse-button'}}
-        if(-not $DryRun){$down=switch([string]$request.button){'left'{0x0002};'right'{0x0008};'middle'{0x0020};default{throw 'invalid-mouse-button'}};$up=switch([string]$request.button){'left'{0x0004};'right'{0x0010};'middle'{0x0040};default{throw 'invalid-mouse-button'}};[FurEverCraftNative]::Mouse(0,0,[uint32]$down);[FurEverCraftNative]::Mouse(0,0,[uint32]$up)}; @{accepted=$true;commandId=$request.commandId}
+        if(-not $DryRun){$down=switch([string]$request.button){'left'{0x0002};'right'{0x0008};'middle'{0x0020};default{throw 'invalid-mouse-button'}};$up=switch([string]$request.button){'left'{0x0004};'right'{0x0010};'middle'{0x0040};default{throw 'invalid-mouse-button'}};[FurEverCraftNative]::Mouse(0,0,[uint32]$down);[FurEverCraftNative]::Mouse(0,0,[uint32]$up)}; [void]$seen.Add([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
       }
       'typeText' {
-        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if(-not $seen.Add([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
-        if(-not $DryRun){foreach($char in [string]$request.text){[FurEverCraftNative]::Unicode($char,$true);[FurEverCraftNative]::Unicode($char,$false)}}; @{accepted=$true;commandId=$request.commandId}
+        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if($seen.Contains([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
+        if(-not $DryRun){foreach($char in [string]$request.text){[FurEverCraftNative]::Unicode($char,$true);[FurEverCraftNative]::Unicode($char,$false)}}; [void]$seen.Add([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
       }
       'captureWindow' {
         if($boundHwnd -eq [IntPtr]::Zero -or -not [FurEverCraftNative]::IsWindow($boundHwnd)){throw 'window-not-found'}

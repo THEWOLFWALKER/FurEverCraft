@@ -60,7 +60,11 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
   // The scheduler's wake hook really advances one decision turn through the same AgentLoop.
   const scheduler = new TaskScheduler(session.events, async (reason) => {
     if (control.pausedValue || control.stoppingValue) return;
-    await loop.run([{ role: 'user', content: `Scheduler wake: ${reason}. Continue the active goal or report the next blocked step.` }], undefined, undefined, { goalId: 'agent', store });
+    // Use the actual active goal (and its revision) so user goals can progress; without one
+    // there is nothing to drive and the wake is a no-op.
+    const active = store.listGoals().find(goal => goal.status === 'active');
+    if (!active) return;
+    await loop.run([{ role: 'user', content: `Scheduler wake: ${reason}. Continue the active goal or report the next blocked step.` }], undefined, undefined, { goalId: active.goal_id, goalRevision: active.revision, store });
   }, 25);
   const sessionSupervisor = new SessionSupervisor(session.events);
   // Wire the scheduler to the event stream so goal/execution/effect/session events coalesce

@@ -85,12 +85,13 @@ export class ToolRouter {
         case 'query_local_world': result = this.bridge.snapshot().cells; break;
         case 'capture_view': result = syntheticCapture('tool-request', Date.now(), this.bridge.snapshot().revision); break;
         case 'find_skills': result = findSkills(args.query as string | undefined); break;
-        case 'get_execution': result = this.store?.getExecution(String(args.executionId)); break;
-        case 'read_events': result = this.events?.read(String(args.cursor ?? '0'), Number(args.limit ?? 100), args.filter as string | undefined); break;
-        case 'revise_goal': result = this.store?.reviseGoal(String(args.goalId), Number(args.expectedRevision), String(args.change)); break;
-        case 'query_memory': result = { spatial: this.memory?.querySpatial(args as any), episodic: this.memory?.queryEpisodic(args as any) }; break;
-        case 'query_knowledge': result = this.memory?.queryKnowledge(args as any); break;
-        case 'remember_place': result = this.memory?.rememberPlace({ placeId: String(args.placeId), context: this.bridge.context, payload: args.payload }); break;
+        // A missing backing service must report failure, not a successful undefined.
+        case 'get_execution': if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' }; result = this.store.getExecution(String(args.executionId)); if (!result) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' }; break;
+        case 'read_events': if (!this.events) return { callId: call.id, name: call.name, ok: false, error: 'events-unavailable' }; result = this.events.read(String(args.cursor ?? '0'), Number(args.limit ?? 100), args.filter as string | undefined); break;
+        case 'revise_goal': if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' }; result = this.store.reviseGoal(String(args.goalId), Number(args.expectedRevision), String(args.change)); break;
+        case 'query_memory': if (!this.memory) return { callId: call.id, name: call.name, ok: false, error: 'memory-unavailable' }; result = { spatial: this.memory.querySpatial(args as any), episodic: this.memory.queryEpisodic(args as any) }; break;
+        case 'query_knowledge': if (!this.memory) return { callId: call.id, name: call.name, ok: false, error: 'memory-unavailable' }; result = this.memory.queryKnowledge(args as any); break;
+        case 'remember_place': if (!this.memory) return { callId: call.id, name: call.name, ok: false, error: 'memory-unavailable' }; result = this.memory.rememberPlace({ placeId: String(args.placeId), context: this.bridge.context, payload: args.payload }); break;
         case 'start_skill': {
           const skill = String(args.skill);
           const implementation = skillImplementations[skill as keyof typeof skillImplementations];
@@ -107,7 +108,7 @@ export class ToolRouter {
               // Intent is durable before dispatch, but it stays `prepared` until the skill
               // actually reports that it reached the dispatch stage. Failing admission must
               // not look like a possibly-sent side effect.
-              this.store!.addEffect({ effectId, executionId: lease.owner, context: this.bridge.context, status: 'prepared', intent: { kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : 'dig', x: typeof executeArgs === 'object' ? executeArgs?.x : undefined, y: typeof executeArgs === 'object' ? executeArgs?.y : undefined, text: executeArgs, block: skill === 'gather_blocks' ? String(args.block) : undefined } });
+              this.store!.addEffect({ effectId, executionId: lease.owner, context: this.bridge.context, status: 'prepared', intent: { kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : 'dig', x: typeof executeArgs === 'object' ? executeArgs?.x : undefined, y: typeof executeArgs === 'object' ? executeArgs?.y : undefined, text: skill === 'send_chat' ? String(executeArgs) : undefined, block: skill === 'gather_blocks' ? String(args.block) : undefined } });
             }
             const guardedReport = (progress: Omit<Progress, 'at'>) => {
               if (effectId && progress.stage === 'dispatch' && progress.completed > 0) {

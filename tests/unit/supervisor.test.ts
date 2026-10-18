@@ -17,6 +17,8 @@ describe('B06 process supervisor', () => {
     const child = new FakeChild();
     const supervisor = new ProcessSupervisor({ spawn: () => child });
     await supervisor.start();
+    child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'c', bootEpoch: 'b', capabilities: [] });
+    await new Promise(r => setImmediate(r));
     expect(supervisor.state).toBe('running');
     expect(child.sent[0]).toMatchObject({ type: 'hello', sessionEpoch: supervisor.ownerEpoch });
     await supervisor.stop();
@@ -24,10 +26,13 @@ describe('B06 process supervisor', () => {
     expect(child.killed).toBe(true);
   });
 
-  it('detects owner loss after the configured heartbeat window', () => {
+  it('detects owner loss after the configured heartbeat window', async () => {
     let now = 0;
-    const supervisor = new ProcessSupervisor({ spawn: () => new FakeChild(), now: () => now, ownerLossMs: 1_000 });
+    const child = new FakeChild();
+    const supervisor = new ProcessSupervisor({ spawn: () => child, now: () => now, ownerLossMs: 1_000 });
     void supervisor.start();
+    child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'c', bootEpoch: 'b', capabilities: [] });
+    await new Promise(r => setImmediate(r));
     now = 999; expect(supervisor.checkOwner()).toMatchObject({ ownerLost: false });
     now = 1_001; expect(supervisor.checkOwner()).toMatchObject({ ownerLost: true, revoked: true });
     expect(supervisor.state).toBe('paused');
@@ -60,6 +65,7 @@ describe('B06 process supervisor', () => {
     const supervisor = new ProcessSupervisor({ spawn: () => child, ipcTimeoutMs: 50 });
     await supervisor.start();
     child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'child-1', bootEpoch: 'b', capabilities: [] });
+    await new Promise(r => setImmediate(r));
     const pending = supervisor.request('status');
     // request() awaits the hello handshake before sending, so let the microtask settle.
     await new Promise(r => setImmediate(r));
@@ -92,6 +98,7 @@ describe('B06 process supervisor', () => {
     const supervisor = new ProcessSupervisor({ spawn: () => child });
     await supervisor.start();
     child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'child-session-1', bootEpoch: 'b', capabilities: [] });
+    await new Promise(r => setImmediate(r));
     expect(supervisor.state).toBe('running');
     child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'foreign-owner', bootEpoch: 'b', capabilities: [] });
     expect(supervisor.state).toBe('failed');
