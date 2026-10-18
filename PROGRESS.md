@@ -1,44 +1,49 @@
 # FurEverCraft v0.2 Full Batch Progress
 
-Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Status reflects verified offline behavior only. Real servers/worlds, paid APIs, actual Windows input and screenshots remain prohibited.
+Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Status reflects verified offline behavior only; real servers/worlds, paid APIs, actual Windows input and screenshots remain prohibited.
 
 | Task group | Status | Implementation evidence | Verification evidence |
 |---|---|---|---|
-| F01 Runtime/Clock/ownership | implemented-offline | `src/execution/factory.ts` single assembly, shared injected Clock, `SystemClock` production default | `tests/unit/runtime.test.ts`, C1 factory tests |
-| F02 execution/cancel/admission | implemented-offline | `src/execution/runtime.ts` owner token, AbortSignal, lease+watchdog renewal on progress, no ambiguous→confirmed | `tests/unit/execution-skills.test.ts` |
-| F03 durable dispatch/recovery | implemented-offline (partial) | `src/execution/session.ts`, effect ledger + receipts in store; dispatch-boundary intent wiring limited | `tests/unit/c2-recovery-events.test.ts`, `tests/integration/v01-v04.integration.test.ts` |
-| F04 Store/state/events | implemented-offline | transactional migration, CAS, sticky read-time WorldState invalidation, event cursor | `tests/unit/persistence.test.ts`, `tests/unit/world.test.ts` |
-| F05 providers | implemented-offline | canonical history, tool pairing, UTF-8 SSE, limits, retry/Retry-After, network gate | `tests/unit/providers.test.ts` |
-| F06 docs/rules | implemented | v0.2 authority synced in README/CLAUDE/AGENTS/DECISIONS | this file |
-| B01 26.3 version profile | implemented-offline (candidate) | `src/bridge/version-profile.ts` 26.3/777/5023 candidate; codec remains legacy 1.20.4 fixture (not live) | `tests/unit/version-profile.test.ts` |
-| B02 raw TCP relay | implemented-offline | `src/bridge/relay/raw.ts` byte relay, handshake rewrite with nextState validation, backpressure, half-close, bounded flush | `tests/unit/raw-relay.test.ts` (7 tests) |
-| B03 bounded observer | implemented-offline (partial) | `src/bridge/observer/bounded.ts` async bounded queue, per-frame offsets, sticky unknown; no compression/typed worker | `tests/unit/bounded-observer.test.ts` (5 tests) |
-| B04 domain adapters | implemented-offline (partial) | `src/bridge/protocol/domain.ts` position/chat/registry projection with explicit unknown for unmapped packets; 26.3 complete packet families not available | `tests/unit/domain-projection.test.ts` |
-| B05 Windows helper/driver | implemented-unverified (Linux) | `src/bridge/windows/driver.ts`, PowerShell helper; no real SendInput run | `tests/unit/windows-driver.test.ts` |
-| B06 IPC/Supervisor | implemented-offline | `src/bridge/ipc/*` session-epoch fencing; `src/bridge/supervisor.ts` owner epoch/restart budget/owner-loss; `src/bridge/relay/entry.ts` + `spawn.ts` fork IPC; `src/bridge/observer/host.ts` worker_threads observer | `tests/unit/ipc-endpoint.test.ts`, `supervisor.test.ts`, `observer-host.test.ts`, `tests/integration/relay-child.test.ts` |
-| U01 shared ControlService | implemented-offline | `src/control/service.ts`, `serve`/`attach` CLI | `tests/unit/control-service.test.ts` |
-| U02 HTTP/SSE | implemented-offline | `src/server/index.ts`, JSON API, SSE snapshot+cursor, bounds, same-origin static hosting | `tests/integration/server.test.ts` |
-| U03 React control UI | implemented-offline | `web/` Vite+React console with the blue-white design tokens, truthful states, command forms, SSE feed | `npm run test:web`, `npm run build:web`, loopback smoke |
-| U04 concurrent CLI/Web | implemented-offline (partial) | requestId dedupe + CAS via ControlService; CLI `serve`/`attach` share one Runtime | server + control tests; Playwright E2E not implemented |
-| M01-M05 3D state/motor | implemented-offline (partial) | `src/motor/*`, `src/fixtures/*`; not wired into production runtime | `tests/unit/m01-m05.test.ts` |
-| A01 GoalManager/TaskScheduler | implemented-offline | `src/autonomous/tasks.ts` | `tests/unit/autonomous.test.ts` |
-| A02 knowledge/spatial/episodic memory | implemented-offline | `src/autonomous/memory.ts` | `tests/unit/autonomous.test.ts` |
-| A03 eleven skills | implemented-offline (partial) | registry has 11; look_at/dig_one/return_to_place implemented against simulated capabilities and fail closed when absent; collect_nearby/gather_blocks intentionally unavailable | `tests/unit/execution-skills.test.ts` |
-| A04 session/auth | implemented-offline | `src/autonomous/session.ts` secretRef only | `tests/unit/autonomous.test.ts` |
-| A05 capture/long-run bounds | implemented-offline | bounded capture history | `tests/unit/autonomous.test.ts` |
-| V01 integrated scenarios | partial | `tests/integration/v01-v04.integration.test.ts`, server tests | 5 integration tests |
-| V02 crash/write/soak | partial | `tests/soak/v02-soak.test.ts` virtual-time 60 min | 1 soak test |
-| V03 trace/replay/docs | partial | `src/diagnostics/trace.ts` + tests | `tests/diagnostics/trace.test.ts` |
-| V04 CI/review | partial | `.github/workflows/offline.yml` Node 22 commands | not yet observed on CI |
+| F01 Runtime/Clock/ownership | implemented-offline (partial) | `src/execution/factory.ts` single assembly, injected Clock, profile validation, idempotent close | `tests/unit/runtime.test.ts` |
+| F02 execution/cancel/admission | implemented-offline | owner token, AbortSignal, watchdog aborts, lease renewal, ordered tools | `tests/unit/execution-skills.test.ts` |
+| F03 durable dispatch/recovery | implemented-offline (partial) | prepared→may-have-dispatched barrier, effect settlement, receipts; no full receipt vocabulary/child execution | `tests/unit/c2-recovery-events.test.ts`, `tests/integration/v01-v04.integration.test.ts` |
+| F04 Store/state/events | implemented-offline (partial) | transactional migrations, terminal-safe writes, sticky read-time WorldState, event cursor; no versioned migration dispatch | `tests/unit/persistence.test.ts`, `tests/unit/world.test.ts` |
+| F05 providers | implemented-offline (partial) | canonical history, tool pairing, SSE limits, retry, gate; no provider-switch path | `tests/unit/providers.test.ts` |
+| F06 docs/rules | implemented | v0.2 authority synced; reports updated with actual numbers | this file |
+| B01 26.3 version profile | implemented-offline (candidate) | candidate metadata; codec remains legacy fixture | `tests/unit/version-profile.test.ts` |
+| B02 raw TCP relay | implemented-offline | allowHalfOpen, handshake validation, backpressure, bounded flush, deterministic stop | `tests/unit/raw-relay.test.ts` |
+| B03 bounded observer | implemented-offline (partial) | async bounded queue, offsets, sequence advance, sticky unknown, worker host; no decompression | `tests/unit/bounded-observer.test.ts`, `observer-host.test.ts` |
+| B04 domain adapters | partial | position/chat/registry; other families explicit unknown | `tests/unit/domain-projection.test.ts` |
+| B05 Windows helper/driver | implemented-unverified (Linux) | 250ms heartbeat, identity confirmation, dedupe; no real SendInput | `tests/unit/windows-driver.test.ts` |
+| B06 IPC/Supervisor | implemented-offline | session/boot fencing, restart budget, owner revoke, relay child fork | `tests/unit/supervisor.test.ts`, `tests/integration/relay-child.test.ts` |
+| U01 shared ControlService | implemented-offline (partial) | atomic claim, CAS, pause admission, stop body release; no child-execution cancel | `tests/unit/control-service.test.ts` |
+| U02 HTTP/SSE | implemented-offline (partial) | JSON API, SSE watermark/gap recovery, bounds; node:http (not Fastify), no pairing/cookie auth | `tests/integration/server.test.ts` |
+| U03 React control UI | implemented-offline (partial) | real API, truthful states, SSE; no five-area layout, Canvas map, capability gating | `npm run test:web` |
+| U04 concurrent CLI/Web | partial | requestId dedupe + CAS; no Playwright E2E | control/server tests |
+| M01 3D state/geometry | partial | sparse voxel, explicit unknown, support required; not wired to Runtime | `tests/unit/m01-m05.test.ts` |
+| M02 action graph | partial | A* with budget/status; walk edges only | `tests/unit/m01-m05.test.ts` |
+| M03 primitives | partial | InputPlan validation; no closed-loop 20Hz controller | `tests/unit/m01-m05.test.ts` |
+| M04 simulated body | partial | continuous tick, gravity, yaw-relative movement; no jump trajectory | `tests/unit/m01-m05.test.ts` |
+| M05 progress/recovery | implemented-offline | cooldown reset, failure classes, phase wait | `tests/unit/m01-m05.test.ts` |
+| A01 GoalManager/Scheduler | implemented-offline | cycle detection, unknown-skill rejection, scheduler wired to events | `tests/unit/autonomous.test.ts` |
+| A02 memory | partial | spatial/episodic + JSON knowledge loader; no auto episodic summary on completion | `tests/unit/autonomous.test.ts` |
+| A03 eleven skills | implemented-offline (partial) | all 11 registered; 5 capability-backed; gather is single-block | `tests/unit/execution-skills.test.ts` |
+| A04 session/auth | partial | secretRef, single owner, lifecycle states; no backoff/lease revoke | `tests/unit/autonomous.test.ts` |
+| A05 capture/bounds | implemented-offline (partial) | bounded history; synthetic PNG not a valid image | `tests/unit/autonomous.test.ts` |
+| V01 integrated scenarios | partial | 2 integration tests, not 14 scenarios | `tests/integration/v01-v04.integration.test.ts` |
+| V02 crash/write/soak | partial | 60 virtual min, 50+ transitions, 5 rebuilds; no injected write failures | `tests/soak/v02-soak.test.ts` |
+| V03 trace/replay/docs | partial | TraceRecorder + tests; no CLI trace command | `tests/diagnostics/trace.test.ts` |
+| V04 CI/review | partial | Node 22 + Windows static parse jobs; not observed | `.github/workflows/offline.yml` |
+
+## Review status
+
+Two uncapped read-only review passes covered every group. Confirmed defects were fixed with regression tests; remaining items are listed as partial/unmet above and in `DELIVERY_REPORT.md`.
 
 ## Honest limits
 
-- The Minecraft codec path is the legacy 1.20.4/765 fixture; the 26.3 adapter is candidate metadata only. No live 26.3 interoperability is claimed.
-- The raw relay is verified on loopback sockets only; no real server was contacted.
-- The React web UI is implemented and served same-origin; browser Playwright E2E remains not implemented.
-- All eleven skills are registered; `look_at`/`dig_one`/`return_to_place`/`collect_nearby`/`gather_blocks` run against simulated capabilities and fail closed when the capability is absent.
+- 26.3 codec absent (installed data has no 26.3); legacy fixture is labelled and never presented as live support.
+- Relay/observer verified on loopback only; no real server.
+- Motor is not wired into the Runtime.
+- React UI lacks Canvas map and Playwright E2E; `test:web` is typecheck+build.
+- V01 has 2 integrated scenarios, not 14.
 - Real Windows input/capture, paid model APIs, Node 22 execution and real Minecraft are unverified.
-
-## Review status (2026-10-18)
-
-A dedicated read-only review of the bridge/relay/observer/control/server/world/skills/web code found ten defects; all ten were fixed with regression tests (relay stop deadlock, half-close reply loss, supervisor late-exit corruption, owner-loss revoke, conflict receipt replay, world gap cell loss, observer concurrency, SSE timer leak, wait-skill no-op, web event kinds). A corrected recovery test also exposed missing durable side-effect persistence, now wired as prepared → may-have-dispatched → confirmed/partial/ambiguous.

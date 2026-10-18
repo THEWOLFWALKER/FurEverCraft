@@ -2,67 +2,50 @@
 
 ## Status
 
-A substantial offline implementation of the v0.2 batch is complete and verified on loopback fixtures. It is not a claim of live Minecraft 26.3, Windows, or paid-API compatibility. Real servers/worlds, paid model APIs, actual SendInput and desktop capture were not used.
-
-Current HEAD after this pass: `279fd8d` (plus documentation commits).
+A substantial offline implementation of the v0.2 batch exists and is verified on loopback fixtures. It is not a claim of live Minecraft 26.3, Windows, or paid-API compatibility. Real servers/worlds, paid model APIs, actual SendInput and desktop capture were not used.
 
 ## What is implemented
 
 ### Foundation and providers (F)
-- One `createRuntime` assembly (`src/execution/factory.ts`) with a single injected `Clock`, Store, Session, Executor, Router, provider, AgentLoop and ControlService.
-- Executor: owner token, AbortSignal propagation, resource leases with resource-scoped generation, lease/watchdog renewal on progress, no ambiguous→confirmed promotion, terminal-state protection.
-- Store: transactional migrations, effect state guards, action receipt lifecycle, checkpoint persistence, context-scoped queries.
-- WorldState: schema-validated updates, read-time TTL, sticky gap cleared only by a full baseline, all cells unknown after a gap, immutable listener notifications.
-- EventHub: `{bootEpoch, sequence}` cursor, filtered reads without manufactured gaps, validated limits.
-- Providers: canonical history (text/image/tool/termination), OpenAI and Anthropic serializers with correct tool pairing, UTF-8 SSE across arbitrary byte chunks, record/response/tool-argument limits, truncation rejection, `Retry-After`-aware bounded retry, cancellation fence, `allowModelNetwork` gate.
+- One `createRuntime` assembly with a shared injected Clock, Store, Session, Executor, Router, provider, AgentLoop, ControlService, GoalManager and TaskScheduler.
+- Executor: owner token, AbortSignal, resource leases with per-resource generation, lease/watchdog renewal on progress, watchdog aborts in-flight work, terminal-state writes are guarded in the store, ambiguous/partial never promoted to confirmed.
+- Store: transactional migrations, effect state guards, action receipt lifecycle (`conflict`/`rejected` preserved), checkpoint persistence, terminal-safe execution writes.
+- WorldState: schema-validated updates, read-time TTL, sticky gap cleared only by a full baseline, prior cells preserved as `unknown` after a gap, immutable notifications.
+- EventHub: `bootEpoch` + sequence, validated cursors, filtered reads without manufactured gaps.
+- Providers: canonical history, OpenAI/Anthropic serializers with correct tool pairing, UTF-8 SSE across arbitrary byte chunks, record/response/tool-argument limits, truncation rejection, `Retry-After`-aware bounded retry, cancellation fence, `allowModelNetwork` gate, no-key unavailable provider.
+- Side-effect skills persist `prepared → may-have-dispatched` before dispatch and settle `confirmed/partial/ambiguous` by outcome; `place` is only confirmed when the target cell is observed blocked.
 
 ### Bridge (B)
-- `src/bridge/version-profile.ts`: 26.3 / protocol 777 / data 5023 candidate metadata with explicit limitations.
-- `src/bridge/relay/raw.ts`: raw TCP byte relay with handshake rewrite (protocol/nextState validated), correct `write=false` backpressure + drain resume, hard limit, bounded close flush, half-close propagation, EOF session cleanup, retryable startup.
-- `src/bridge/observer/bounded.ts`: async bounded dispatch queue with concurrency/timeout, per-frame byte offsets, sticky global unknown, explicit gap events.
-- `src/bridge/ipc/endpoint.ts`: versioned protocol, session-epoch fencing (stale responses cannot settle requests), bounded pending, listener cleanup.
-- `src/bridge/protocol/domain.ts`: packet→domain projection; unsupported packets become explicit `unknown` observations, never silent drops.
-- Windows driver/helper: request-ID matching, command-ID dedup, disabled-safe cleanup, binding/input checks (Linux-tested via `FakeHelperTransport` only).
+- `version-profile.ts`: 26.3 / 777 / 5023 candidate metadata with explicit limitations; the legacy 1.20.4/765 codec is labelled as a fixture and never presented as 26.3 support.
+- Raw TCP relay: `allowHalfOpen`, validated handshake rewrite (protocol/nextState), declared-length limit, backpressure on `write=false` with drain resume, bounded close flush, half-close reply preservation, EOF session cleanup, retryable startup, deterministic stop.
+- Bounded observer: async bounded queue with concurrency/timeout, per-frame byte offsets, sequence advance on dropped frames, sticky global unknown, reset clears partial frames, worker_threads host with failure isolation.
+- IPC: versioned protocol, session-epoch fencing, bounded pending requests, listener cleanup.
+- Domain projection: position/chat/registry with explicit `unknown` for unsupported or malformed packets.
+- Windows driver/helper: 250 ms heartbeat default, PID/HWND confirmation on bind, identity required to permit input, request-ID matching, command-ID dedup, best-effort cleanup. Linux-tested only via `FakeHelperTransport`.
+- Supervisor: owner epoch, child session/boot fencing, hello-before-request, 3-per-60s restart budget, owner-loss revoke, explicit quit; relay child entry and fork spawner, verified end-to-end over loopback child IPC.
 
 ### Control surface (U)
-- `src/control/service.ts`: shared ControlService with canonical payload hashing, durable requestId dedupe, CAS conflicts, goal set/revise, message, chat, pause/resume/stop/cancel/save/quit; stop cancels non-terminal executions; save persists a checkpoint.
-- `src/server/index.ts`: JSON API, SSE snapshot+consistent ascending cursor, bounds, same-origin static hosting of the built UI.
-- `web/`: React + Vite control console using the calm blue-white design tokens, truthful unknown (`--`) states, live SSE feed, capability-gated actions, responsive breakpoints.
-- CLI: `serve`, `attach`, `demo`, `status`, `doctor`, `bridge` (fixture/inspect/live-gated).
+- Shared ControlService: canonical payload hash, atomic in-flight claim for concurrent requestId dedupe, durable receipts, CAS conflicts, pause blocks new admission, stop cancels non-terminal executions and releases body input, save persists a checkpoint, message goal-revision conflicts surface as `conflict`.
+- HTTP/SSE: JSON API, Zod DTOs, 400/409, SSE snapshot at a consistent watermark, gap re-sends a fresh snapshot, bounded events/bytes, heartbeats with backpressure checks, same-origin static hosting.
+- React + Vite console using the calm blue-white tokens, truthful `--` unknown states, live SSE feed, capability-aware panels, responsive breakpoints.
+- CLI: `serve` (default 127.0.0.1:3000), `attach`, `demo`, `status`, `doctor`, `bridge` fixture/inspect/live-gated.
 
-### Motor, autonomy and verification (M/A/V)
-- `src/motor/*` + `src/fixtures/*`: sparse 3D voxel world, swept-collision A*, primitives, independent simulated body, no-progress/recovery controller.
-- `src/autonomous/*`: GoalManager/TaskScheduler, knowledge/spatial/episodic memory, session supervisor, bounded capture history.
-- Eleven skills registered; `look_at`, `dig_one`, `return_to_place` implemented against simulated capabilities and fail closed when the capability is absent.
-- `src/diagnostics/trace.ts` bounded trace.
-- Tests: unit, integration, soak (60 virtual minutes) and trace suites.
+### Motor / autonomy / verification (M/A/V)
+- Sparse 3D world with explicit unknown; action graph requires an actual support surface (air is not support); continuous simulated body with gravity, yaw-relative movement, jump and support checks; progress controller with correct cooldown reset.
+- GoalManager rejects cycles and unknown skills; TaskScheduler is subscribed to the EventHub and advances a real AgentLoop turn; knowledge rules load from a versioned JSON file; episodic memory can be recorded.
+- Eleven skills registered; `look_at`, `dig_one`, `return_to_place`, `collect_nearby`, `gather_blocks` run against simulated capabilities and fail closed when absent.
+- Soak: 60 virtual minutes, ≥50 command transitions, pause/resume cycles, 5 runtime/db rebuilds with receipt dedupe verified after restart.
 
-## Review pass (2026-10-18)
-
-A dedicated read-only review of the recent bridge/relay/observer/control/server/world/skills/web code produced ten findings; all were fixed with regression tests:
-
-1. Relay `stop()` deadlocked with active sessions — stop now closes sessions before `server.close` and flush ends the writable side so drain can fire.
-2. Supervisor late child `exit` after restart corrupted state — handlers now ignore events from a non-current child.
-3. Conflict/rejected command receipts were persisted as `completed` and replayed as `terminal` — receipt states `conflict`/`rejected` added and replay preserved.
-4. `WorldState` gap destroyed previously known cells — gapped deltas now preserve prior keys as `unknown`.
-5. Relay half-close dropped the upstream reply — sockets use `allowHalfOpen`; the upstream reply is delivered after client FIN.
-6. Supervisor owner-loss did not revoke control — `request()` refuses unless running and revokes on loss.
-7. Observer concurrency could exceed `maxConcurrency` after listener timeout — slots remain counted until the listener settles.
-8. SSE could leak `poll`/`heartbeat` intervals when the initial snapshot closed the stream — timers are cleared if the stream finished.
-9. `wait_for_condition` returned immediately with an injected clock — it now resolves only after the scheduled deadline and honours cancellation.
-10. Web SSE skipped `control.quit`/`control.message`/`runtime.shutdown-requested` — the subscriber listens to the full control/runtime/tool event kinds.
-
-Additionally, the corrected recovery test exposed a real gap: side-effect skills did not persist a durable effect. The router now writes `prepared → may-have-dispatched` inside the execution (after the execution row exists) and settles `confirmed/partial/ambiguous` by outcome, so a crash leaves a reconcilable pending effect.
-
-
+## Verified commands (local Linux, Node 20.19.5)
 
 ```text
 npm run typecheck            pass
 npm run build                pass
 npm run build:web            pass
-npm run test:offline         24 files / 106 tests pass
+npm run test:offline         24 files / 112 tests pass
 npm run test:v:offline       integration (incl. forked relay child) + soak + trace pass
 npm run demo:offline         6 scenarios pass
+npm run demo:autonomy        pass
 npm run doctor -- --profile simulated   pass
 npm run bridge:protocol -- --config configs/simulated.json   pass (fixture, loopback)
 npm run test:web             web typecheck + vite build pass
@@ -70,16 +53,28 @@ npm run test:web             web typecheck + vite build pass
 
 Loopback smoke: `serve` served the built UI (200 text/html), `/api/v1/status` returned running, `goal.set` returned terminal, and the JS asset loaded (200).
 
-## Honest limits / not implemented
+## Review passes performed
 
-- Minecraft codec remains the legacy 1.20.4/765 fixture. The 26.3 adapter is candidate metadata only; no live 26.3 packet decoding is claimed.
-- Raw relay verified on loopback sockets only; no real upstream connection.
-- A child-process Supervisor manages the relay child (owner epoch, 3-per-60s restart budget, owner-loss revoke); it does not manage or auto-restart a game process. Observer runs in a worker_threads host.
-- `collect_nearby` and `gather_blocks` intentionally fail closed (no capability).
-- No Playwright browser E2E; the web build and same-origin serving are verified but not driven by a browser.
-- Node 22 CI is configured (Linux verify + Windows helper static parse) but has not been observed passing on GitHub.
-- Real Windows SendInput/capture, paid model APIs and real Minecraft remain unverified.
+Two full read-only review passes covered every group without a finding cap:
+- F01–F06, B01–B06, U01–U04, M01–M05, A01–A05, V01–V04.
+- Each item is classified satisfied/partial/unmet with file:line evidence.
+
+Fixes applied from those reviews include: relay stop deadlock and half-close reply loss, supervisor late-exit/hello/boot-epoch/owner-revoke, observer sequence/reset/concurrency, relay declared-length limit, Windows identity/heartbeat, atomic command claim, pause admission, stop body release, real capabilities, SSE watermark and gap recovery, motor support/cooldown/body physics, task cycles/unknown skills, scheduler wiring, knowledge loader, deterministic demo DBs, real autonomous demo path, and the missing `demo:autonomy`/`test:web:e2e` scripts.
+
+## Honest limits (explicitly not implemented or not verified)
+
+- **26.3 codec is absent**: the installed `minecraft-data` has no 26.3 data; the codec remains the 1.20.4/765 fixture. The 26.3 profile is candidate metadata only. This is a fail-closed boundary, not live support.
+- **Domain adapters are partial**: only position/chat/registry are projected; health/inventory/entity/chunk/light/respawn are explicit `unknown`. No coverage query or `CapabilityProvider`.
+- **Observer lacks decompression/compression-ratio enforcement** and phase progression; it frames bytes but does not decompress or type-parse 26.3 packets.
+- **Relay STATUS independent probe** has no explicit session classification; it relies on per-connection upstreams.
+- **CompositeClientBridge does not implement the Runtime capability interface**, so `client-offline` cannot be assembled as a production bridge.
+- **Windows**: no real SendInput/capture; no SDL3 mapping or calibration; helper restart control-uncertain is not implemented.
+- **Motor is not wired into the Runtime**: M01–M05 is a verified standalone module, not the production control path.
+- **React UI**: no Canvas top-down map, no Playwright browser E2E, no list pagination/cursor; `test:web` is typecheck+build.
+- **V01 has 2 integrated scenarios**, not the 14 named S01–S14; S12 entityDelta/PositionPath is absent.
+- **Node 22 CI is configured but unobserved**; Windows CI only statically parses the helper.
+- **No real Minecraft server/world, paid API, SendInput or screenshot verification.**
 
 ## Testing discipline
 
-Every assertion is grounded in a contract or observable behavior. Fixture provenance is preserved (`fixture`/`simulated`), async tests use `await`/`rejects`, databases use isolated temp paths, and unknown/ambiguous/failure/cleanup paths are asserted. No assertion was weakened to force green; several tests were corrected where their premise (not the implementation) was wrong.
+Assertions are grounded in contracts or observable behavior. Fixture provenance stays `fixture`/`simulated`. Async tests use `await`/`rejects`. Databases use isolated temp paths. Unknown/ambiguous/failure/cleanup paths are asserted. Tests corrected during review had wrong premises (e.g. missing full baseline, incomplete helper identity, snapshot watermark semantics); no assertion was weakened to force green.
