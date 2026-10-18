@@ -87,14 +87,14 @@ export async function runAttach(url: string, io: CliIo = {}) {
   for await (const line of rl) { if (!line.trim()) continue; const words = parseWords(line); try { printJson(output, await command(words)); } catch (error) { printJson(output, { error: error instanceof Error ? error.message : String(error) }); } if (words[0] === 'quit') break; }
   rl.close();
 }
-async function listenServer(server: Server, host: string, port: number) {
-  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); });
-  const address = server.address(); if (!address || typeof address === 'string') throw new Error('server-address-unavailable'); return `http://${host}:${address.port}`;
+async function listenServer(server: import('fastify').FastifyInstance, host: string, port: number) {
+  await server.listen({ port, host });
+  const address = server.server.address(); if (!address || typeof address === 'string') throw new Error('server-address-unavailable'); return `http://${host}:${address.port}`;
 }
 export async function runServe(options: { db?: string; host?: string; port?: string; profile?: string }) {
   const db = options.db ?? process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent.sqlite'; const runtime = createRuntime({ profile: (options.profile ?? 'simulated') as 'simulated' | 'client-offline', db }); const server = createControlServer(runtime); const host = options.host ?? '127.0.0.1'; const url = await listenServer(server, host, Number(options.port ?? 0)); runtime.session.start();
   console.log(JSON.stringify({ listening: url, profile: options.profile ?? 'simulated', db })); let closing = false;
-  const close = async () => { if (closing) return; closing = true; await new Promise<void>(resolve => server.close(() => resolve())); runtime.close(); };
+  const close = async () => { if (closing) return; closing = true; await server.close(); runtime.close(); };
   process.once('SIGINT', close); process.once('SIGTERM', close); await new Promise<void>(resolve => { const timer = setInterval(() => { if (closing || runtime.control.status().stopping) { clearInterval(timer); void close().then(resolve); } }, 25); });
 }
 

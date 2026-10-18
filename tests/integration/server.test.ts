@@ -8,14 +8,11 @@ import { createControlServer } from '../../src/server/index.js';
 const openServers: Array<{ close: () => Promise<void> }> = [];
 
 async function listen(server: ReturnType<typeof createControlServer>) {
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve());
-  });
-  const address = server.address();
+  await server.listen({ port: 0, host: '127.0.0.1' });
+  const address = server.server.address();
   if (!address || typeof address === 'string') throw new Error('server-address-unavailable');
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  const close = () => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  const close = () => server.close();
   openServers.push({ close });
   return { baseUrl, close };
 }
@@ -175,6 +172,72 @@ describe('control server offline integration', () => {
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
+      runtime.close();
+    }
+  });
+});
+
+describe('U02 local pairing and CSRF', () => {
+  it('requires a paired HttpOnly session and matching CSRF for browser writes', async () => {
+    const runtime = createRuntime();
+    try {
+      const server = createControlServer(runtime, { pairing: true, pairingCode: 'abcd1234' });
+      const { baseUrl, close } = await listen(server);
+      try {
+        const unpaired = await fetch(`${baseUrl}/api/v1/commands`, {
+          method: 'POST', headers: { 'content-type': 'application/json', origin: baseUrl }, body: JSON.stringify({ requestId: 'p0', command: 'pause', payload: {} }),
+        });
+        expect(unpaired.status).toBe(401);
+
+        const badCode = await fetch(`${baseUrl}/api/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: 'wrong' }) });
+        expect(badCode.status).toBe(401);
+
+        const paired = await fetch(`${baseUrl}/api/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: 'abcd1234' }) });
+        expect(paired.status).toBe(200);
+        const cookie = paired.headers.get('set-cookie') ?? '';
+        expect(cookie.toLowerCase()).toContain('httponly');
+        expect(cookie.toLowerCase()).toContain('samesite=strict');
+        const csrf = ((await paired.json()) as { csrfToken: string }).csrfToken;
+        const sessionCookie = cookie.split(';')[0]!;
+
+        const noCsrf = await fetch(`${baseUrl}/api/v1/commands`, {
+          method: 'POST', headers: { 'content-type': 'application/json', origin: baseUrl, cookie: sessionCookie }, body: JSON.stringify({ requestId: 'p1', command: 'pause', payload: {} }),
+        });
+        expect(noCsrf.status).toBe(403);
+
+        const ok = await fetch(`${baseUrl}/api/v1/commands`, {
+          method: 'POST', headers: { 'content-type': 'application/json', origin: baseUrl, cookie: sessionCookie, 'x-csrf-token': csrf }, body: JSON.stringify({ requestId: 'p2', command: 'resume', payload: {} }),
+        });
+        expect(ok.status).toBe(200);
+
+        const reuse = await fetch(`${baseUrl}/api/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: 'abcd1234' }) });
+        expect(reuse.status).toBe(409);
+      } finally {
+        await close();
+        const index = openServers.findIndex(item => item.close === close);
+        if (index >= 0) openServers.splice(index, 1);
+      }
+    } finally {
+      runtime.close();
+    }
+  });
+
+  it('allows a CLI bearer write without browser origin', async () => {
+    const runtime = createRuntime();
+    try {
+      const server = createControlServer(runtime, { pairing: true, pairingCode: 'x', cliBearer: 'cli-secret' });
+      const { baseUrl, close } = await listen(server);
+      try {
+        const rejected = await fetch(`${baseUrl}/api/v1/commands`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: 'b0', command: 'pause', payload: {} }) });
+        expect(rejected.status).toBe(401);
+        const accepted = await fetch(`${baseUrl}/api/v1/commands`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer cli-secret' }, body: JSON.stringify({ requestId: 'b1', command: 'pause', payload: {} }) });
+        expect(accepted.status).toBe(200);
+      } finally {
+        await close();
+        const index = openServers.findIndex(item => item.close === close);
+        if (index >= 0) openServers.splice(index, 1);
+      }
+    } finally {
       runtime.close();
     }
   });

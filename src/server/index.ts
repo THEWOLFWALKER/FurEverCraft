@@ -1,227 +1,186 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { URL } from 'node:url';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { extname, join, normalize, resolve } from 'node:path';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import fastifyCookie from '@fastify/cookie';
+import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import type { RuntimeAssembly } from '../execution/factory.js';
 import type { ControlService } from '../control/service.js';
+import { CommandRequestSchema } from '../control/dto.js';
 import { redact } from '../diagnostics/redaction.js';
 
 export type ControlServerOptions = {
   host?: string;
-  port?: number;
   heartbeatMs?: number;
   pollMs?: number;
   maxSseEvents?: number;
   maxSseBytes?: number;
   maxBodyBytes?: number;
-  bearerToken?: string;
-  csrfToken?: string;
   allowedOrigin?: string;
-  /** Directory of the built same-origin control UI. Defaults to dist/web. */
   webRoot?: string;
+  /** Enables local pairing. When set, browser writes require a paired HttpOnly session. */
+  pairing?: boolean;
+  /** Fixture/test transport for pairing codes; production prints the code to the terminal. */
+  pairingCode?: string;
+  cliBearer?: string;
 };
 
+type PairingState = { codeHash: string; expiresAt: number; used: boolean; sessions: Map<string, { expiresAt: number; csrf: string }> };
+
+const hash = (value: string) => createHash('sha256').update(value).digest();
+const safeEqual = (a: string, b: string) => { const left = hash(a); const right = hash(b); return timingSafeEqual(left, right); };
+
+export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlService, options: ControlServerOptions = {}): FastifyInstance {
+  const runtime = 'control' in runtimeOrControl && 'store' in runtimeOrControl ? runtimeOrControl as RuntimeAssembly : undefined;
+  const control = runtime?.control ?? runtimeOrControl as ControlService;
+  const app = Fastify({ logger: false, bodyLimit: options.maxBodyBytes ?? 1024 * 1024, exposeHeadRoutes: false });
+  void app.register(fastifyCookie);
+  const host = options.host ?? '127.0.0.1';
+  const pairing: PairingState | undefined = options.pairing ? {
+    codeHash: hash(options.pairingCode ?? randomBytes(4).toString('hex')).toString('hex'),
+    expiresAt: Date.now() + 5 * 60_000,
+    used: false,
+    sessions: new Map(),
+  } : undefined;
+
+  const isLoopback = (request: FastifyRequest) => {
+    const source = request.ip;
+    return source === '127.0.0.1' || source === '::1' || source === '::ffff:127.0.0.1';
+  };
+  const originOk = (request: FastifyRequest, reply: FastifyReply) => {
+    const origin = request.headers.origin;
+    if (!origin) return true;
+    const expected = `http://${request.headers.host ?? 'localhost'}`;
+    if (origin !== expected && origin !== options.allowedOrigin) { void reply.code(403).send({ error: { code: 'origin-not-allowed' } }); return false; }
+    return true;
+  };
+  const sessionOf = (request: FastifyRequest) => {
+    const cookie = request.cookies[SESSION_COOKIE];
+    if (!pairing || !cookie) return undefined;
+    const entry = pairing.sessions.get(cookie);
+    return entry && entry.expiresAt > Date.now() ? entry : undefined;
+  };
+  const hasSession = (request: FastifyRequest) => Boolean(sessionOf(request));
+  const authorizeWrite = (request: FastifyRequest, reply: FastifyReply): boolean => {
+    if (!isLoopback(request)) { void reply.code(403).send({ error: { code: 'non-loopback-denied' } }); return false; }
+    if (!originOk(request, reply)) return false;
+    const auth = request.headers.authorization;
+    if (auth && options.cliBearer && safeEqual(auth.replace(/^Bearer /, ''), options.cliBearer)) return true;
+    if (!pairing) return true;
+    const origin = request.headers.origin;
+    if (!origin) { void reply.code(401).send({ error: { code: 'pairing-session-required' } }); return false; }
+    const session = sessionOf(request);
+    if (!session) { void reply.code(401).send({ error: { code: 'pairing-session-required' } }); return false; }
+    const csrf = request.headers['x-csrf-token'];
+    if (typeof csrf !== 'string' || !safeEqual(csrf, session.csrf)) { void reply.code(403).send({ error: { code: 'csrf-failed' } }); return false; }
+    return true;
+  };
+
+  app.get('/api/v1/status', async () => control.status());
+  app.get('/api/v1/capabilities', async () => control.capabilities());
+  app.get('/api/v1/goals', async () => control.goals());
+  app.get('/api/v1/tasks', async () => control.goals());
+  app.get('/api/v1/executions', async () => control.executions());
+  app.get('/api/v1/effects', async request => control.effects((request.query as { executionId?: string }).executionId));
+  app.get('/api/v1/places', async () => control.places());
+  app.get('/api/v1/memories', async () => ({ places: control.places(), episodes: runtime?.store.listEpisodes() ?? [] }));
+  app.get('/api/v1/provider', async () => control.provider());
+  app.get('/api/v1/config', async () => redact({ provider: control.provider(), profile: control.capabilities().profile }));
+  app.get('/api/v1/events', async (request, reply) => {
+    const query = request.query as { cursor?: string; limit?: string; filter?: string };
+    try { return control.events(query.cursor ?? '0', Number(query.limit ?? 100), query.filter); }
+    catch { return reply.code(400).send({ error: { code: 'invalid-event-cursor' } }); }
+  });
+
+  app.post('/api/v1/pair', async (request, reply) => {
+    if (!pairing) return reply.code(404).send({ error: { code: 'pairing-disabled' } });
+    if (!isLoopback(request)) return reply.code(403).send({ error: { code: 'non-loopback-denied' } });
+    const now = Date.now();
+    if (pairing.used) return reply.code(409).send({ error: { code: 'pairing-used' } });
+    const body = (request.body ?? {}) as { code?: string };
+    if (typeof body.code !== 'string' || createHash('sha256').update(body.code).digest('hex') !== pairing.codeHash) return reply.code(401).send({ error: { code: 'pairing-code-invalid' } });
+    if (now > pairing.expiresAt) return reply.code(410).send({ error: { code: 'pairing-expired' } });
+    pairing.used = true;
+    const session = randomBytes(32).toString('hex');
+    const csrf = randomBytes(24).toString('hex');
+    pairing.sessions.set(session, { expiresAt: now + 12 * 3600_000, csrf });
+    void reply.setCookie(SESSION_COOKIE, session, { httpOnly: true, sameSite: 'strict', path: '/', secure: false });
+    return { paired: true, csrfToken: csrf };
+  });
+
+  app.post('/api/v1/commands', async (request, reply) => {
+    if (!authorizeWrite(request, reply)) return reply;
+    const parsed = CommandRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      const requestId = typeof (request.body as { requestId?: unknown })?.requestId === 'string' ? (request.body as { requestId: string }).requestId : 'invalid';
+      return reply.code(400).send({ requestId, command: 'invalid', state: 'rejected', code: 'invalid-command' });
+    }
+    const result = await control.command(parsed.data);
+    if (result.state === 'conflict') return reply.code(409).send(result);
+    if (result.state === 'rejected') return reply.code(400).send(result);
+    return result;
+  });
+
+  app.get('/api/v1/events/stream', streamHandler);
+  app.get('/events', streamHandler);
+  async function streamHandler(request: FastifyRequest, reply: FastifyReply) {
+    const header = request.headers['last-event-id'];
+    const query = request.query as { cursor?: string };
+    const cursor = Array.isArray(header) ? header[0] : header ?? query.cursor ?? '0';
+    if (!cursor || !/^\d+$/.test(String(cursor))) return reply.code(400).send({ error: { code: 'invalid-event-cursor' } });
+    reply.hijack();
+    const raw = reply.raw;
+    raw.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+    let position = String(cursor); let closed = false; let sent = 0; let bytes = 0;
+    const maxEvents = options.maxSseEvents ?? 256; const maxBytes = options.maxSseBytes ?? 1024 * 1024;
+    const finish = () => { if (closed) return; closed = true; clearInterval(poll); clearInterval(heartbeat); raw.end(); };
+    const emit = (event: string, payload: unknown, id?: string) => {
+      if (closed) return false;
+      const data = JSON.stringify(redact(payload));
+      const frame = `${id === undefined ? '' : `id: ${id}\n`}event: ${event}\ndata: ${data}\n\n`;
+      const size = Buffer.byteLength(frame);
+      if (sent >= maxEvents || bytes + size > maxBytes) { finish(); return false; }
+      raw.write(frame); sent += 1; bytes += size; return true;
+    };
+    const initial = control.events(position, maxEvents);
+    const watermark = initial.events.length ? initial.next : position;
+    if (initial.gap) emit('gap', { gap: true, availableFrom: initial.availableFrom, cursor: initial.scannedCursor }, initial.scannedCursor);
+    emit('snapshot', { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor: watermark, gap: initial.gap }, watermark);
+    position = watermark;
+    const poll = setInterval(() => {
+      if (closed) return;
+      try {
+        const read = control.events(position, Math.min(256, maxEvents - sent));
+        if (read.gap) { emit('gap', { gap: true, availableFrom: read.availableFrom, cursor: read.scannedCursor }, read.scannedCursor); emit('snapshot', { ...control.status(), cursor: read.scannedCursor, gap: true }, read.scannedCursor); position = read.scannedCursor; return; }
+        for (const event of read.events) { if (!emit(event.kind, event.payload, event.seq)) return; position = event.seq; }
+      } catch { finish(); }
+    }, options.pollMs ?? 250);
+    const heartbeat = setInterval(() => { if (closed || raw.writableNeedDrain) return; raw.write(': heartbeat\n\n'); }, options.heartbeatMs ?? 15_000);
+    if (closed) { clearInterval(poll); clearInterval(heartbeat); }
+    request.raw.on('close', finish);
+  }
+
+  app.get('/', async (request, reply) => {
+    const root = options.webRoot ?? './dist/web';
+    const path = (request.url ?? '/').split('?')[0]!;
+    const safe = path.replace(/\.\./g, '');
+    const candidate = `${root}${safe === '/' ? '/index.html' : safe}`;
+    if (existsSync(candidate) && !candidate.endsWith('/')) return reply.type(contentType(candidate)).send(readFileSync(candidate));
+    const index = `${root}/index.html`;
+    if (existsSync(index)) return reply.type('text/html; charset=utf-8').send(readFileSync(index));
+    return reply.code(404).send({ error: { code: 'not-found' } });
+  });
+  app.setNotFoundHandler((request, reply) => {
+    if (request.method === 'GET' && !request.url.startsWith('/api/')) {
+      const root = options.webRoot ?? './dist/web';
+      const index = `${root}/index.html`;
+      if (existsSync(index)) return reply.type('text/html; charset=utf-8').send(readFileSync(index));
+    }
+    return reply.code(404).send({ error: { code: 'not-found' } });
+  });
+  return app;
+}
+
+const SESSION_COOKIE = 'furevercraft_session';
 const contentTypes: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
-function serveStatic(response: ServerResponse, webRoot: string, pathname: string): boolean {
-  if (!existsSync(webRoot)) return false;
-  const root = resolve(webRoot);
-  const relative = normalize(decodeURIComponent(pathname)).replace(/^(\.\.[/\\])+/, '');
-  let file = resolve(join(root, relative));
-  if (!file.startsWith(root)) return false;
-  if (!existsSync(file) || !statSync(file).isFile()) file = join(root, 'index.html');
-  if (!existsSync(file)) return false;
-  const body = readFileSync(file);
-  response.writeHead(200, { 'content-type': contentTypes[extname(file)] ?? 'application/octet-stream', 'content-length': String(body.length), 'cache-control': 'no-cache' });
-  response.end(body);
-  return true;
-}
-
-export type ControlServer = Server;
-type Control = Pick<ControlService, 'status' | 'capabilities' | 'goals' | 'executions' | 'effects' | 'places' | 'events' | 'provider' | 'command'>;
-type RuntimeOrControl = RuntimeAssembly | ControlService | Control;
-type ServerContext = { control: Control; runtime?: RuntimeAssembly };
-
-const jsonHeaders = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
-const text = (value: unknown) => JSON.stringify(redact(value));
-const asContext = (value: RuntimeOrControl): ServerContext => 'control' in value ? { control: value.control, runtime: value } : { control: value };
-const numberParam = (url: URL, key: string, fallback: number, min: number, max: number) => {
-  const raw = url.searchParams.get(key);
-  if (raw === null) return fallback;
-  const value = Number(raw);
-  return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
-};
-
-function send(response: ServerResponse, status: number, body: unknown) {
-  response.writeHead(status, jsonHeaders);
-  response.end(text(body));
-}
-
-function errorResponse(response: ServerResponse, status: number, code: string, message?: string) {
-  send(response, status, { error: { code, ...(message ? { message } : {}) } });
-}
-
-async function readJson(request: IncomingMessage, maxBytes: number): Promise<unknown> {
-  let size = 0;
-  const chunks: Buffer[] = [];
-  for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    size += buffer.length;
-    if (size > maxBytes) throw new Error('request-too-large');
-    chunks.push(buffer);
-  }
-  if (!size) return undefined;
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-  catch { throw new Error('invalid-json'); }
-}
-
-function routeQuery(control: Control, pathname: string, url: URL, runtime?: RuntimeAssembly) {
-  const limit = numberParam(url, 'limit', 100, 1, 10000);
-  const cursor = url.searchParams.get('cursor') ?? '0';
-  switch (pathname) {
-    case '/api/v1/status': return control.status();
-    case '/api/v1/capabilities': return control.capabilities();
-    case '/api/v1/goals':
-    case '/api/v1/tasks': return control.goals();
-    case '/api/v1/executions': return control.executions();
-    case '/api/v1/effects': return control.effects(url.searchParams.get('executionId') ?? undefined);
-    case '/api/v1/places': return control.places();
-    case '/api/v1/memories': return runtime?.store.listEpisodes() ?? [];
-    case '/api/v1/provider':
-    case '/api/v1/config': return control.provider();
-    case '/api/v1/events': return control.events(cursor, limit, url.searchParams.get('filter') ?? undefined);
-    default: {
-      const match = pathname.match(/^\/api\/v1\/commands\/([^/]+)$/);
-      if (match && runtime) {
-        const receipt = runtime.store.getActionReceipt(`control:${runtime.bridge.context.serverProfileId}`, decodeURIComponent(match[1]!));
-        return receipt ?? { requestId: decodeURIComponent(match[1]!), state: 'unknown', code: 'command-not-found' };
-      }
-      return undefined;
-    }
-  }
-}
-
-function writeSse(response: ServerResponse, event: string, payload: unknown, id?: string): boolean {
-  const data = text(payload);
-  if (id !== undefined) response.write(`id: ${id}\n`);
-  response.write(`event: ${event}\ndata: ${data}\n\n`);
-  return true;
-}
-
-function startEvents(control: Control, request: IncomingMessage, response: ServerResponse, options: Required<Pick<ControlServerOptions, 'heartbeatMs' | 'pollMs' | 'maxSseEvents' | 'maxSseBytes'>>) {
-  const url = new URL(request.url ?? '/events', 'http://localhost');
-  const headerCursor = request.headers['last-event-id'];
-  let cursor: string = (Array.isArray(headerCursor) ? (headerCursor[0] ?? '0') : (headerCursor ?? url.searchParams.get('cursor') ?? '0')) as string;
-  if (!/^\d+$/.test(cursor)) { errorResponse(response, 400, 'invalid-event-cursor'); return; }
-  response.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache, no-store',
-    connection: 'keep-alive',
-    'x-accel-buffering': 'no',
-  });
-
-  let sent = 0;
-  let bytes = 0;
-  let closed = false;
-  let poll: ReturnType<typeof setInterval> | undefined;
-  let heartbeat: ReturnType<typeof setInterval> | undefined;
-  const finish = () => { if (closed) return; closed = true; if (poll) clearInterval(poll); if (heartbeat) clearInterval(heartbeat); response.end(); };
-  const emit = (event: string, payload: unknown, id?: string) => {
-    if (closed) return false;
-    const encoded = text(payload);
-    const frameBytes = Buffer.byteLength(`${id === undefined ? '' : `id: ${id}\n`}event: ${event}\ndata: ${encoded}\n\n`);
-    if (sent >= options.maxSseEvents || bytes + frameBytes > options.maxSseBytes) { finish(); return false; }
-    writeSse(response, event, payload, id); sent += 1; bytes += frameBytes; return true;
-  };
-
-  // Read events first, then build the snapshot at the same watermark so a write between the
-  // two reads cannot be both included in the snapshot and replayed (or missed by both).
-  const initial = control.events(cursor, options.maxSseEvents);
-  const watermark = initial.events.length ? initial.next : cursor;
-  if (initial.gap) emit('gap', { gap: true, availableFrom: initial.availableFrom, cursor: initial.scannedCursor }, initial.scannedCursor);
-  const snapshot = { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor: watermark, gap: initial.gap };
-  emit('snapshot', snapshot, watermark);
-  // Events after the snapshot watermark are delivered by the poll below; replaying older ones
-  // would duplicate state already reflected in the snapshot.
-  cursor = watermark;
-
-  poll = setInterval(() => {
-    if (closed) return;
-    try {
-      const read = control.events(cursor, Math.min(256, options.maxSseEvents - sent));
-      if (read.gap) {
-        // A gap means the client cannot reconstruct the stream; resend a fresh snapshot at the
-        // new watermark and continue from there instead of silently closing.
-        emit('gap', { gap: true, availableFrom: read.availableFrom, cursor: read.scannedCursor }, read.scannedCursor);
-        const fresh = { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor: read.scannedCursor, gap: true };
-        if (!emit('snapshot', fresh, read.scannedCursor)) return;
-        cursor = read.scannedCursor; return;
-      }
-      for (const event of read.events) { if (!emit(event.kind, event.payload, event.seq)) return; cursor = event.seq; }
-    } catch { finish(); }
-  }, options.pollMs);
-  heartbeat = setInterval(() => {
-    if (closed || response.writableNeedDrain) return;
-    const frame = `: heartbeat\n\n`;
-    if (bytes + Buffer.byteLength(frame) > options.maxSseBytes) { finish(); return; }
-    bytes += Buffer.byteLength(frame);
-    response.write(frame);
-  }, options.heartbeatMs);
-  // The snapshot/replay may have already closed the stream; never keep timers for a finished stream.
-  if (closed) { if (poll) clearInterval(poll); if (heartbeat) clearInterval(heartbeat); poll = undefined; heartbeat = undefined; }
-  request.on('aborted', finish);
-  request.on('close', finish);
-  response.on('close', finish);
-}
-
-export function createControlServer(runtimeOrControl: RuntimeOrControl, options: ControlServerOptions = {}): ControlServer {
-  const context = asContext(runtimeOrControl);
-  const control = context.control;
-  const settings = {
-    heartbeatMs: options.heartbeatMs ?? 15_000,
-    pollMs: options.pollMs ?? 250,
-    maxSseEvents: options.maxSseEvents ?? 256,
-    maxSseBytes: options.maxSseBytes ?? 1024 * 1024,
-    maxBodyBytes: options.maxBodyBytes ?? 1024 * 1024,
-    host: options.host ?? '127.0.0.1',
-    bearerToken: options.bearerToken,
-    csrfToken: options.csrfToken,
-    allowedOrigin: options.allowedOrigin,
-    webRoot: options.webRoot ?? resolve(process.cwd(), 'dist', 'web'),
-  };
-  const server = createServer(async (request, response) => {
-    try {
-      const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
-      const host = (request.headers.host ?? '').split(':')[0]!.toLowerCase();
-      if (settings.host === '127.0.0.1' && host && host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') { errorResponse(response, 403, 'host-not-allowed'); return; }
-      const origin = request.headers.origin;
-      if (origin && settings.allowedOrigin && origin !== settings.allowedOrigin) { errorResponse(response, 403, 'origin-not-allowed'); return; }
-      if (origin && !settings.allowedOrigin && origin !== `http://${request.headers.host ?? 'localhost'}`) { errorResponse(response, 403, 'origin-not-allowed'); return; }
-      if (settings.bearerToken && request.headers.authorization !== `Bearer ${settings.bearerToken}`) { errorResponse(response, 401, 'unauthorized'); return; }
-      if (request.method === 'OPTIONS') { response.writeHead(204, { 'access-control-allow-origin': settings.allowedOrigin ?? 'null', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'authorization,content-type,last-event-id,x-csrf-token' }); response.end(); return; }
-      if (request.method === 'GET' && (url.pathname === '/api/v1/events/stream' || url.pathname === '/events')) { startEvents(control, request, response, settings); return; }
-      if (request.method === 'GET') {
-        const result = routeQuery(control, url.pathname, url, context.runtime);
-        if (result === undefined) {
-          if (!url.pathname.startsWith('/api/') && !url.pathname.startsWith('/events') && serveStatic(response, settings.webRoot, url.pathname)) return;
-          errorResponse(response, 404, 'not-found'); return;
-        }
-        send(response, 200, result); return;
-      }
-      if (request.method === 'POST' && url.pathname === '/api/v1/commands') {
-        if (origin && settings.csrfToken && request.headers['x-csrf-token'] !== settings.csrfToken) { errorResponse(response, 403, 'csrf-failed'); return; }
-        const input = await readJson(request, settings.maxBodyBytes);
-        const result = await control.command(input);
-        if (result.state === 'conflict') { send(response, 409, result); return; }
-        if (result.state === 'rejected') { send(response, 400, result); return; }
-        send(response, 200, result); return;
-      }
-      errorResponse(response, 404, 'not-found');
-    } catch (error) {
-      const code = error instanceof Error ? error.message : 'request-failed';
-      errorResponse(response, code === 'request-too-large' ? 413 : code === 'invalid-json' ? 400 : 400, code);
-    }
-  });
-  return server;
-}
+function contentType(path: string) { const ext = path.slice(path.lastIndexOf('.')).toLowerCase(); return contentTypes[ext] ?? 'application/octet-stream'; }
 
 export default createControlServer;
