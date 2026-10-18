@@ -44,6 +44,6 @@ Two uncapped read-only review passes covered every group. Confirmed defects were
 - 26.3 codec absent (installed data has no 26.3); legacy fixture is labelled and never presented as live support.
 - Relay/observer verified on loopback only; no real server.
 - Motor is not wired into the Runtime.
-- React UI lacks Canvas map and Playwright E2E; `test:web` is typecheck+build.
-- V01 has 2 integrated scenarios, not 14.
+- React UI has a Canvas top view and five areas; Playwright browser E2E is still not implemented and `test:web` is typecheck+build.
+- V01 covers S01–S14 in grouped offline tests (not one test per scenario); S04/S05/S08/S09/S12/S13 have limited depth due to missing 26.3 data.
 - Real Windows input/capture, paid model APIs, Node 22 execution and real Minecraft are unverified.
