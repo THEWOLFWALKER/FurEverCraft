@@ -95,11 +95,15 @@ export class Executor {
     const armWatchdog = () => {
       if (active.watchdog) this.clock.cancel(active.watchdog);
       active.watchdog = this.clock.schedule(this.clock.now() + this.watchdogTtl, () => {
-        if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; execution.status = 'failed'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); }
+        // Timeout must abort the in-flight work, not just flip a flag: the skill keeps
+        // performing writes otherwise and the released lease could be re-acquired.
+        if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; active.controller.abort(); execution.status = 'failed'; execution.outcome = 'unknown'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); }
       });
     };
     const report = (p: Omit<Progress, 'at'>) => {
       this.assertLive(execution.executionId);
+      // A progress report must not resurrect an execution the operator has asked to stop.
+      if (execution.status !== 'stopping') execution.status = 'running';
       const progress = { ...p, at: this.clock.now() };
       this.progressByExecution.set(execution.executionId, progress);
       this.store.saveExecution({ ...execution, checkpoint: progress });
@@ -149,7 +153,12 @@ export class Executor {
     return this.store.getExecution(executionId);
   }
   progress(executionId: string) { return this.progressByExecution.get(executionId); }
-  watchdog(executionId: string) { const active = this.active.get(executionId); if (active) { active.canceled = true; this.arbiter.release(active.lease.leaseId); this.active.delete(executionId); this.store.updateExecutionStatus?.(executionId, 'failed', 'watchdog-timeout'); } }
-  reconcile(executionId: string, outcome: 'confirmed' | 'partial' | 'ambiguous') { this.store.updateExecutionStatus?.(executionId, 'succeeded', outcome); return outcome; }
+  watchdog(executionId: string) { const active = this.active.get(executionId); if (active) { active.canceled = true; active.controller.abort(); this.arbiter.release(active.lease.leaseId); this.active.delete(executionId); this.store.updateExecutionStatus?.(executionId, 'failed', 'watchdog-timeout'); } }
+  /** Reconcile an effect result without ever promoting an unknown outcome to success. */
+  reconcile(executionId: string, outcome: 'confirmed' | 'partial' | 'ambiguous') {
+    const status = outcome === 'confirmed' ? 'succeeded' : outcome === 'partial' ? 'suspended' : 'failed';
+    this.store.updateExecutionStatus?.(executionId, status, undefined, outcome);
+    return outcome;
+  }
   private assertLive(executionId: string) { const active = this.active.get(executionId); if (!active || active.canceled) throw new Error('execution-canceled'); this.arbiter.validate(active.lease.leaseId, executionId); }
 }

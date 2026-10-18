@@ -3,7 +3,7 @@ import { nextId } from '../contracts/index.js';
 import type { ModelMessage, ModelProvider, ToolCall } from '../providers/scripted/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
-import { Executor, type InputArbiter } from '../execution/runtime.js';
+import { Executor, type InputArbiter, type Progress } from '../execution/runtime.js';
 import { skillImplementations } from '../skills/skills.js';
 import { findSkills } from '../skills/registry.js';
 import type { EventHub } from '../diagnostics/events.js';
@@ -92,10 +92,18 @@ export class ToolRouter {
           const execution = await this.executor.start('agent', skill, args, (lease, report, signal) => {
             if (effectId && !effectStarted) {
               effectStarted = true;
+              // Intent is durable before dispatch, but it stays `prepared` until the skill
+              // actually reports that it reached the dispatch stage. Failing admission must
+              // not look like a possibly-sent side effect.
               this.store!.addEffect({ effectId, executionId: lease.owner, context: this.bridge.context, status: 'prepared', intent: { kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : 'dig', x: typeof executeArgs === 'object' ? executeArgs?.x : undefined, y: typeof executeArgs === 'object' ? executeArgs?.y : undefined, text: executeArgs, block: skill === 'gather_blocks' ? String(args.block) : undefined } });
-              this.store!.updateEffect(effectId, 'may-have-dispatched');
             }
-            return (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs);
+            const guardedReport = (progress: Omit<Progress, 'at'>) => {
+              if (effectId && progress.stage === 'dispatch' && progress.completed > 0) {
+                try { this.store!.updateEffect(effectId, 'may-have-dispatched'); } catch { /* effect already settled */ }
+              }
+              report(progress);
+            };
+            return (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report: guardedReport, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs);
           });
           result = execution;
           if (sideEffect && effectId) {

@@ -31,7 +31,9 @@ export function sendChat(ctx: SkillContext, text: string): SkillResult {
     const receipt: { accepted: boolean; ambiguous?: boolean; commandId: string; seq: number; text?: string } = ctx.bridge.dispatchChat ? ctx.bridge.dispatchChat(text) : (() => { ctx.bridge.setUi('chat'); return { accepted: true, commandId: `chat_${Date.now()}`, seq: 0, text }; })();
     enteredChat = true;
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
-    return { ok: receipt.accepted === true && !receipt.ambiguous, outcome: receipt.accepted && !receipt.ambiguous ? 'confirmed' : 'ambiguous', value: receipt };
+    // Delivery acceptance is not world confirmation: only an explicit non-ambiguous receipt is confirmed.
+    if (receipt.accepted !== true || receipt.ambiguous) return { ok: false, outcome: 'ambiguous', reason: 'chat-delivery-unconfirmed', value: receipt };
+    return { ok: true, outcome: 'confirmed', value: receipt };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
   finally { if (enteredChat) { try { ctx.bridge.setUi('gameplay'); } catch { /* preserve ambiguous result */ } } }
 }
@@ -44,7 +46,11 @@ export function placeOne(ctx: SkillContext, target: { x: number; y: number }): S
   try {
     const receipt = ctx.bridge.place(target.x, target.y);
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
-    return { ok: receipt.accepted === true && !receipt.ambiguous, outcome: receipt.accepted && !receipt.ambiguous ? 'confirmed' : 'ambiguous', value: receipt };
+    // The bridge receipt only proves acceptance/injection; the world effect is verified by the
+    // target cell changing, otherwise the outcome stays ambiguous.
+    if (receipt.accepted !== true || receipt.ambiguous) return { ok: false, outcome: 'ambiguous', reason: 'place-delivery-unconfirmed', value: receipt };
+    const placed = ctx.bridge.cell(target.x, target.y) === 'blocked';
+    return placed ? { ok: true, outcome: 'confirmed', value: receipt } : { ok: false, outcome: 'ambiguous', reason: 'target-not-observed-blocked', value: receipt };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
 }
 

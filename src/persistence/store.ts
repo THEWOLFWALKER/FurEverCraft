@@ -28,6 +28,7 @@ const effectStatuses = ['prepared', 'may-have-dispatched', 'verifying', 'confirm
 const receiptStatuses = ['pending', 'completed', 'unknown', 'sent', 'ambiguous', 'conflict', 'rejected'] as const;
 const receiptTerminal = new Set(['completed', 'unknown', 'sent', 'ambiguous', 'conflict', 'rejected']);
 const effectRank: Record<string, number> = { prepared: 0, 'may-have-dispatched': 1, verifying: 2, ambiguous: 3, partial: 4, confirmed: 5 };
+const executionTerminal = new Set(['succeeded', 'failed', 'canceled']);
 
 export class SQLiteStore {
   readonly db: Database.Database;
@@ -99,6 +100,8 @@ export class SQLiteStore {
     const existing = this.db.prepare('SELECT * FROM executions WHERE proposal_id=?').get(e.proposalId) as any;
     if (existing) {
       if (existing.proposal_hash !== e.proposalHash) throw new Error('proposal-id-conflict');
+      // A late writer must not resurrect or overwrite a terminal execution.
+      if (executionTerminal.has(existing.status) && existing.status !== e.status) return this.getExecution(existing.execution_id) ?? this.getExecution(existing.proposal_id);
       this.db.prepare(`UPDATE executions SET status=?, reason=COALESCE(?,reason), outcome=COALESCE(?,outcome),
         checkpoint_json=COALESCE(?,checkpoint_json) WHERE proposal_id=?`)
         .run(e.status, e.reason ?? null, e.outcome ?? null, e.checkpoint ? json(e.checkpoint) : null, e.proposalId);
@@ -134,8 +137,11 @@ export class SQLiteStore {
   }
 
   updateExecutionStatus(id: string, status: string, reason?: string, outcome?: string) {
+    const existing = this.getExecution(id);
+    if (existing && executionTerminal.has(existing.status) && existing.status !== status) return existing;
     this.db.prepare(`UPDATE executions SET status=?, reason=COALESCE(?,reason), outcome=COALESCE(?,outcome)
       WHERE execution_id=? OR proposal_id=?`).run(status, reason ?? null, outcome ?? null, id, id);
+    return this.getExecution(id);
   }
 
   addEffect(e: any) {
