@@ -142,3 +142,25 @@ describe('FEC-182/FEC-183 lease fencing', () => {
     expect(() => arbiter.validate(lease.leaseId, 'a')).toThrow('lease-invalid');
   });
 });
+
+describe('audit regressions', () => {
+  it('navigation fails when a walk is silently dropped or the target is not reached', async () => {
+    const bridge = new FakeClientBridge();
+    bridge.configureFault('walk', { fault: 'drop' });
+    const result = navigateTo({ bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} }, { x: 1, y: 0 });
+    expect(result.ok).toBe(false);
+    expect(result.outcome).toBe('failed');
+  });
+  it('dig/gather never treat an unknown cell as cleared', () => {
+    const bridge = new FakeClientBridge();
+    bridge.setUnknown(1, 0);
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} };
+    expect(digOne(ctx, { x: 1, y: 0 }).reason).toBe('target-not-observed-blocked');
+    expect(gatherBlocks(ctx, 'stone').outcome).toBe('failed');
+  });
+  it('send_chat fails closed when the bridge has no real dispatch path', () => {
+    const bridge = new FakeClientBridge(); (bridge as unknown as { dispatchChat?: unknown }).dispatchChat = undefined;
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} };
+    expect(sendChat(ctx, 'hello')).toMatchObject({ ok: false, outcome: 'failed', reason: 'chat-dispatch-unavailable' });
+  });
+});

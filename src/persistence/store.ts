@@ -83,12 +83,16 @@ export class SQLiteStore {
     const timestamp = now();
     const current = this.getGoal(goal.goalId);
     if (!current && goal.revision !== 0 && goal.revision !== 1) throw new Error('goal-revision-conflict:0');
-    if (current && goal.revision !== current.revision && goal.revision !== current.revision + 1) throw new Error(`goal-revision-conflict:${current.revision}`);
+    // Only the next revision may be written; a repeat of the current revision is a conflict.
+    if (current && goal.revision !== current.revision + 1) throw new Error(`goal-revision-conflict:${current.revision}`);
     this.db.prepare(`INSERT INTO goals(goal_id,revision,status,body_context,spec_json,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?) ON CONFLICT(goal_id) DO UPDATE SET revision=excluded.revision,
       status=excluded.status, body_context=excluded.body_context, spec_json=excluded.spec_json, updated_at=excluded.updated_at
-      WHERE goals.revision=excluded.revision-1 OR goals.revision=excluded.revision`)
+      WHERE goals.revision=excluded.revision-1`)
       .run(goal.goalId, goal.revision, goal.status, json(goal.context ?? 'simulated'), json({ text: goal.text }), timestamp, timestamp);
+    // A write that loses the revision race must fail, not silently no-op.
+    const stored = this.getGoal(goal.goalId);
+    if (!stored || stored.revision !== goal.revision) throw new Error(`goal-revision-conflict:${stored?.revision ?? 0}`);
   }
 
   getGoal(id: string) {
@@ -288,7 +292,8 @@ export class SQLiteStore {
   savePlace(place: { placeId: string; context: unknown; status: string; lastVerifiedAt?: string; payload: unknown }) {
     this.db.prepare(`INSERT INTO places(place_id,context,status,last_verified_at,payload_json) VALUES (?,?,?,?,?)
       ON CONFLICT(place_id) DO UPDATE SET context=excluded.context,status=excluded.status,
-      last_verified_at=excluded.last_verified_at,payload_json=excluded.payload_json`)
+      last_verified_at=excluded.last_verified_at,payload_json=excluded.payload_json
+      WHERE places.context=excluded.context`)
       .run(place.placeId, json(place.context), place.status, place.lastVerifiedAt ?? null, json(place.payload));
   }
 

@@ -67,3 +67,13 @@ describe('SQLiteStore W04 persistence', () => {
     store.close();
   });
 });
+
+describe('audit regressions', () => {
+  it('rejects a same-revision goal overwrite', () => {
+    const store = new SQLiteStore(':memory:');
+    store.saveGoal({ goalId: 'g', revision: 1, status: 'active', text: 'one' });
+    expect(() => store.saveGoal({ goalId: 'g', revision: 1, status: 'active', text: 'overwrite' })).toThrow('goal-revision-conflict');
+    expect(store.getGoal('g')?.spec.text).toBe('one');
+    store.close();
+  });
+});

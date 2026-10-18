@@ -113,8 +113,9 @@ export function digOne(ctx: SkillContext, target: { x: number; y: number }): Ski
     const result = ctx.bridge.dig(target.x, target.y);
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
     if (!result.accepted) return { ok: false, outcome: 'ambiguous', value: result };
-    const cleared = ctx.bridge.cell(target.x, target.y) !== 'blocked';
-    return cleared ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'ambiguous', value: result, reason: 'target-still-blocked' };
+    // Only an observed free cell proves the dig; unknown is not cleared.
+    const cleared = ctx.bridge.cell(target.x, target.y) === 'free';
+    return cleared ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'ambiguous', value: result, reason: 'target-not-observed-free' };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
 }
 export function collectNearby(ctx: SkillContext): SkillResult {
@@ -137,8 +138,9 @@ export function gatherBlocks(ctx: SkillContext, block: string): SkillResult {
   try {
     const result = ctx.bridge.digBlock(target.x, target.y, block);
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
-    const cleared = ctx.bridge.cell(target.x, target.y) !== 'blocked';
-    return cleared ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'ambiguous', value: result, reason: 'target-still-blocked' };
+    // Only an observed free cell proves the dig; unknown is not cleared.
+    const cleared = ctx.bridge.cell(target.x, target.y) === 'free';
+    return cleared ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'ambiguous', value: result, reason: 'target-not-observed-free' };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
 }
 export function returnToPlace(ctx: SkillContext, placeId: string, budget = 3): SkillResult {
