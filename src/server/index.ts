@@ -158,22 +158,24 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     request.raw.on('close', finish);
   }
 
-  app.get('/', async (request, reply) => {
+  // Serve real files under /assets (and other static extensions); SPA fallback only for
+  // extensionless paths so a missing script is a 404, not an HTML body served as JS.
+  const serveStatic = (request: FastifyRequest, reply: FastifyReply) => {
     const root = options.webRoot ?? './dist/web';
     const path = (request.url ?? '/').split('?')[0]!;
     const safe = path.replace(/\.\./g, '');
     const candidate = `${root}${safe === '/' ? '/index.html' : safe}`;
     if (existsSync(candidate) && !candidate.endsWith('/')) return reply.type(contentType(candidate)).send(readFileSync(candidate));
+    const extension = /\.[a-z0-9]+$/i.test(path);
+    if (extension && path !== '/') return reply.code(404).send({ error: { code: 'not-found' } });
     const index = `${root}/index.html`;
     if (existsSync(index)) return reply.type('text/html; charset=utf-8').send(readFileSync(index));
     return reply.code(404).send({ error: { code: 'not-found' } });
-  });
+  };
+  app.get('/assets/*', serveStatic);
+  app.get('/', serveStatic);
   app.setNotFoundHandler((request, reply) => {
-    if (request.method === 'GET' && !request.url.startsWith('/api/')) {
-      const root = options.webRoot ?? './dist/web';
-      const index = `${root}/index.html`;
-      if (existsSync(index)) return reply.type('text/html; charset=utf-8').send(readFileSync(index));
-    }
+    if (request.method === 'GET' && !request.url.startsWith('/api/') && !/\.[a-z0-9]+$/i.test(request.url.split('?')[0]!)) return serveStatic(request, reply);
     return reply.code(404).send({ error: { code: 'not-found' } });
   });
   return app;

@@ -165,6 +165,8 @@ describe('control server offline integration', () => {
         expect(await root.text()).toContain('FurEverCraft Control');
         const unknownApi = await fetch(`${baseUrl}/api/v1/unknown`);
         expect(unknownApi.status).toBe(404);
+        const missingAsset = await fetch(`${baseUrl}/assets/missing.js`);
+        expect(missingAsset.status).toBe(404);
       } finally {
         await close();
         const index = openServers.findIndex(item => item.close === close);
