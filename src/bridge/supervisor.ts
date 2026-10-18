@@ -31,6 +31,7 @@ export class ProcessSupervisor {
   readonly ownerEpoch = `owner_${randomUUID()}`;
   private child?: ChildProcessLike;
   private childEpoch?: string;
+  private childBootEpoch?: string;
   private stateValue: SupervisorState = 'idle';
   private restarts: number[] = [];
   private lastHeartbeat: number;
@@ -62,6 +63,7 @@ export class ProcessSupervisor {
     if (this.stateValue === 'stopped' || this.stateValue === 'stopping') throw new Error('supervisor-stopped');
     this.stateValue = 'starting';
     this.childEpoch = undefined;
+    this.childBootEpoch = undefined;
     const child = this.options.spawn();
     this.child = child;
     child.on('message', message => {
@@ -69,14 +71,16 @@ export class ProcessSupervisor {
       if (isHello(message)) {
         // Adopt the first hello as the child's session identity; an in-flight identity
         // change means ownership was taken over and must not be adopted silently.
-        if (!this.childEpoch) this.childEpoch = message.sessionEpoch;
-        else if (message.sessionEpoch !== this.childEpoch) { this.stateValue = 'failed'; child.kill(); return; }
+        if (!this.childEpoch) { this.childEpoch = message.sessionEpoch; this.childBootEpoch = message.bootEpoch; }
+        else if (message.sessionEpoch !== this.childEpoch || (message.bootEpoch && this.childBootEpoch && message.bootEpoch !== this.childBootEpoch)) { this.stateValue = 'failed'; child.kill(); return; }
+        else if (message.bootEpoch && this.childBootEpoch === undefined) this.childBootEpoch = message.bootEpoch;
         for (const waiter of this.helloWaiters) waiter(this.childEpoch!);
         this.helloWaiters.clear();
       }
       if (isResponse(message)) {
         const waiter = this.pending.get(message.requestId);
-        if (waiter && (!message.sessionEpoch || !this.childEpoch || message.sessionEpoch === this.childEpoch)) {
+        // A response without an epoch, or for another session/boot, must not settle a request.
+        if (waiter && message.sessionEpoch && message.sessionEpoch === this.childEpoch) {
           this.pending.delete(message.requestId); clearTimeout(waiter.timer);
           message.ok ? waiter.resolve(message.result) : waiter.reject(new Error(message.error?.code ?? 'ipc-request-failed'));
         }
@@ -102,14 +106,16 @@ export class ProcessSupervisor {
   }
 
   /** Send a control request to the child and await its correlated response. */
-  request<T = unknown>(command: 'status' | 'shutdown' | 'capabilities' | 'observe' | 'start-observer' | 'stop-observer', payload: unknown = {}): Promise<T> {
+  async request<T = unknown>(command: 'status' | 'shutdown' | 'capabilities' | 'observe' | 'start-observer' | 'stop-observer', payload: unknown = {}): Promise<T> {
     const child = this.child;
     if (!child) return Promise.reject(new Error('supervisor-no-child'));
     // Owner loss revokes control: a paused/failed supervisor must not keep driving the child.
     if (this.stateValue !== 'running') return Promise.reject(new Error(`supervisor-not-running:${this.stateValue}`));
+    // A request before the child hello would carry the owner epoch and be rejected as stale.
+    const epoch = await this.waitForHello().catch(() => { throw new Error('supervisor-hello-unavailable'); });
+    if (this.child !== child) return Promise.reject(new Error('supervisor-child-replaced'));
     const requestId = `sup_${randomUUID()}`;
-    const sessionEpoch = this.childEpoch ?? this.ownerEpoch;
-    const message = { type: 'request', protocolVersion: 1, requestId, sessionEpoch, command, payload, timeoutMs: this.ipcTimeoutMs } satisfies IpcMessage;
+    const message = { type: 'request', protocolVersion: 1, requestId, sessionEpoch: epoch, command, payload, timeoutMs: this.ipcTimeoutMs } satisfies IpcMessage;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error('ipc-timeout')); }, this.ipcTimeoutMs);
       this.pending.set(requestId, { timer, resolve: value => resolve(value as T), reject });
@@ -155,16 +161,19 @@ export class ProcessSupervisor {
 
   private async stopChild(reason: string): Promise<void> {
     const child = this.child;
+    const epoch = this.childEpoch;
     this.child = undefined;
     this.childEpoch = undefined;
+    this.childBootEpoch = undefined;
     for (const [id, waiter] of this.pending) { clearTimeout(waiter.timer); waiter.reject(new Error('ipc-disconnected')); this.pending.delete(id); }
     if (!child) return;
-    try { child.send({ type: 'request', protocolVersion: 1, requestId: `stop-${reason}`, sessionEpoch: this.ownerEpoch, command: 'shutdown', payload: {}, timeoutMs: 1_000 } satisfies IpcMessage); } catch { /* best effort */ }
+    // The relay only accepts its own session epoch; fall back to kill when no hello was seen.
+    if (epoch) { try { child.send({ type: 'request', protocolVersion: 1, requestId: `stop-${reason}`, sessionEpoch: epoch, command: 'shutdown', payload: {}, timeoutMs: 1_000 } satisfies IpcMessage); } catch { /* best effort */ } }
     try { child.kill(); } catch { /* best effort */ }
   }
 }
 
-function isHello(value: unknown): value is { type: 'hello'; sessionEpoch: string } {
+function isHello(value: unknown): value is { type: 'hello'; sessionEpoch: string; bootEpoch?: string } {
   return Boolean(value) && typeof value === 'object' && (value as { type?: unknown }).type === 'hello' && typeof (value as { sessionEpoch?: unknown }).sessionEpoch === 'string';
 }
 

@@ -72,7 +72,7 @@ export class WindowsHelperDriver {
   private readonly now: () => number;
   private readonly heartbeatMs: number;
   private readonly completedCommands = new Set<string>();
-  constructor(private readonly transport: HelperTransport, private readonly enabled = false, now: () => number = () => Date.now(), heartbeatMs = 2_000) { this.now = now; this.heartbeatMs = heartbeatMs; }
+  constructor(private readonly transport: HelperTransport, private readonly enabled = false, now: () => number = () => Date.now(), heartbeatMs = 250) { this.now = now; this.heartbeatMs = heartbeatMs; }
   private commandIdResult(commandId: string) { return this.completedCommands.has(commandId) ? { duplicate: true } : undefined; }
   private markCommand(commandId: string) { this.completedCommands.add(commandId); }
   private async command(command: HelperCommand, fields: Record<string, unknown> = {}) {
@@ -88,19 +88,30 @@ export class WindowsHelperDriver {
   private startWatchdog() { this.stopWatchdog(); this.heartbeatTimer = setInterval(() => { if (this.now() - this.lastReleaseAt > this.heartbeatMs * 2) { this.lastReleaseAt = this.now(); void this.releaseOwnedInputs().catch(() => undefined); } }, this.heartbeatMs); }
   private stopWatchdog() { if (this.heartbeatTimer) clearInterval(this.heartbeatTimer); this.heartbeatTimer = undefined; }
   probe() { return this.command('probe'); }
-  async bindWindow(pid: number, hwnd: string) { if (!Number.isInteger(pid) || pid <= 0 || !hwnd) throw new Error('window-identity-required'); const result = await this.command('bindWindow', { pid, hwnd }); this.bound = true; this.boundIdentity = { pid, hwnd }; this.state = { exists: true, focused: true, visible: true, pid, hwnd }; this.lastReleaseAt = this.now(); this.startWatchdog(); return result; }
+  async bindWindow(pid: number, hwnd: string) {
+    if (!Number.isInteger(pid) || pid <= 0 || !hwnd) throw new Error('window-identity-required');
+    const result = await this.command('bindWindow', { pid, hwnd }) as { bound?: unknown; pid?: unknown; hwnd?: unknown } | undefined;
+    // The helper must confirm the same identity it was asked to bind.
+    if (!result || result.bound !== true) throw new Error('window-bind-unconfirmed');
+    if (result.pid !== undefined && Number(result.pid) !== pid) throw new Error('window-pid-mismatch');
+    if (result.hwnd !== undefined && String(result.hwnd).toLowerCase() !== String(hwnd).toLowerCase()) throw new Error('window-hwnd-mismatch');
+    this.bound = true; this.boundIdentity = { pid, hwnd }; this.state = { exists: true, focused: true, visible: true, pid, hwnd }; this.lastReleaseAt = this.now(); this.startWatchdog(); return result;
+  }
   async getWindowState() {
     if (!this.bound) throw new Error('window-not-bound');
     const raw = await this.command('getWindowState') as Partial<WindowState>;
+    // Missing identity fields are unknown, never silently filled from the local binding.
     const state: WindowState = {
       exists: raw.exists === true,
       focused: raw.focused === true,
       visible: raw.visible === true,
-      ...(raw.pid === undefined ? { pid: this.boundIdentity?.pid } : { pid: raw.pid }),
-      ...(raw.hwnd === undefined ? { hwnd: this.boundIdentity?.hwnd } : { hwnd: raw.hwnd }),
+      ...(raw.pid === undefined ? {} : { pid: raw.pid }),
+      ...(raw.hwnd === undefined ? {} : { hwnd: raw.hwnd }),
     };
     this.state = state;
-    if (!state.exists || !state.focused || !state.visible || state.pid !== this.boundIdentity?.pid || state.hwnd !== this.boundIdentity?.hwnd) await this.releaseOwnedInputs();
+    const identityVerified = raw.pid !== undefined && raw.hwnd !== undefined && String(raw.pid) === String(this.boundIdentity?.pid) && String(raw.hwnd).toLowerCase() === String(this.boundIdentity?.hwnd).toLowerCase();
+    if (!state.exists || !state.focused || !state.visible || !identityVerified) await this.releaseOwnedInputs();
+    if (!identityVerified) throw new Error('window-identity-unverified');
     return state;
   }
   moveRelative(dx: number, dy: number, commandId: string, leaseUntil: number, generation = 0) {

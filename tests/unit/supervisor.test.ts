@@ -61,6 +61,8 @@ describe('B06 process supervisor', () => {
     await supervisor.start();
     child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'child-1', bootEpoch: 'b', capabilities: [] });
     const pending = supervisor.request('status');
+    // request() awaits the hello handshake before sending, so let the microtask settle.
+    await new Promise(r => setImmediate(r));
     const request = child.sent.at(-1) as { requestId: string };
     child.emit('message', { type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch: 'old', ok: true, result: { stale: true } });
     await expect(Promise.race([pending.then(() => 'settled'), new Promise(r => setTimeout(() => r('pending'), 10))])).resolves.toBe('pending');

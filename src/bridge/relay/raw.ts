@@ -49,10 +49,10 @@ class Session implements RelaySession {
     const onDrain=(source:Socket,dir:RelayDirection)=>()=>{ this.stats.queuedBytes[dir]=0; if(stalled[dir]){clearTimeout(stalled[dir]);stalled[dir]=undefined;} if(!this.closed&&source.isPaused())source.resume(); };
     const pair:Array<[Socket,Socket,RelayDirection]> = [[this.client,this.server,clientDir],[this.server,this.client,serverDir]];
     for(const [source,dest,dir] of pair){ const other=dir===clientDir?serverDir:clientDir;
-      source.on('data',(chunk:Buffer)=>{ if(this.closed)return; if(source===this.client&&!handshakeDone){ first=Buffer.concat([first,chunk]); if(first.length>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); const parsed=readVarInt(first); if(!parsed||first.length<parsed.size+parsed.value)return; const frame=first.subarray(0,parsed.size+parsed.value); first=first.subarray(frame.length); try { const out=rewriteHandshake(frame,this.config.targetHost,this.config.targetPort,this.config.allowedNextStates); handshakeDone=true; if(handshakeTimer)clearTimeout(handshakeTimer); handshakeTimer=undefined; this.state='forwarding'; this.stats.state='forwarding'; forward(dest,source,out,dir); if(first.length){ forward(dest,source,first,dir); first=Buffer.alloc(0); } } catch { void this.close('handshake-rewrite-failed'); } return; }
+      source.on('data',(chunk:Buffer)=>{ if(this.closed)return; if(source===this.client&&!handshakeDone){ first=Buffer.concat([first,chunk]); const parsed=readVarInt(first); if(parsed && parsed.value>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(first.length>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(!parsed||first.length<parsed.size+parsed.value)return; const frame=first.subarray(0,parsed.size+parsed.value); first=first.subarray(frame.length); try { const out=rewriteHandshake(frame,this.config.targetHost,this.config.targetPort,this.config.allowedNextStates); handshakeDone=true; if(handshakeTimer)clearTimeout(handshakeTimer); handshakeTimer=undefined; this.state='forwarding'; this.stats.state='forwarding'; forward(dest,source,out,dir); if(first.length){ forward(dest,source,first,dir); first=Buffer.alloc(0); } } catch { void this.close('handshake-rewrite-failed'); } return; }
         forward(dest,source,chunk,dir); });
       dest.on('drain',onDrain(source,dir));
-      source.on('end',()=>{ if(this.closed)return; if(!settle(source))return; if(this.state==='forwarding'){this.state='half-closed';this.stats.state='half-closed';} dest.end(); if(accounted.size>=2) void this.close('closed'); });
+      source.on('end',()=>{ if(this.closed)return; if(!settle(source))return; if(this.state!=='closing'){this.state='half-closed';this.stats.state='half-closed';} dest.end(); if(accounted.size>=2) void this.close('closed'); });
       source.on('close',()=>{ if(this.closed)return; if(!settle(source))return; if(accounted.size>=2) void this.close('closed'); });
       source.on('error',()=>void this.close(`${dir}-source-error`)); dest.on('error',()=>void this.close(`${dir}-destination-error`));
     }
@@ -64,7 +64,7 @@ class Session implements RelaySession {
     const clients=[this.client,this.server];
     await this.flush(clients);
     for(const s of clients) s.destroy();
-    this.state=reason==='closed'?'closed':'failed'; this.stats.state=this.state; this.stats.closeReason=reason; this.onClosed();
+    this.state=reason==='closed'||reason==='relay-stop'||reason==='client-closed'?'closed':'failed'; this.stats.state=this.state; this.stats.closeReason=reason; this.onClosed();
   }
   private flush(clients:Socket[]):Promise<void>{
     return new Promise<void>(resolve=>{

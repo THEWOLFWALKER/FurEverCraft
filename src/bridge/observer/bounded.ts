@@ -48,7 +48,12 @@ export class BoundedObserver {
       const offsetEnd=(this.consumed[direction]+BigInt(total)).toString();
       this.consumed[direction]=BigInt(offsetEnd);
       const seq=(BigInt(state.frameSequence)+1n).toString();
-      if(this.pending.length>=this.limits.maxQueuedFrames||this.queuedBytes+frame.length>this.limits.maxQueuedBytes){this.gap('domain','queue-overflow',direction,state.frameSequence);continue;}
+      if(this.pending.length>=this.limits.maxQueuedFrames||this.queuedBytes+frame.length>this.limits.maxQueuedBytes){
+        // Drop the frame but advance the sequence so the gap reports a real lost range.
+        const fromFrame=state.frameSequence; state.frameSequence=seq;
+        this.gap('domain','queue-overflow',direction,fromFrame);
+        continue;
+      }
       state.frameSequence=seq;
       this.pending.push({direction,frame:Buffer.from(frame),frameSequence:seq,phase:state.phase,offsetStart,offsetEnd});
       this.queuedBytes+=frame.length;
@@ -58,7 +63,17 @@ export class BoundedObserver {
   subscribe(listener:ObserverListener){this.listeners.add(listener);return()=>this.listeners.delete(listener);}
   state(){return {upstream:{...this.states['server-to-client']},downstream:{...this.states['client-to-server']}};}
   markUnknown(reason='framing-loss',direction?:ObserverDirection){this.healthValue='unknown';if(direction)this.states[direction].phase='UNKNOWN';this.gap('global',reason,direction);}
-  reset(direction:ObserverDirection){this.states[direction].phase='HANDSHAKE';this.states[direction].compression='disabled';if(this.healthValue==='unknown'||this.healthValue==='degraded')this.healthValue='healthy';}
+  reset(direction:ObserverDirection){
+    // A reset starts a fresh frame sequence; any partial frame from the previous epoch must not
+    // be glued onto the next one.
+    this.buffers[direction]=Buffer.alloc(0);
+    this.consumed[direction]=0n;
+    this.states[direction].phase='HANDSHAKE';
+    this.states[direction].compression='disabled';
+    this.states[direction].frameSequence='0';
+    const unknown=Object.values(this.states).some(state=>state.phase==='UNKNOWN');
+    if(!unknown&&(this.healthValue==='unknown'||this.healthValue==='degraded'))this.healthValue='healthy';
+  }
   private async drain(){
     if(this.draining||this.stopped)return;
     this.draining=true;
@@ -75,12 +90,16 @@ export class BoundedObserver {
   private async dispatch(item:PendingFrame){
     const event:ObserverEvent={kind:'observation',source:'client',sessionEpoch:this.sessionEpoch,direction:item.direction,frameSequence:item.frameSequence,phase:item.phase,payload:{bytes:item.frame.length,offsetStart:item.offsetStart,offsetEnd:item.offsetEnd}};
     this.inflight+=1;
+    let released=false;
+    const release=()=>{ if(released)return; released=true; this.inflight=Math.max(0,this.inflight-1); };
     let timer:ReturnType<typeof setTimeout>|undefined;
     const timeout=new Promise<void>(resolve=>{ timer=setTimeout(()=>{ this.healthValue=this.healthValue==='healthy'?'degraded':this.healthValue; resolve(); },this.limits.taskTimeoutMs); });
     const work=Promise.all([...this.listeners].map(listener=>Promise.resolve().then(()=>listener(event)).catch(()=>undefined))).then(()=>undefined);
     await Promise.race([work,timeout]);
-    // On timeout the listener may still be running; keep the slot counted until it settles.
-    void work.finally(()=>{ this.inflight=Math.max(0,this.inflight-1); });
+    // On timeout release the slot immediately so a hung listener cannot exceed maxConcurrency.
+    // The listener may keep running; its eventual settlement must not double-release.
+    release();
+    work.finally(()=>release());
     if(timer)clearTimeout(timer);
   }
   private gap(scope:'global'|'domain',reason:string,direction?:ObserverDirection,fromFrame?:string){if(this.healthValue==='healthy')this.healthValue='degraded';this.emit({kind:'observer_gap',source:'client',sessionEpoch:this.sessionEpoch,gap:{scope,reason,direction,fromFrame,toFrame:direction?this.states[direction].frameSequence:undefined}});}

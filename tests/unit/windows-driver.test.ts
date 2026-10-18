@@ -3,11 +3,11 @@ import { FakeHelperTransport, WindowsHelperDriver } from '../../src/bridge/windo
 
 describe('Windows helper driver offline contract', () => {
   it('enforces profile gates, bound identity, focus and visible state', async () => {
-    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: { exists: true, focused: false, visible: true } }));
+    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: { exists: true, focused: false, visible: true, pid: 42, hwnd: '0x2a' } }));
     const driver = new WindowsHelperDriver(transport, true, () => 100);
     expect(() => driver.moveRelative(1, 2, 'm1', 200)).toThrow('window-not-actionable');
     await expect(driver.bindWindow(0, '0x2a')).rejects.toThrow('window-identity-required');
-    const boundTransport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: request.command === 'getWindowState' ? { exists: true, focused: false, visible: true } : undefined }));
+    const boundTransport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: request.command === 'getWindowState' ? { exists: true, focused: false, visible: true, pid: 42, hwnd: '0x2a' } : request.command === 'bindWindow' ? { bound: true, pid: request.pid, hwnd: request.hwnd } : undefined }));
     const bound = new WindowsHelperDriver(boundTransport, true, () => 100);
     await bound.bindWindow(42, '0x2a');
     await bound.getWindowState();
@@ -19,7 +19,7 @@ describe('Windows helper driver offline contract', () => {
 
   it('rejects expired leases and NUL text, deduplicates effects and validates response IDs', async () => {
     let now = 1_000;
-    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: request.command === 'getWindowState' ? { exists: true, focused: true, visible: true, pid: 12, hwnd: '0xc' } : { command: request.command, dryRun: true } }));
+    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: request.command === 'getWindowState' ? { exists: true, focused: true, visible: true, pid: 12, hwnd: '0xc' } : request.command === 'bindWindow' ? { bound: true, pid: request.pid, hwnd: request.hwnd } : { command: request.command, dryRun: true } }));
     const driver = new WindowsHelperDriver(transport, true, () => now);
     await driver.bindWindow(12, '0xc');
     await driver.getWindowState();
@@ -42,7 +42,7 @@ describe('Windows helper driver offline contract', () => {
 
   it('releases owned inputs after focus loss and shutdown', async () => {
     let focused = true;
-    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: request.command === 'getWindowState' ? { exists: true, focused, visible: true } : undefined }));
+    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: request.command === 'getWindowState' ? { exists: true, focused, visible: true, pid: 12, hwnd: '0xc' } : request.command === 'bindWindow' ? { bound: true, pid: request.pid, hwnd: request.hwnd } : undefined }));
     const driver = new WindowsHelperDriver(transport, true);
     await driver.bindWindow(12, '0xc');
     focused = false;

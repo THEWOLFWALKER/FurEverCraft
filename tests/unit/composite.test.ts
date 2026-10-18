@@ -12,8 +12,10 @@ describe('CompositeClientBridge', () => {
   it('combines protocol observations and windows under one identity', async () => {
     const protocol = new ProtocolSession('fixture-session');
     const transport = new FakeHelperTransport(request => request.command === 'getWindowState'
-      ? { requestId: request.requestId, ok: true, result: { exists: true, focused: true, visible: true } }
-      : { requestId: request.requestId, ok: true, result: { command: request.command } });
+      ? { requestId: request.requestId, ok: true, result: { exists: true, focused: true, visible: true, pid: 1, hwnd: 'hwnd' } }
+      : request.command === 'bindWindow'
+        ? { requestId: request.requestId, ok: true, result: { bound: true, pid: request.pid, hwnd: request.hwnd } }
+        : { requestId: request.requestId, ok: true, result: { command: request.command } });
     const bridge = new CompositeClientBridge({ protocol, windows: new WindowsHelperDriver(transport, true), profile: { profile: 'client-offline', allowOsInput: true, allowScreenCapture: true } });
     expect(bridge.identity.connectionEpoch).toBe('fixture-session');
     protocol.observe('position', 'upstream', { x: 1 });
@@ -27,8 +29,10 @@ describe('CompositeClientBridge', () => {
   it('releases inputs on focus loss and coordinates auth without exposing secrets', async () => {
     let focused = true;
     const transport = new FakeHelperTransport(request => request.command === 'getWindowState'
-      ? { requestId: request.requestId, ok: true, result: { focused, visible: true } }
-      : { requestId: request.requestId, ok: true, result: { mimeType: 'image/png', data: 'fixture' } });
+      ? { requestId: request.requestId, ok: true, result: { exists: true, focused, visible: true, pid: 1, hwnd: 'h' } }
+      : request.command === 'bindWindow'
+        ? { requestId: request.requestId, ok: true, result: { bound: true, pid: request.pid, hwnd: request.hwnd } }
+        : { requestId: request.requestId, ok: true, result: { mimeType: 'image/png', data: 'fixture' } });
     const auth = vi.fn(async () => undefined);
     const bridge = new CompositeClientBridge({ windows: new WindowsHelperDriver(transport, true), authExecutor: auth, credentials: () => ({ username: 'u', secret: 's' }), profile: { profile: 'client-offline', allowOsInput: true, allowScreenCapture: true, allowAuth: true } });
     await bridge.bindWindow(1, 'h'); focused = false;
