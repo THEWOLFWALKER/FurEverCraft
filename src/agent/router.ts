@@ -111,12 +111,16 @@ export class ToolRouter {
               this.store!.addEffect({ effectId, executionId: lease.owner, context: this.bridge.context, status: 'prepared', intent: { kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : 'dig', x: typeof executeArgs === 'object' ? executeArgs?.x : undefined, y: typeof executeArgs === 'object' ? executeArgs?.y : undefined, text: skill === 'send_chat' ? String(executeArgs) : undefined, block: skill === 'gather_blocks' ? String(args.block) : undefined } });
             }
             const guardedReport = (progress: Omit<Progress, 'at'>) => {
+              // Persisting the dispatch barrier must succeed before any world action; a failed
+              // write aborts the skill so an unsent effect is never dispatched.
               if (effectId && progress.stage === 'dispatch' && progress.completed > 0) {
-                try { this.store!.updateEffect(effectId, 'may-have-dispatched'); } catch { /* effect already settled */ }
+                this.store!.updateEffect(effectId, 'may-have-dispatched');
               }
               report(progress);
             };
-            return (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report: guardedReport, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs);
+            const result = (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report: guardedReport, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs);
+            if (result instanceof Promise) return result.catch(error => { throw error; });
+            return result;
           });
           result = execution;
           if (sideEffect && effectId) {
@@ -139,8 +143,11 @@ export class ToolRouter {
           break;
         }
         case 'cancel_execution': {
+          if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' };
+          const target = this.store.getExecution(String(args.executionId));
+          if (!target) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' };
           this.executor?.cancel(String(args.executionId));
-          result = { canceled: args.executionId };
+          result = { canceled: args.executionId, status: this.store.getExecution(String(args.executionId))?.status };
           break;
         }
       }

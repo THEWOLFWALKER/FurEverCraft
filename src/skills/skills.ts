@@ -25,6 +25,8 @@ export function observeUi(ctx: SkillContext): SkillResult {
 export function sendChat(ctx: SkillContext, text: string): SkillResult {
   if (!text) return { ok: false, outcome: 'failed', reason: 'text-required' };
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  // Remember the mode the player was in so the UI is restored, not forced to gameplay.
+  const previousUi = ctx.bridge.snapshot().ui;
   ctx.report({ stage: 'dispatch', completed: 0, total: 1 });
   let enteredChat = false;
   try {
@@ -37,7 +39,7 @@ export function sendChat(ctx: SkillContext, text: string): SkillResult {
     if (receipt.accepted !== true || receipt.ambiguous) return { ok: false, outcome: 'ambiguous', reason: 'chat-delivery-unconfirmed', value: receipt };
     return { ok: true, outcome: 'confirmed', value: receipt };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
-  finally { if (enteredChat) { try { ctx.bridge.setUi('gameplay'); } catch { /* preserve ambiguous result */ } } }
+  finally { if (enteredChat) { try { ctx.bridge.setUi(previousUi); } catch { /* preserve ambiguous result */ } } }
 }
 
 export function placeOne(ctx: SkillContext, target: { x: number; y: number }): SkillResult {
