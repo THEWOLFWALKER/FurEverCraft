@@ -57,10 +57,17 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
   };
   const control = new ControlService(undefined, providerMetadata);
   const goalManager = new GoalManager(store, session.events);
-  const scheduler = new TaskScheduler(session.events, async () => undefined, 25);
+  // The scheduler's wake hook really advances one decision turn through the same AgentLoop.
+  const scheduler = new TaskScheduler(session.events, async (reason) => {
+    if (control.pausedValue || control.stoppingValue) return;
+    await loop.run([{ role: 'user', content: `Scheduler wake: ${reason}. Continue the active goal or report the next blocked step.` }], undefined, undefined, { goalId: 'agent', store });
+  }, 25);
   const sessionSupervisor = new SessionSupervisor(session.events);
+  // Wire the scheduler to the event stream so goal/execution/effect/session events coalesce
+  // into a single wake instead of a per-tick model call.
+  const unsubscribeScheduler = session.events.subscribe(event => scheduler.observe(event));
   let closed = false;
-  const assembly = { bridge, store, session, router, provider, loop, clock, control, goalManager, scheduler, sessionSupervisor, close() { if (closed) return; closed = true; scheduler.close(); void sessionSupervisor.stop(); const shutdown = (bridge as { shutdown?: () => Promise<void> }).shutdown; if (typeof shutdown === 'function') void shutdown.call(bridge).catch(() => undefined); try { store.close(); } finally { if (lockKey) activeRuntimes.delete(lockKey); } } } as RuntimeAssembly;
+  const assembly = { bridge, store, session, router, provider, loop, clock, control, goalManager, scheduler, sessionSupervisor, close() { if (closed) return; closed = true; unsubscribeScheduler(); scheduler.close(); void sessionSupervisor.stop(); const shutdown = (bridge as { shutdown?: () => Promise<void> }).shutdown; if (typeof shutdown === 'function') void shutdown.call(bridge).catch(() => undefined); try { store.close(); } finally { if (lockKey) activeRuntimes.delete(lockKey); } } } as RuntimeAssembly;
   control.attach(assembly);
   return assembly;
 }

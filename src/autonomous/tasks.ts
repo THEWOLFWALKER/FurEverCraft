@@ -1,10 +1,27 @@
 import { nextId } from '../contracts/index.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import type { EventHub, Event } from '../diagnostics/events.js';
+import { findSkill } from '../skills/registry.js';
 
 export type TaskStatus = 'proposed' | 'ready' | 'running' | 'waiting' | 'succeeded' | 'failed' | 'canceled';
 export type TaskNode = { id: string; skill: string; args: Record<string, unknown>; dependsOn?: string[]; status?: TaskStatus };
 export type GoalSpec = { goalId: string; text: string; revision: number; nodes: TaskNode[]; priority: number; budget: { maxNodes: number; used: number }; completion?: string };
+
+/** Detect a dependency cycle across task nodes; a cycle can never make progress. */
+function hasCycle(nodes: TaskNode[]): boolean {
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const state = new Map<string, 0 | 1 | 2>();
+  const visit = (id: string): boolean => {
+    const mark = state.get(id) ?? 0;
+    if (mark === 1) return true;
+    if (mark === 2) return false;
+    state.set(id, 1);
+    for (const dep of byId.get(id)?.dependsOn ?? []) if (visit(dep)) return true;
+    state.set(id, 2);
+    return false;
+  };
+  return nodes.some(node => visit(node.id));
+}
 
 export class GoalManager {
   constructor(private readonly store: SQLiteStore, private readonly events: EventHub) {}
@@ -13,6 +30,8 @@ export class GoalManager {
     if (nodes.length > 32) throw new Error('task-budget-exceeded');
     const ids = new Set(nodes.map(node => node.id));
     if (ids.size !== nodes.length || nodes.some(node => (node.dependsOn ?? []).some(dep => !ids.has(dep) || dep === node.id))) throw new Error('invalid-task-dependencies');
+    if (hasCycle(nodes)) throw new Error('cyclic-task-dependencies');
+    if (nodes.some(node => !findSkill(node.skill))) throw new Error('unknown-task-skill');
     const goal: GoalSpec = { goalId, text: input.text, revision: 0, nodes, priority: input.priority ?? 0, budget: { maxNodes: 32, used: 0 }, completion: input.completion };
     this.store.saveGoal({ goalId, revision: 0, status: 'active', text: input.text, context: 'simulated' });
     this.events.publish('goal.proposed', goal, true); return goal;
