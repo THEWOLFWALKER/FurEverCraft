@@ -42,7 +42,7 @@ A substantial offline implementation of the v0.2 batch exists and is verified on
 npm run typecheck            pass
 npm run build                pass
 npm run build:web            pass
-npm run test:offline         25 files / 124 tests pass
+npm run test:offline         26 files / 171 tests pass
 npm run test:v:offline       integration (incl. forked relay child) + soak + trace pass
 npm run demo:offline         6 scenarios pass
 npm run demo:autonomy        pass
@@ -61,6 +61,21 @@ Loopback smoke: `serve` served the built UI (200 text/html), `/api/v1/status` re
 - Trace export/replay CLI (`trace:export`, `trace:replay`).
 - S01–S14 acceptance-mapped integration suite and U04 concurrency tests (identical requestId once, stale CAS conflict).
 - Recovery now attributes a placement only when the effect had actually been dispatched; a blocked cell alone is ambiguous.
+
+## 500-issue audit remediation (2026-10-18)
+
+Triage of the 500-item audit: ~143 real findings (70 deduplicated root causes), 142 false positives, 208 not-implemented-by-design (excluded by instruction), 7 unverifiable environment facts. Fixes were made only for bugs, with regression tests:
+
+- WorldState: deltas merge instead of replacing cells; default invalidate demotes every known cell; invalid sequence is a contract error.
+- Leases: epoch fencing and owner-checked release; progress renews lease/watchdog; watchdog aborts work.
+- Execution: unknown/absent outcome becomes ambiguous, never success; terminal states are write-protected.
+- Side effects: dispatch barrier must persist or the skill aborts; recovery only attributes a placement when it was actually dispatched and the snapshot is fresh and complete; effects/pending rows are scoped to the current world.
+- Control: pause/stop abort in-flight AgentLoops, quit closes the runtime and records a terminal receipt, resume cannot unpause after stop, commands rejected after close.
+- Server: Fastify migration with local pairing, HttpOnly session, CSRF, CLI bearer; static assets 404 instead of SPA HTML; SSE snapshot/watermark consistent.
+- Bridge: relay buffers client bytes until upstream connect; observer reports phase/compression as unsupported rather than fabricating; IPC close clears pending/listeners and backpressure tracks real queue.
+- Windows: watchdog keyed on heartbeat not release, bind identity verified, helper registers dedupe only after success.
+- Skills: navigation verifies actual position, dig/gather require observed free cells, chat fails closed without a dispatcher and restores the prior UI mode.
+- Clock: large timeouts no longer collapse to 1 ms.
 
 ## Review passes performed
 
