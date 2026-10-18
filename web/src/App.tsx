@@ -1,6 +1,25 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, subscribeEvents, type Capabilities, type Effect, type EventRecord, type Execution, type Goal, type Place, type Provider, type Status } from './api';
 
+function WorldCanvas({ cells }: { cells: Record<string, string> }) {
+  const ref = React.useRef<HTMLCanvasElement>(null);
+  React.useEffect(() => {
+    const canvas = ref.current; if (!canvas) return;
+    const ctx = canvas.getContext('2d'); if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#f8fbff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const entries = Object.entries(cells);
+    if (entries.length === 0) { ctx.fillStyle = '#8195aa'; ctx.font = '12px Inter, system-ui'; ctx.fillText('No local cells observed (--)', 12, 24); return; }
+    const size = Math.max(6, Math.floor(Math.min(canvas.width, canvas.height) / 24));
+    entries.slice(0, 24 * 24).forEach(([key, value]) => {
+      const [x, y] = key.split(',').map(Number) as [number, number];
+      ctx.fillStyle = value === 'blocked' ? '#0b2142' : value === 'free' ? '#2bbd79' : '#d6e4f1';
+      ctx.fillRect((x % 24) * size, (y % 24) * size, size - 1, size - 1);
+    });
+  });
+  return <canvas ref={ref} width={288} height={288} aria-label="Top-down local world view" role="img" />;
+}
+
 const value = (input: unknown) => (input === undefined || input === null || input === '' ? '--' : String(input));
 const time = (iso?: string) => (iso ? new Date(iso).toLocaleTimeString() : '--');
 
@@ -36,6 +55,9 @@ export default function App() {
   const [stream, setStream] = useState<'connecting' | 'open' | 'error'>('connecting');
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  const [activeTab, setActiveTab] = useState<'overview'|'conversation'|'tasks'|'world'|'settings'>('overview');
+  const [conversation, setConversation] = useState<Array<{ role: string; text: string; state?: string }>>([]);
+  const worldCells = (status?.context as { cells?: Record<string, string> } | undefined)?.cells ?? {};
   const [lastUpdated, setLastUpdated] = useState<string>();
   const [goalId, setGoalId] = useState('goal-main');
   const [goalText, setGoalText] = useState('Explore the local area and return');
@@ -72,6 +94,8 @@ export default function App() {
     setBusy(true);
     try {
       const result = await api.command(command, payload, expectedRevision);
+      const state = String((result.body as { state?: string }).state ?? (result.status >= 400 ? 'rejected' : 'unknown'));
+      if (command === 'message' || command === 'chat') setConversation(previous => [...previous.slice(-40), { role: 'you', text: String(payload.text ?? ''), state }]);
       if (result.status >= 400) setError(String((result.body as { code?: string }).code ?? `http-${result.status}`));
       else setError(undefined);
       await refresh();
@@ -101,121 +125,164 @@ export default function App() {
 
       {error && <div className="panel error" role="alert">Command or read failed: {error}. Values shown as -- are unavailable.</div>}
 
-      <div className="grid two">
-        <section className="panel primary">
-          <h2>Runtime status</h2>
-          <div className="hero-status"><Dot tone={tone} /> {headline}</div>
-          <p className="hero-explain">
-            {activeGoal?.spec?.text ?? 'No active goal. Set one below to start autonomous work.'}
-          </p>
-          <div className="hero-meta">
-            <span>profile {value(capabilities?.profile)}</span>
-            <span>provider {value(provider?.provider)}</span>
-            <span>updated {value(lastUpdated)}</span>
-          </div>
-        </section>
-        <section className="panel">
-          <h2>Capabilities</h2>
-          <div className="kv">
-            <div className="kv-row"><span className="kv-key">Network</span><span className="kv-value">{provider?.networkEnabled ? 'enabled' : 'disabled'}</span></div>
-            <div className="kv-row"><span className="kv-key">Model configured</span><span className="kv-value">{provider?.configured === undefined ? '--' : provider.configured ? 'yes' : 'no'}</span></div>
-            <div className="kv-row"><span className="kv-key">Transport</span><span className="kv-value">{value(provider?.transport)}</span></div>
-            <div className="kv-row"><span className="kv-key">Limitations</span><span className="kv-value">{capabilities?.limitations?.length ? capabilities.limitations.join(', ') : 'none reported'}</span></div>
-          </div>
-        </section>
-      </div>
+      <nav className="app-tabs" aria-label="Sections">
+        {(['overview','conversation','tasks','world','settings'] as const).map(tab => (
+          <button key={tab} className={tab === activeTab ? 'primary' : ''} onClick={() => setActiveTab(tab)} aria-pressed={tab === activeTab}>{tab[0]!.toUpperCase() + tab.slice(1)}</button>
+        ))}
+      </nav>
 
-      <div className="grid metrics" style={{ marginTop: 16 }}>
-        <Metric label="Active goal revision" count={activeGoal?.revision} hint="Current goal revision or unknown" />
-        <Metric label="Executions" count={executions.length} hint="Persisted executions or unknown" />
-        <Metric label="Pending effects" count={pendingEffects} hint="Effects not yet confirmed or partial" />
-        <Metric label="Places" count={places.length} hint="Remembered places or unknown" />
-      </div>
-
-      <div className="grid two" style={{ marginTop: 16 }}>
-        <section className="panel">
-          <h2>Command</h2>
-          <div className="form">
-            <label>Goal id<input value={goalId} onChange={event => setGoalId(event.target.value)} /></label>
-            <label>Goal text<textarea rows={2} value={goalText} onChange={event => setGoalText(event.target.value)} /></label>
-            <div className="actions">
-              <button className="primary" disabled={busy || !goalText.trim()} onClick={() => void run('goal.set', { goalId, text: goalText }, activeGoal && activeGoal.goal_id === goalId ? activeGoal.revision : undefined)}>Set goal</button>
-              <button disabled={busy || !activeGoal} onClick={() => void run('goal.revise', { goalId: activeGoal!.goal_id, expectedRevision: activeGoal!.revision, change: goalText })}>Revise goal</button>
-            </div>
-            <label>Message to agent<textarea rows={2} value={message} onChange={event => setMessage(event.target.value)} /></label>
-            <div className="actions">
-              <button disabled={busy || !message.trim()} onClick={() => void run('message', { text: message })}>Send message</button>
-              <button disabled={busy || !message.trim()} onClick={() => void run('chat', { text: message })}>Send game chat</button>
-            </div>
-            <div className="actions">
-              <button disabled={busy} onClick={() => void run('pause', {})}>Pause</button>
-              <button disabled={busy} onClick={() => void run('resume', {})}>Resume</button>
-              <button disabled={busy} onClick={() => void run('save', {})}>Save checkpoint</button>
-              <button disabled={busy} onClick={() => void run('stop', {})}>Stop</button>
-            </div>
-            <label>Cancel execution<input placeholder="execution id" value={cancelId} onChange={event => setCancelId(event.target.value)} /></label>
-            <div className="actions">
-              <button disabled={busy || !cancelId.trim()} onClick={() => void run('cancel', { executionId: cancelId.trim() })}>Cancel execution</button>
-            </div>
-          </div>
-        </section>
-
-        <section className="panel">
-          <h2>Executions</h2>
-          <div className="list">
-            {executions.length === 0 ? <div className="empty">No executions yet.</div> : executions.slice(0, 8).map(execution => (
-              <div className="row" key={execution.execution_id}>
-                <div className="row-main">
-                  <span className="row-id">{execution.execution_id}</span>
-                  <span className="row-meta">{execution.skill_id} · outcome {value(execution.outcome)}</span>
-                </div>
-                <span className={`tag ${stateTone(execution.status)}`}>{execution.status}</span>
+      {activeTab === 'overview' && (
+        <>
+          <div className="grid two">
+            <section className="panel primary">
+              <h2>Runtime status</h2>
+              <div className="hero-status"><Dot tone={tone} /> {headline}</div>
+              <p className="hero-explain">{activeGoal?.spec?.text ?? 'No active goal. Set one to start autonomous work.'}</p>
+              <div className="hero-meta">
+                <span>profile {value(capabilities?.profile)}</span>
+                <span>provider {value(provider?.provider)}</span>
+                <span>updated {value(lastUpdated)}</span>
               </div>
-            ))}
+            </section>
+            <section className="panel">
+              <h2>Capabilities</h2>
+              <div className="kv">
+                <div className="kv-row"><span className="kv-key">Network</span><span className="kv-value">{provider?.networkEnabled ? 'enabled' : 'disabled'}</span></div>
+                <div className="kv-row"><span className="kv-key">Model configured</span><span className="kv-value">{provider?.configured === undefined ? '--' : provider.configured ? 'yes' : 'no'}</span></div>
+                <div className="kv-row"><span className="kv-key">Transport</span><span className="kv-value">{value(provider?.transport)}</span></div>
+                <div className="kv-row"><span className="kv-key">Limitations</span><span className="kv-value">{capabilities?.limitations?.length ? capabilities.limitations.join(', ') : 'none reported'}</span></div>
+              </div>
+            </section>
           </div>
-        </section>
-      </div>
+          <div className="grid metrics" style={{ marginTop: 16 }}>
+            <Metric label="Active goal revision" count={activeGoal?.revision} hint="Current goal revision or unknown" />
+            <Metric label="Executions" count={executions.length} hint="Persisted executions or unknown" />
+            <Metric label="Pending effects" count={pendingEffects} hint="Effects not yet confirmed or partial" />
+            <Metric label="Places" count={places.length} hint="Remembered places or unknown" />
+          </div>
+        </>
+      )}
 
-      <div className="grid two" style={{ marginTop: 16 }}>
-        <section className="panel">
-          <h2>Effects</h2>
-          <div className="list">
-            {effects.length === 0 ? <div className="empty">No effects recorded.</div> : effects.slice(0, 8).map(effect => (
-              <div className="row" key={effect.effect_id}>
-                <div className="row-main">
-                  <span className="row-id">{effect.effect_id}</span>
-                  <span className="row-meta">{effect.execution_id}</span>
+      {activeTab === 'conversation' && (
+        <>
+          <div className="grid two">
+            <section className="panel">
+              <h2>Command</h2>
+              <div className="form">
+                <label>Goal id<input value={goalId} onChange={event => setGoalId(event.target.value)} /></label>
+                <label>Goal text<textarea rows={2} value={goalText} onChange={event => setGoalText(event.target.value)} /></label>
+                <div className="actions">
+                  <button className="primary" disabled={busy || !goalText.trim()} onClick={() => void run('goal.set', { goalId, text: goalText }, activeGoal && activeGoal.goal_id === goalId ? activeGoal.revision : undefined)}>Set goal</button>
+                  <button disabled={busy || !activeGoal} onClick={() => void run('goal.revise', { goalId: activeGoal!.goal_id, expectedRevision: activeGoal!.revision, change: goalText })}>Revise goal</button>
                 </div>
-                <span className={`tag ${stateTone(effect.status)}`}>{effect.status}</span>
-              </div>
-            ))}
-          </div>
-        </section>
-        <section className="panel">
-          <h2>Places</h2>
-          <div className="list">
-            {places.length === 0 ? <div className="empty">No places remembered.</div> : places.slice(0, 8).map(place => (
-              <div className="row" key={place.place_id}>
-                <div className="row-main">
-                  <span className="row-id">{place.place_id}</span>
-                  <span className="row-meta">verified {value(place.last_verified_at)}</span>
+                <label>Message to agent<textarea rows={2} value={message} onChange={event => setMessage(event.target.value)} /></label>
+                <div className="actions">
+                  <button disabled={busy || !message.trim()} onClick={() => void run('message', { text: message })}>Send message</button>
+                  <button disabled={busy || !message.trim()} onClick={() => void run('chat', { text: message })}>Send game chat</button>
                 </div>
-                <span className={`tag ${stateTone(place.status)}`}>{place.status}</span>
+                <div className="actions">
+                  <button disabled={busy} onClick={() => void run('pause', {})}>Pause</button>
+                  <button disabled={busy} onClick={() => void run('resume', {})}>Resume</button>
+                  <button disabled={busy} onClick={() => void run('save', {})}>Save checkpoint</button>
+                  <button disabled={busy} onClick={() => void run('stop', {})}>Stop</button>
+                </div>
+                <label>Cancel execution<input placeholder="execution id" value={cancelId} onChange={event => setCancelId(event.target.value)} /></label>
+                <div className="actions">
+                  <button disabled={busy || !cancelId.trim()} onClick={() => void run('cancel', { executionId: cancelId.trim() })}>Cancel execution</button>
+                </div>
               </div>
-            ))}
+            </section>
+            <section className="panel">
+              <h2>Conversation</h2>
+              <div className="list">
+                {conversation.length === 0 ? <div className="empty">No messages exchanged yet.</div> : conversation.map((entry, index) => (
+                  <div className="row" key={`${index}-${entry.role}`}>
+                    <div className="row-main"><span className="row-id">{entry.role}</span><span className="row-meta">{entry.text}</span></div>
+                    <span className={`tag ${stateTone(entry.state)}`}>{value(entry.state)}</span>
+                  </div>
+                ))}
+              </div>
+            </section>
           </div>
-        </section>
-      </div>
+        </>
+      )}
+
+      {activeTab === 'tasks' && (
+        <div className="grid two">
+          <section className="panel">
+            <h2>Executions</h2>
+            <div className="list">
+              {executions.length === 0 ? <div className="empty">No executions yet.</div> : executions.slice(0, 20).map(execution => (
+                <div className="row" key={execution.execution_id}>
+                  <div className="row-main"><span className="row-id">{execution.execution_id}</span><span className="row-meta">{execution.skill_id} · outcome {value(execution.outcome)}</span></div>
+                  <span className={`tag ${stateTone(execution.status)}`}>{execution.status}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+          <section className="panel">
+            <h2>Effects</h2>
+            <div className="list">
+              {effects.length === 0 ? <div className="empty">No effects recorded.</div> : effects.slice(0, 20).map(effect => (
+                <div className="row" key={effect.effect_id}>
+                  <div className="row-main"><span className="row-id">{effect.effect_id}</span><span className="row-meta">{effect.execution_id}</span></div>
+                  <span className={`tag ${stateTone(effect.status)}`}>{effect.status}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {activeTab === 'world' && (
+        <div className="grid two">
+          <section className="panel">
+            <h2>Top-down view</h2>
+            <WorldCanvas cells={worldCells} />
+          </section>
+          <section className="panel">
+            <h2>Places</h2>
+            <div className="list">
+              {places.length === 0 ? <div className="empty">No places remembered.</div> : places.slice(0, 20).map(place => (
+                <div className="row" key={place.place_id}>
+                  <div className="row-main"><span className="row-id">{place.place_id}</span><span className="row-meta">verified {value(place.last_verified_at)}</span></div>
+                  <span className={`tag ${stateTone(place.status)}`}>{place.status}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {activeTab === 'settings' && (
+        <div className="grid two">
+          <section className="panel">
+            <h2>Provider</h2>
+            <div className="kv">
+              <div className="kv-row"><span className="kv-key">Provider</span><span className="kv-value">{value(provider?.provider)}</span></div>
+              <div className="kv-row"><span className="kv-key">Model</span><span className="kv-value">{value(provider?.model)}</span></div>
+              <div className="kv-row"><span className="kv-key">Network</span><span className="kv-value">{provider?.networkEnabled ? 'enabled' : 'disabled'}</span></div>
+              <div className="kv-row"><span className="kv-key">Configured</span><span className="kv-value">{provider?.configured === undefined ? '--' : provider.configured ? 'yes' : 'no'}</span></div>
+            </div>
+          </section>
+          <section className="panel">
+            <h2>Diagnostics</h2>
+            <div className="kv">
+              <div className="kv-row"><span className="kv-key">Profile</span><span className="kv-value">{value(capabilities?.profile)}</span></div>
+              <div className="kv-row"><span className="kv-key">SSE</span><span className="kv-value">{stream}</span></div>
+              <div className="kv-row"><span className="kv-key">Last refresh</span><span className="kv-value">{value(lastUpdated)}</span></div>
+              <div className="kv-row"><span className="kv-key">Limitations</span><span className="kv-value">{capabilities?.limitations?.join(', ') || 'none reported'}</span></div>
+            </div>
+          </section>
+        </div>
+      )}
 
       <section className="panel" style={{ marginTop: 16 }}>
         <h2>Event stream</h2>
         <div className="list">
           {events.length === 0 ? <div className="empty">No events received yet.</div> : events.slice(0, 20).map(event => (
             <div className="row" key={`${event.seq}-${event.kind}`}>
-              <div className="row-main">
-                <span className="row-id">{event.kind}</span>
-                <span className="row-meta">{JSON.stringify(event.payload ?? {}).slice(0, 160)}</span>
-              </div>
+              <div className="row-main"><span className="row-id">{event.kind}</span><span className="row-meta">{JSON.stringify(event.payload ?? {}).slice(0, 160)}</span></div>
               <span className="row-time">#{event.seq}</span>
             </div>
           ))}

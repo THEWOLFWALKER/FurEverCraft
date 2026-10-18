@@ -122,3 +122,8 @@ button.primary:hover:not(:disabled) { background: #1460d2; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+.app-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 16px; }
+.app-tabs button { min-height: 36px; padding: 6px 14px; border-radius: 10px; }
+.app-tabs button[aria-pressed="true"] { background: var(--primary-soft); border-color: var(--primary); color: var(--primary); }
+canvas { display: block; max-width: 100%; height: auto; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--surface-soft); }
