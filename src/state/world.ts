@@ -5,6 +5,11 @@ type Cell = 'free'|'blocked'|'unknown';
 export type Observation = WorldSnapshot & { observedAt:number; sequence:string; sourceEpoch?:string; ttl?:number; baseline?:'full'|'delta' };
 const clone=<T>(v:T):T=>structuredClone(v);
 const sameStableContext = (a: BodyContext, b: BodyContext) => a.serverProfileId === b.serverProfileId && a.worldGenerationId === b.worldGenerationId && a.dimension === b.dimension;
+/** Sequences are non-negative decimal strings; anything else is a contract error, not a BigInt SyntaxError. */
+const parseSequence = (value: unknown) => {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new Error('invalid-observation-sequence');
+  return BigInt(value);
+};
 
 export class WorldState {
   private current?:Observation; private revision=0n; private lastSequence=0n; private epoch?:string; private gap=false;
@@ -16,7 +21,7 @@ export class WorldState {
     const parsed = WorldSnapshotSchema.parse(o);
     const c = parsed.context;
     if(!sameStableContext(c,this.context)) throw new Error('world-context-mismatch');
-    const seq=BigInt(o.sequence); if(seq<0n) throw new Error('invalid-observation-sequence');
+    const seq=parseSequence(o.sequence);
     const epoch=o.sourceEpoch??c.connectionEpoch;
     const newEpoch=this.epoch!==epoch;
     const isFull=o.baseline==='full';
@@ -42,9 +47,11 @@ export class WorldState {
 
   invalidate(reason='observation-gap',scope:'cells'|'all'='cells'):WorldSnapshot {
     this.revision++; this.gap=true;
-    if(this.current){const cells=scope==='all'?Object.fromEntries(Object.keys(this.current.cells).map(k=>[k,'unknown' as Cell])):this.current.cells;
+    // Invalidating the default 'cells' scope demotes every known cell to unknown; keeping the old
+    // values would let stale cells be read as current after the gap.
+    if(this.current){const cells=Object.fromEntries(Object.keys(this.current.cells).map(k=>[k,'unknown' as Cell]));
       this.current={...this.current,revision:this.revision.toString(),freshness:'unknown',gap:true,cells,fields:Object.fromEntries(Object.entries(this.current.fields).map(([k,v])=>[k,{...v,freshness:'unknown',available:false}]))};}
-    void reason;
+    void scope;
     const out=this.snapshot(true);
     for(const listener of this.listeners){try{listener(clone(out))}catch{ /* listener isolation */ }}
     return out;

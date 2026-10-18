@@ -60,6 +60,7 @@ export class SQLiteStore {
         last_verified_at TEXT, payload_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS episodes(episode_id TEXT PRIMARY KEY, context TEXT NOT NULL,
         event_refs_json TEXT NOT NULL, summary_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS memory_scope(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS action_receipts(
         receipt_id TEXT PRIMARY KEY, scope TEXT NOT NULL, command_id TEXT NOT NULL, status TEXT NOT NULL,
         result_json TEXT, context_json TEXT, payload_hash TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -70,6 +71,11 @@ export class SQLiteStore {
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)').run(now());
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(now());
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(now());
+    })();
+    // Widening primary keys rebuilds tables, so it runs outside the schema DDL transaction.
+    this.db.transaction(() => {
+      this.scopeMemoryKeys('places', 'place_id');
+      this.scopeMemoryKeys('episodes', 'episode_id');
     })();
   }
 
@@ -82,6 +88,7 @@ export class SQLiteStore {
   saveGoal(goal: { goalId: string; revision: number; status: string; text: string; context?: unknown }) {
     const timestamp = now();
     const current = this.getGoal(goal.goalId);
+    // A goal's first revision is 0 or 1; any other first write is a skip and is rejected.
     if (!current && goal.revision !== 0 && goal.revision !== 1) throw new Error('goal-revision-conflict:0');
     // Only the next revision may be written; a repeat of the current revision is a conflict.
     if (current && goal.revision !== current.revision + 1) throw new Error(`goal-revision-conflict:${current.revision}`);
@@ -90,7 +97,7 @@ export class SQLiteStore {
       status=excluded.status, body_context=excluded.body_context, spec_json=excluded.spec_json, updated_at=excluded.updated_at
       WHERE goals.revision=excluded.revision-1`)
       .run(goal.goalId, goal.revision, goal.status, json(goal.context ?? 'simulated'), json({ text: goal.text }), timestamp, timestamp);
-    // A write that loses the revision race must fail, not silently no-op.
+    // A write that loses the revision race (or rolls the revision back) must fail, not silently no-op.
     const stored = this.getGoal(goal.goalId);
     if (!stored || stored.revision !== goal.revision) throw new Error(`goal-revision-conflict:${stored?.revision ?? 0}`);
   }
@@ -290,38 +297,114 @@ export class SQLiteStore {
   }
 
   savePlace(place: { placeId: string; context: unknown; status: string; lastVerifiedAt?: string; payload: unknown }) {
-    this.db.prepare(`INSERT INTO places(place_id,context,status,last_verified_at,payload_json) VALUES (?,?,?,?,?)
-      ON CONFLICT(place_id) DO UPDATE SET context=excluded.context,status=excluded.status,
-      last_verified_at=excluded.last_verified_at,payload_json=excluded.payload_json
-      WHERE places.context=excluded.context`)
-      .run(place.placeId, json(place.context), place.status, place.lastVerifiedAt ?? null, json(place.payload));
+    // A place id is only unique inside its scope: the same place in another world must not
+    // overwrite this one. Legacy single-column layouts are widened to (place_id, context).
+    const reuse = place.context === undefined ? undefined : this.db.prepare('SELECT rowid FROM places WHERE place_id=? AND context=?').get(place.placeId, json(place.context)) as { rowid: number } | undefined;
+    if (reuse) {
+      this.db.prepare(`UPDATE places SET status=?, last_verified_at=?, payload_json=? WHERE rowid=?`)
+        .run(place.status, place.lastVerifiedAt ?? null, json(place.payload), reuse.rowid);
+    } else {
+      this.db.prepare(`INSERT INTO places(place_id,context,status,last_verified_at,payload_json) VALUES (?,?,?,?,?)`)
+        .run(place.placeId, json(place.context), place.status, place.lastVerifiedAt ?? null, json(place.payload));
+    }
+    this.touchScope(place.context);
   }
 
-  getPlace(placeId: string) {
-    const row = this.db.prepare('SELECT * FROM places WHERE place_id=?').get(placeId) as any;
-    return row ? { ...row, context: parse(row.context), payload: parse(row.payload_json) } : undefined;
+  /** Returns the record with this id: the one visible in the current scope when a scope is given. */
+  getPlace(placeId: string, context?: unknown) {
+    if (context !== undefined) return this.placeRow(this.db.prepare('SELECT * FROM places WHERE place_id=? AND context=?').get(placeId, json(context)) as any);
+    const current = this.currentScope();
+    if (current !== undefined) {
+      const scoped = this.placeRow(this.db.prepare('SELECT * FROM places WHERE place_id=? AND context=?').get(placeId, current) as any);
+      if (scoped) return scoped;
+    }
+    return this.placeRow(this.db.prepare('SELECT * FROM places WHERE place_id=? ORDER BY rowid DESC LIMIT 1').get(placeId) as any);
   }
 
   listPlaces(context?: unknown) {
-    const rows = this.db.prepare('SELECT * FROM places ORDER BY place_id').all() as any[];
-    return rows.map(row => ({ ...row, context: parse(row.context), payload: parse(row.payload_json) }))
-      .filter(row => context === undefined || json(row.context) === json(context));
+    const rows = (context === undefined
+      ? this.db.prepare('SELECT * FROM places ORDER BY place_id, context').all()
+      : this.db.prepare('SELECT * FROM places WHERE context=? ORDER BY place_id').all(json(context))) as any[];
+    return rows.map(row => this.placeRow(row)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+  }
+
+  /** Persist a scoped place and return the row for that scope (never another world's row). */
+  rememberPlace(place: { placeId: string; context: unknown; status: string; lastVerifiedAt?: string; payload: unknown }) {
+    this.savePlace(place);
+    return this.getPlace(place.placeId, place.context);
+  }
+
+  private placeRow(row: any) {
+    return row ? { ...row, context: parse(row.context), payload: parse(row.payload_json) } : undefined;
   }
 
   saveEpisode(episode: { episodeId: string; context: unknown; eventRefs: unknown; summary: unknown }) {
-    this.db.prepare(`INSERT INTO episodes(episode_id,context,event_refs_json,summary_json) VALUES (?,?,?,?)
-      ON CONFLICT(episode_id) DO UPDATE SET context=excluded.context,event_refs_json=excluded.event_refs_json,
-      summary_json=excluded.summary_json`).run(episode.episodeId, json(episode.context), json(episode.eventRefs), json(episode.summary));
+    // Episodes are scoped like places so the same episode id in another world is a separate record.
+    const reuse = episode.context === undefined ? undefined : this.db.prepare('SELECT rowid FROM episodes WHERE episode_id=? AND context=?').get(episode.episodeId, json(episode.context)) as { rowid: number } | undefined;
+    if (reuse) {
+      this.db.prepare('UPDATE episodes SET event_refs_json=?, summary_json=? WHERE rowid=?')
+        .run(json(episode.eventRefs), json(episode.summary), reuse.rowid);
+    } else {
+      this.db.prepare(`INSERT INTO episodes(episode_id,context,event_refs_json,summary_json) VALUES (?,?,?,?)`)
+        .run(episode.episodeId, json(episode.context), json(episode.eventRefs), json(episode.summary));
+    }
+    this.touchScope(episode.context);
   }
 
-  getEpisode(episodeId: string) {
-    const row = this.db.prepare('SELECT * FROM episodes WHERE episode_id=?').get(episodeId) as any;
-    return row ? { ...row, context: parse(row.context), eventRefs: parse(row.event_refs_json), summary: parse(row.summary_json) } : undefined;
+  /** Returns the record with this id: the one visible in the current scope when a scope is given. */
+  getEpisode(episodeId: string, context?: unknown) {
+    if (context !== undefined) return this.episodeRow(this.db.prepare('SELECT * FROM episodes WHERE episode_id=? AND context=?').get(episodeId, json(context)) as any);
+    const current = this.currentScope();
+    if (current !== undefined) {
+      const scoped = this.episodeRow(this.db.prepare('SELECT * FROM episodes WHERE episode_id=? AND context=?').get(episodeId, current) as any);
+      if (scoped) return scoped;
+    }
+    return this.episodeRow(this.db.prepare('SELECT * FROM episodes WHERE episode_id=? ORDER BY rowid DESC LIMIT 1').get(episodeId) as any);
   }
 
   listEpisodes(context?: unknown) {
-    const rows = this.db.prepare('SELECT * FROM episodes ORDER BY episode_id').all() as any[];
-    return rows.map(row => ({ ...row, context: parse(row.context), eventRefs: parse(row.event_refs_json), summary: parse(row.summary_json) }))
-      .filter(row => context === undefined || json(row.context) === json(context));
+    const rows = (context === undefined
+      ? this.db.prepare('SELECT * FROM episodes ORDER BY episode_id, context').all()
+      : this.db.prepare('SELECT * FROM episodes WHERE context=? ORDER BY episode_id').all(json(context))) as any[];
+    return rows.map(row => this.episodeRow(row)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+  }
+
+  /** Persist a scoped episode and return the row for that scope (never another world's row). */
+  recordEpisode(episode: { episodeId: string; context: unknown; eventRefs: unknown; summary: unknown }) {
+    this.saveEpisode(episode);
+    return this.getEpisode(episode.episodeId, episode.context);
+  }
+
+  private episodeRow(row: any) {
+    return row ? { ...row, context: parse(row.context), eventRefs: parse(row.event_refs_json), summary: parse(row.summary_json) } : undefined;
+  }
+
+  /** The scope reported by this database's most recent scoped memory write, if any. */
+  private currentScope(): string | undefined {
+    const row = this.db.prepare("SELECT value FROM memory_scope WHERE key='current'").get() as { value?: string } | undefined;
+    return row?.value;
+  }
+
+  private touchScope(context: unknown) {
+    if (context === undefined) return;
+    this.db.prepare("INSERT INTO memory_scope(key,value) VALUES ('current',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(json(context));
+  }
+
+  /**
+   * Widen a legacy single-column primary key to (id, context). The rebuild re-applies the current
+   * schema, so this must run inside the migration transaction where a failure rolls everything back.
+   */
+  private scopeMemoryKeys(table: 'places' | 'episodes', idColumn: string) {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string; pk: number }>;
+    const keys = columns.filter(column => column.pk > 0).sort((left, right) => left.pk - right.pk).map(column => column.name);
+    if (keys.length === 2 && keys[0] === idColumn && keys[1] === 'context') return;
+    if (keys.length !== 1 || keys[0] !== idColumn) throw new Error(`memory-schema-mismatch:${table}`);
+    this.db.exec(`ALTER TABLE ${table} RENAME TO ${table}_legacy`);
+    this.db.exec(`CREATE TABLE ${table}(${table === 'places'
+      ? 'place_id TEXT NOT NULL, context TEXT NOT NULL, status TEXT NOT NULL, last_verified_at TEXT, payload_json TEXT NOT NULL'
+      : 'episode_id TEXT NOT NULL, context TEXT NOT NULL, event_refs_json TEXT NOT NULL, summary_json TEXT NOT NULL'}, PRIMARY KEY(${idColumn}, context))`);
+    const target = table === 'places' ? 'place_id,context,status,last_verified_at,payload_json' : 'episode_id,context,event_refs_json,summary_json';
+    this.db.exec(`INSERT INTO ${table}(${target}) SELECT ${target} FROM ${table}_legacy`);
+    this.db.exec(`DROP TABLE ${table}_legacy`);
   }
 }

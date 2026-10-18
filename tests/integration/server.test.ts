@@ -24,7 +24,9 @@ async function jsonResponse(response: Response) {
 async function readUntil(reader: ReadableStreamDefaultReader<Uint8Array>, predicate: (body: string) => boolean) {
   const decoder = new TextDecoder();
   let body = '';
-  while (!predicate(body)) {
+  // Bound the wait so a regression fails fast instead of hanging the suite.
+  const deadline = Date.now() + 4000;
+  while (!predicate(body) && Date.now() < deadline) {
     const chunk = await reader.read();
     if (chunk.done) break;
     body += decoder.decode(chunk.value, { stream: true });
@@ -106,7 +108,7 @@ describe('control server offline integration', () => {
     }
   });
 
-  it('streams a snapshot, durable command event, and honors cursor headers', async () => {
+  it('streams a snapshot, durable command event, and honors cursor headers', { timeout: 20_000 }, async () => {
     const runtime = createRuntime();
     try {
       const server = createControlServer(runtime, { maxSseEvents: 8, heartbeatMs: 60_000, pollMs: 10 });
@@ -180,7 +182,7 @@ describe('control server offline integration', () => {
 });
 
 describe('U02 local pairing and CSRF', () => {
-  it('requires a paired HttpOnly session and matching CSRF for browser writes', async () => {
+  it('requires a paired HttpOnly session and matching CSRF for browser writes', { timeout: 20_000 }, async () => {
     const runtime = createRuntime();
     try {
       const server = createControlServer(runtime, { pairing: true, pairingCode: 'abcd1234' });

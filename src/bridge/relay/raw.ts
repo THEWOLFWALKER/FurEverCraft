@@ -32,6 +32,12 @@ class Session implements RelaySession {
   constructor(readonly client:Socket, readonly server:Socket, private readonly config:{targetHost:string;targetPort:number;rewriteHandshake:boolean;handshakeLimitBytes:number;handshakeTimeoutMs:number;allowedNextStates:Set<number>;budgets:RelayBudgets}, private readonly onClosed:()=>void){ this.stats.state='handshaking'; this.state='handshaking'; this.install(); }
   metrics(){return {...this.stats,queuedBytes:{...this.stats.queuedBytes},forwardedBytes:{...this.stats.forwardedBytes},undeliveredBytes:{...this.stats.undeliveredBytes}};}
   private install(){ let first=Buffer.alloc(0); let handshakeDone=!this.config.rewriteHandshake; let handshakeTimer:ReturnType<typeof setTimeout>|undefined;
+    // FEC-381: the upstream socket may not be writable yet. Client bytes are buffered until
+    // 'connect' and only released afterwards; a connect error closes the whole session.
+    let upstreamConnected=false; const upstreamPending:Buffer[]=[]; let upstreamPendingBytes=0;
+    const releaseUpstream=()=>{ if(this.closed)return; upstreamConnected=true; const pending=Buffer.concat(upstreamPending); upstreamPending.length=0; upstreamPendingBytes=0; if(pending.length){ this.stats.forwardedBytes['client-to-server']+=pending.length; this.server.write(pending); } };
+    const queueForUpstream=(chunk:Buffer)=>{ upstreamPending.push(Buffer.from(chunk)); upstreamPendingBytes+=chunk.length; if(upstreamPendingBytes>this.config.budgets.hardLimitBytes){void this.close('client-to-server-hard-limit');} };
+    this.server.once('connect',releaseUpstream);
     if(handshakeDone){ this.state='forwarding'; this.stats.state='forwarding'; }
     if(!handshakeDone) handshakeTimer=setTimeout(()=>void this.close('handshake-timeout'),this.config.handshakeTimeoutMs);
     const clientDir:RelayDirection='client-to-server'; const serverDir:RelayDirection='server-to-client';
@@ -41,20 +47,25 @@ class Session implements RelaySession {
     const accounted=new Set<Socket>();
     const settle=(socket:Socket)=>{ if(accounted.has(socket))return false; accounted.add(socket); return true; };
     const forward=(dest:Socket,source:Socket,chunk:Buffer,dir:RelayDirection)=>{
-      const queued=dest.writableLength; if(queued+chunk.length>this.config.budgets.hardLimitBytes){ void this.close(`${dir}-hard-limit`); return; }
+      if(dir===clientDir&&!upstreamConnected){ queueForUpstream(chunk); return; }
       this.stats.forwardedBytes[dir]+=chunk.length;
+      const queued=dest.writableLength; if(queued+chunk.length>this.config.budgets.hardLimitBytes){ void this.close(`${dir}-hard-limit`); return; }
       const ok=dest.write(chunk); this.stats.queuedBytes[dir]=dest.writableLength;
       if(!ok){ source.pause(); if(stalled[dir])clearTimeout(stalled[dir]); stalled[dir]=setTimeout(()=>void this.close(`${dir}-write-stall`),this.config.budgets.writeStallMs); }
     };
-    const onDrain=(source:Socket,dir:RelayDirection)=>()=>{ this.stats.queuedBytes[dir]=0; if(stalled[dir]){clearTimeout(stalled[dir]);stalled[dir]=undefined;} if(!this.closed&&source.isPaused())source.resume(); };
+    // The only reader ever paused by backpressure is the client (when client-to-server is stalled);
+    // resolving `source` here would capture the server from the last loop iteration.
+    const onDrain=(dir:RelayDirection)=>()=>{ this.stats.queuedBytes[dir]=0; if(stalled[dir]){clearTimeout(stalled[dir]);stalled[dir]=undefined;} if(!this.closed&&dir===clientDir&&this.client.isPaused())this.client.resume(); };
     const pair:Array<[Socket,Socket,RelayDirection]> = [[this.client,this.server,clientDir],[this.server,this.client,serverDir]];
-    for(const [source,dest,dir] of pair){ const other=dir===clientDir?serverDir:clientDir;
-      source.on('data',(chunk:Buffer)=>{ if(this.closed)return; if(source===this.client&&!handshakeDone){ first=Buffer.concat([first,chunk]); const parsed=readVarInt(first); if(parsed && parsed.value>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(first.length>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(!parsed||first.length<parsed.size+parsed.value)return; const frame=first.subarray(0,parsed.size+parsed.value); first=first.subarray(frame.length); try { const out=rewriteHandshake(frame,this.config.targetHost,this.config.targetPort,this.config.allowedNextStates); handshakeDone=true; if(handshakeTimer)clearTimeout(handshakeTimer); handshakeTimer=undefined; this.state='forwarding'; this.stats.state='forwarding'; forward(dest,source,out,dir); if(first.length){ forward(dest,source,first,dir); first=Buffer.alloc(0); } } catch { void this.close('handshake-rewrite-failed'); } return; }
+    for(const [source,dest,dir] of pair){
+      source.on('data',(chunk:Buffer)=>{ if(this.closed)return; if(source===this.client&&!handshakeDone){ first=Buffer.concat([first,chunk]); const parsed=readVarInt(first); if(parsed && parsed.value>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(first.length>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(!parsed||first.length<parsed.size+parsed.value)return; const frame=Buffer.from(first.subarray(0,parsed.size+parsed.value)); first=Buffer.from(first.subarray(frame.length)); try { const out=rewriteHandshake(frame,this.config.targetHost,this.config.targetPort,this.config.allowedNextStates); handshakeDone=true; if(handshakeTimer)clearTimeout(handshakeTimer); handshakeTimer=undefined; this.state='forwarding'; this.stats.state='forwarding'; forward(dest,source,out,dir); if(first.length){ forward(dest,source,first,dir); first=Buffer.alloc(0); } } catch { void this.close('handshake-rewrite-failed'); } return; }
         forward(dest,source,chunk,dir); });
-      dest.on('drain',onDrain(source,dir));
-      source.on('end',()=>{ if(this.closed)return; if(!settle(source))return; if(this.state!=='closing'){this.state='half-closed';this.stats.state='half-closed';} dest.end(); if(accounted.size>=2) void this.close('closed'); });
+      dest.on('drain',onDrain(dir));
+      source.on('end',()=>{ if(this.closed)return; if(!settle(source))return; if(source===this.client&&!upstreamConnected){ if(upstreamPendingBytes>0)releaseUpstream(); void this.close('upstream-not-connected'); return; } if(this.state!=='closing'){this.state='half-closed';this.stats.state='half-closed';} dest.end(); if(accounted.size>=2) void this.close('closed'); });
       source.on('close',()=>{ if(this.closed)return; if(!settle(source))return; if(accounted.size>=2) void this.close('closed'); });
       source.on('error',()=>void this.close(`${dir}-source-error`)); dest.on('error',()=>void this.close(`${dir}-destination-error`));
+      // FEC-381: a failed upstream connect must terminate the session, not leave the client attached.
+      if(dest===this.server) dest.on('close',()=>{ if(!upstreamConnected&&!this.closed)void this.close('upstream-connect-failed'); });
     }
   }
   async close(reason='closed'){ if(this.finishing)return this.finishing; this.finishing=this.doClose(reason); return this.finishing; }

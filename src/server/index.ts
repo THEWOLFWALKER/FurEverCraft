@@ -42,9 +42,16 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
   } : undefined;
 
   const isLoopback = (request: FastifyRequest) => {
-    const source = request.ip;
+    // Decide from the TCP peer, never from client-settable forwarding headers. request.ip can be
+    // rewritten by a future trustProxy setting, so the raw socket address is the authority.
+    const source = request.socket.remoteAddress;
     return source === '127.0.0.1' || source === '::1' || source === '::ffff:127.0.0.1';
   };
+  const hasBearer = (request: FastifyRequest) => {
+    const auth = request.headers.authorization;
+    return Boolean(auth && options.cliBearer && safeEqual(auth.replace(/^Bearer /, ''), options.cliBearer));
+  };
+
   const originOk = (request: FastifyRequest, reply: FastifyReply) => {
     const origin = request.headers.origin;
     if (!origin) return true;
@@ -58,33 +65,37 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     const entry = pairing.sessions.get(cookie);
     return entry && entry.expiresAt > Date.now() ? entry : undefined;
   };
-  const hasSession = (request: FastifyRequest) => Boolean(sessionOf(request));
-  const authorizeWrite = (request: FastifyRequest, reply: FastifyReply): boolean => {
+  const authorizeRequest = (request: FastifyRequest, reply: FastifyReply): boolean => {
     if (!isLoopback(request)) { void reply.code(403).send({ error: { code: 'non-loopback-denied' } }); return false; }
     if (!originOk(request, reply)) return false;
-    const auth = request.headers.authorization;
-    if (auth && options.cliBearer && safeEqual(auth.replace(/^Bearer /, ''), options.cliBearer)) return true;
+    if (hasBearer(request)) return true;
+    // Default simulated local use stays open; pairing, when enabled, guards every API read too.
     if (!pairing) return true;
-    const origin = request.headers.origin;
-    if (!origin) { void reply.code(401).send({ error: { code: 'pairing-session-required' } }); return false; }
-    const session = sessionOf(request);
-    if (!session) { void reply.code(401).send({ error: { code: 'pairing-session-required' } }); return false; }
+    if (!sessionOf(request)) { void reply.code(401).send({ error: { code: 'pairing-session-required' } }); return false; }
+    return true;
+  };
+  const authorizeWrite = (request: FastifyRequest, reply: FastifyReply): boolean => {
+    if (!authorizeRequest(request, reply)) return false;
+    if (!pairing || hasBearer(request)) return true;
+    // Browser writes additionally require same-origin and a CSRF token bound to the session.
+    if (!request.headers.origin) { void reply.code(401).send({ error: { code: 'pairing-session-required' } }); return false; }
+    const session = sessionOf(request)!;
     const csrf = request.headers['x-csrf-token'];
     if (typeof csrf !== 'string' || !safeEqual(csrf, session.csrf)) { void reply.code(403).send({ error: { code: 'csrf-failed' } }); return false; }
     return true;
   };
-
-  app.get('/api/v1/status', async () => control.status());
-  app.get('/api/v1/capabilities', async () => control.capabilities());
-  app.get('/api/v1/goals', async () => control.goals());
-  app.get('/api/v1/tasks', async () => control.goals());
-  app.get('/api/v1/executions', async () => control.executions());
-  app.get('/api/v1/effects', async request => control.effects((request.query as { executionId?: string }).executionId));
-  app.get('/api/v1/places', async () => control.places());
-  app.get('/api/v1/memories', async () => ({ places: control.places(), episodes: runtime?.store.listEpisodes() ?? [] }));
-  app.get('/api/v1/provider', async () => control.provider());
-  app.get('/api/v1/config', async () => redact({ provider: control.provider(), profile: control.capabilities().profile }));
+  app.get('/api/v1/status', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.status(); });
+  app.get('/api/v1/capabilities', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.capabilities(); });
+  app.get('/api/v1/goals', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.goals(); });
+  app.get('/api/v1/tasks', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.goals(); });
+  app.get('/api/v1/executions', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.executions(); });
+  app.get('/api/v1/effects', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.effects((request.query as { executionId?: string }).executionId); });
+  app.get('/api/v1/places', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.places(); });
+  app.get('/api/v1/memories', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return { places: control.places(), episodes: runtime?.store.listEpisodes() ?? [] }; });
+  app.get('/api/v1/provider', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.provider(); });
+  app.get('/api/v1/config', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact({ provider: control.provider(), profile: control.capabilities().profile }); });
   app.get('/api/v1/events', async (request, reply) => {
+    if (!authorizeRequest(request, reply)) return reply;
     const query = request.query as { cursor?: string; limit?: string; filter?: string };
     try { return control.events(query.cursor ?? '0', Number(query.limit ?? 100), query.filter); }
     catch { return reply.code(400).send({ error: { code: 'invalid-event-cursor' } }); }
@@ -122,6 +133,7 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
   app.get('/api/v1/events/stream', streamHandler);
   app.get('/events', streamHandler);
   async function streamHandler(request: FastifyRequest, reply: FastifyReply) {
+    if (!authorizeRequest(request, reply)) return reply;
     const header = request.headers['last-event-id'];
     const query = request.query as { cursor?: string };
     const cursor = Array.isArray(header) ? header[0] : header ?? query.cursor ?? '0';
@@ -140,16 +152,32 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
       if (sent >= maxEvents || bytes + size > maxBytes) { finish(); return false; }
       raw.write(frame); sent += 1; bytes += size; return true;
     };
-    const initial = control.events(position, maxEvents);
-    const watermark = initial.events.length ? initial.next : position;
+    // A reconnecting client (or a gap) must not observe a state that predates the events it will not
+    // receive: rewind to the oldest retained sequence and read up to the watermark so the snapshot
+    // and the cursor agree.
+    const reconnecting = position !== '0';
+    const availableFrom = Math.max(0, Number(control.events(position, 1).availableFrom));
+    const floor = reconnecting && availableFrom < 1e15 ? Math.min(Number(position), availableFrom) : Number(position);
+    const initial = control.events(String(floor), maxEvents);
+    const watermark = initial.events.length ? initial.next : String(floor);
     if (initial.gap) emit('gap', { gap: true, availableFrom: initial.availableFrom, cursor: initial.scannedCursor }, initial.scannedCursor);
-    emit('snapshot', { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor: watermark, gap: initial.gap }, watermark);
+    const snapshot = (cursorValue: string, gap: boolean, windowed: boolean) => ({ ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor: cursorValue, gap, ...(windowed ? { windowed: true } : {}) });
+    emit('snapshot', snapshot(watermark, initial.gap, initial.events.length === maxEvents), watermark);
+    // Deliver every durable event up to the watermark that the snapshot may not reflect, in order.
+    for (const event of initial.events) { if (!emit(event.kind, event.payload, event.seq)) return; }
     position = watermark;
     const poll = setInterval(() => {
       if (closed) return;
       try {
-        const read = control.events(position, Math.min(256, maxEvents - sent));
-        if (read.gap) { emit('gap', { gap: true, availableFrom: read.availableFrom, cursor: read.scannedCursor }, read.scannedCursor); emit('snapshot', { ...control.status(), cursor: read.scannedCursor, gap: true }, read.scannedCursor); position = read.scannedCursor; return; }
+        const read = control.events(position, Math.max(1, Math.min(256, maxEvents - sent)));
+        if (read.gap) {
+          // The snapshot at the new cursor already contains every domain collection, so the
+          // subscriber never resumes from a partial status document.
+          emit('gap', { gap: true, availableFrom: read.availableFrom, cursor: read.scannedCursor }, read.scannedCursor);
+          emit('snapshot', snapshot(read.scannedCursor, true, false), read.scannedCursor);
+          position = read.scannedCursor;
+          return;
+        }
         for (const event of read.events) { if (!emit(event.kind, event.payload, event.seq)) return; position = event.seq; }
       } catch { finish(); }
     }, options.pollMs ?? 250);

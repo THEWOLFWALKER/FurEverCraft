@@ -62,3 +62,54 @@ describe('FEC-481 delta merge', () => {
     expect(partial.cells['0,0']).toBe('blocked');
   });
 });
+
+describe('FEC-491/492 invalidate scope', () => {
+  const ctx = { serverProfileId:'simulated', worldGenerationId:'world-1', connectionEpoch:'1', bodyEpoch:'1', dimension:'overworld' } as const;
+  it('marks every known cell unknown on the default cells scope', () => {
+    const bridge = new FakeClientBridge(4); const state = new WorldState(ctx);
+    bridge.block(1, 1); bridge.block(2, 2);
+    const full = state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '1', sourceEpoch: bridge.sessionEpoch, ttl: 100, baseline: 'full' });
+    expect(full.cells['1,1']).toBe('blocked'); expect(full.cells['0,0']).toBe('free');
+    const out = state.invalidate();
+    expect(out.gap).toBe(true); expect(out.freshness).toBe('unknown');
+    expect(Object.keys(out.cells).length).toBeGreaterThan(0);
+    expect(Object.values(out.cells).every(cell => cell === 'unknown')).toBe(true);
+    expect(state.snapshot().cells['1,1']).toBe('unknown');
+    expect(Object.values(out.fields).every(field => field.available === false)).toBe(true);
+    // Deltas that arrive while the gap is sticky keep every known key unknown.
+    const delta = state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '2', sourceEpoch: bridge.sessionEpoch, ttl: 100 });
+    expect(delta.gap).toBe(true);
+    expect(delta.cells['2,2']).toBe('unknown'); expect(delta.cells['0,0']).toBe('unknown');
+  });
+  it('treats an explicit cells scope the same as all', () => {
+    const bridge = new FakeClientBridge(4); const state = new WorldState(ctx);
+    state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '1', sourceEpoch: bridge.sessionEpoch, ttl: 100, baseline: 'full' });
+    for (const scope of ['cells', 'all'] as const) {
+      expect(Object.values(state.invalidate('manual', scope).cells).every(cell => cell === 'unknown')).toBe(true);
+    }
+  });
+  it('invalidates cells when a delta arrives for a new source epoch', () => {
+    const bridge = new FakeClientBridge(4); const state = new WorldState(ctx);
+    state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '1', sourceEpoch: bridge.sessionEpoch, ttl: 100, baseline: 'full' });
+    bridge.disconnect();
+    const out = state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '1', sourceEpoch: bridge.sessionEpoch, ttl: 100 });
+    expect(out.gap).toBe(true);
+    expect(Object.values(out.cells).every(cell => cell === 'unknown')).toBe(true);
+  });
+});
+
+describe('FEC-497 observation sequence contract errors', () => {
+  const ctx = { serverProfileId:'simulated', worldGenerationId:'world-1', connectionEpoch:'1', bodyEpoch:'1', dimension:'overworld' } as const;
+  it.each(['abc', '1.5', '-1', '', ' 1', '1e3', '0x10', '12a', '  ', '١'])('rejects the invalid sequence %j as invalid-observation-sequence', (sequence) => {
+    const bridge = new FakeClientBridge(4); const state = new WorldState(ctx);
+    state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '5', sourceEpoch: bridge.sessionEpoch, ttl: 100, baseline: 'full' });
+    let error: unknown;
+    try { state.apply({ ...bridge.snapshot(), observedAt: 0, sequence, sourceEpoch: bridge.sessionEpoch, ttl: 100 }); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe('invalid-observation-sequence');
+    expect((error as Error).name).not.toBe('SyntaxError');
+    // The rejected observation does not advance the accepted sequence.
+    expect(state.snapshot().gap).toBe(false);
+    expect(() => state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '6', sourceEpoch: bridge.sessionEpoch, ttl: 100, baseline: 'full' })).not.toThrow();
+  });
+});

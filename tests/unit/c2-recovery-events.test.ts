@@ -97,7 +97,100 @@ describe('C2 receipt and effect recovery contracts', () => {
     const bridge = new FakeClientBridge(12, { context: { ...context, connectionEpoch: '2' } });
     bridge.block(1, 0);
     const result = new SessionRuntime(bridge, store).start();
+    // The effect belongs to a previous connection epoch: it is left untouched, never re-attributed.
+    expect(result.reconciled).toEqual([]);
+    expect(store.getEffect('effect-c2')).toMatchObject({ status: 'may-have-dispatched', context });
+    expect(store.getEffect('effect-c2')?.evidence).toBeUndefined();
+    expect(store.pendingEffects()).toHaveLength(1);
+    store.close();
+    cleanup(file);
+  });
+
+  it('does not reconcile pending effects of another world or account (FEC-233)', () => {
+    const file = tempDb();
+    const store = new SQLiteStore(file);
+    store.saveExecution({ executionId: 'execution-other', proposalId: 'proposal-other', proposalHash: 'hash-other', goalId: 'goal-other', skillId: 'place_one', skillVersion: '1.0.0', status: 'running' });
+    store.saveExecution({ executionId: 'execution-c2', proposalId: 'proposal-c2', proposalHash: 'hash-c2', goalId: 'goal-c2', skillId: 'place_one', skillVersion: '1.0.0', status: 'running' });
+    const otherWorld = { ...context, worldGenerationId: 'world-other' };
+    const otherAccount = { ...context, bodyEpoch: '9' };
+    store.addEffect({ effectId: 'effect-other-world', executionId: 'execution-other', context: otherWorld, status: 'may-have-dispatched', intent: { kind: 'place', x: 1, y: 0 } });
+    store.addEffect({ effectId: 'effect-other-account', executionId: 'execution-other', context: otherAccount, status: 'verifying', intent: { kind: 'place', x: 1, y: 0 } });
+    store.addEffect({ effectId: 'effect-c2', executionId: 'execution-c2', context, status: 'may-have-dispatched', intent: { kind: 'place', x: 1, y: 0 } });
+    const bridge = new FakeClientBridge(12, { context });
+    bridge.block(1, 0);
+
+    const result = new SessionRuntime(bridge, store).start();
+    expect(result.reconciled).toEqual([{ effectId: 'effect-c2', status: 'confirmed' }]);
+    // Other scopes are left pending and untouched, with no recovery evidence written.
+    for (const id of ['effect-other-world', 'effect-other-account']) {
+      expect(store.getEffect(id)).toMatchObject({ status: id === 'effect-other-account' ? 'verifying' : 'may-have-dispatched' });
+      expect(store.getEffect(id)?.evidence).toBeUndefined();
+    }
+    expect(store.pendingEffects().map(effect => effect.effectId)).toEqual(['effect-other-account', 'effect-other-world']);
+
+    // Their own session can still reconcile them against its own snapshot.
+    const otherBridge = new FakeClientBridge(12, { context: otherWorld });
+    otherBridge.block(1, 0);
+    const other = new SessionRuntime(otherBridge, store).start();
+    expect(other.reconciled).toEqual([{ effectId: 'effect-other-world', status: 'confirmed' }]);
+    expect(store.getEffect('effect-other-account')).toMatchObject({ status: 'verifying' });
+    store.close();
+    cleanup(file);
+  });
+
+  it('does not confirm from a snapshot with a gap (FEC-235/237)', () => {
+    const file = tempDb();
+    seedPlaceEffect(file);
+    const store = new SQLiteStore(file);
+    const bridge = new FakeClientBridge(12, { context });
+    bridge.block(1, 0);
+    // The observer reports a sequence gap: the cells in this snapshot are not fresh evidence.
+    const original = bridge.snapshot.bind(bridge);
+    bridge.snapshot = () => original(true);
+    const result = new SessionRuntime(bridge, store).start();
     expect(result.reconciled).toEqual([{ effectId: 'effect-c2', status: 'ambiguous' }]);
+    expect(store.getEffect('effect-c2')).toMatchObject({ status: 'ambiguous', evidence: { error: 'snapshot-gap' } });
+    expect(store.pendingEffects()).toHaveLength(1);
+    store.close();
+    cleanup(file);
+  });
+
+  it.each([
+    ['available=false', (field: Record<string, unknown>) => ({ ...field, available: false })],
+    ['freshness=stale', (field: Record<string, unknown>) => ({ ...field, freshness: 'stale' })],
+    ['freshness=unknown', (field: Record<string, unknown>) => ({ ...field, freshness: 'unknown' })],
+  ])('does not confirm from a snapshot whose fields are not available (%s) (FEC-239)', (_label, corrupt) => {
+    const file = tempDb();
+    seedPlaceEffect(file);
+    const store = new SQLiteStore(file);
+    const bridge = new FakeClientBridge(12, { context });
+    bridge.block(1, 0);
+    const original = bridge.snapshot.bind(bridge);
+    bridge.snapshot = (gap = false) => {
+      const snapshot = original(gap);
+      const cells = corrupt({ ...snapshot.fields.cells }) as (typeof snapshot.fields)[string];
+      return { ...snapshot, fields: { ...snapshot.fields, cells } };
+    };
+    const result = new SessionRuntime(bridge, store).start();
+    expect(result.reconciled).toEqual([{ effectId: 'effect-c2', status: 'ambiguous' }]);
+    expect(store.getEffect('effect-c2')).toMatchObject({ status: 'ambiguous', evidence: { error: 'snapshot-stale', unavailableField: 'cells' } });
+    expect(store.pendingEffects()).toHaveLength(1);
+    store.close();
+    cleanup(file);
+  });
+
+  it('does not confirm from a snapshot without field evidence at all', () => {
+    const file = tempDb();
+    seedPlaceEffect(file);
+    const store = new SQLiteStore(file);
+    const bridge = new FakeClientBridge(12, { context });
+    bridge.block(1, 0);
+    const original = bridge.snapshot.bind(bridge);
+    // A snapshot that carries no per-field evidence cannot certify the cells are fresh.
+    bridge.snapshot = (gap = false) => ({ ...original(gap), fields: {} });
+    const result = new SessionRuntime(bridge, store).start();
+    expect(result.reconciled).toEqual([{ effectId: 'effect-c2', status: 'ambiguous' }]);
+    expect(store.getEffect('effect-c2')).toMatchObject({ status: 'ambiguous', evidence: { error: 'snapshot-unverified' } });
     expect(store.pendingEffects()).toHaveLength(1);
     store.close();
     cleanup(file);
