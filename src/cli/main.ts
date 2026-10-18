@@ -9,7 +9,7 @@ import { createRawTcpRelay } from '../bridge/relay/raw.js';
 import net from 'node:net';
 import { createRuntime } from '../execution/factory.js';
 import { redact } from '../diagnostics/redaction.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Server } from 'node:http';
@@ -20,7 +20,12 @@ export async function runDemo(db = process.env.MINECRAFT_AGENT_DB ?? '/tmp/minec
   const names = ['autonomous','obstruction','human-steering','chat-ui','crash-recovery','bridge-fixture'] as const;
   if (scenario && !names.includes(scenario as typeof names[number])) throw new Error(`unknown-scenario:${scenario}`);
   const selected = scenario ? [scenario as typeof names[number]] : [...names];
-  const results = selected.map(name => runScenario(name, db));
+  // Each scenario gets a freshly created database so repeated runs are deterministic.
+  const results = selected.map((name, index) => {
+    const scenarioDb = `${db}.${index}`;
+    for (const suffix of ['', '-wal', '-shm']) { try { rmSync(`${scenarioDb}${suffix}`, { force: true }); } catch { /* best effort */ } }
+    return runScenario(name, scenarioDb);
+  });
   console.log(JSON.stringify(redact({ simulated: true, scenarios: results, summary: { count: results.length, names: results.map(r => r.scenario) } })));
 }
 
@@ -28,11 +33,21 @@ type ScenarioName = 'autonomous'|'obstruction'|'human-steering'|'chat-ui'|'crash
 function runScenario(scenario: ScenarioName, db: string) {
   const store = new SQLiteStore(db); const bridge = new FakeClientBridge(); const runtime = new SessionRuntime(bridge, store); runtime.start();
   try {
-    if (scenario === 'autonomous') { const first = navigate(bridge, {x:2,y:0}); store.saveGoal({goalId:'goal_autonomous',revision:1,status:'completed',text:'autonomous navigation'}); const next = navigate(bridge,{x:3,y:0}); return {scenario,outcome:'completed',phases:['observe','navigate','milestone','next-task'],executionIds:[first.executionId,next.executionId],position:bridge.position}; }
+    if (scenario === 'autonomous') { const first = navigate(bridge, {x:2,y:0}); store.saveGoal({goalId:'goal_autonomous',revision:1,status:'active',text:'autonomous navigation'}); const next = navigate(bridge,{x:3,y:0}); const completed = first.status === 'succeeded' && next.status === 'succeeded'; if (completed) store.saveGoal({goalId:'goal_autonomous',revision:2,status:'completed',text:'autonomous navigation'}); return {scenario,outcome:completed?'completed':'failed',phases:['observe','navigate','milestone','next-task'],executionIds:[first.executionId,next.executionId],goal:store.getGoal('goal_autonomous')?.status,position:bridge.position}; }
     if (scenario === 'obstruction') { bridge.block(1,0); bridge.setUnknown(1,1); const result=navigate(bridge,{x:3,y:1},2); return {scenario,outcome:result.status,dynamicObstacle:true,unknownCell:true,replanned:result.path.length>0,budget:2,pathLength:result.path.length}; }
     if (scenario === 'human-steering') { const old=navigate(bridge,{x:4,y:0}); const revised=navigate(bridge,{x:0,y:2}); return {scenario,outcome:revised.status,oldExecution:old.executionId,oldResult:'superseded',steering:'target-revised',position:bridge.position}; }
     if (scenario === 'chat-ui') { const moved=navigate(bridge,{x:1,y:0}); const chat=sendChat({bridge,lease:{leaseId:'demo',owner:'demo',resources:['ui','textEntry'],until:Date.now()+1000,generation:1},report:()=>{}},'offline hello'); return {scenario,outcome:chat.outcome,navigation:moved.status,uiHandoff:['gameplay','chat','gameplay'],unknownMessageNotRetried:true}; }
-    if (scenario === 'crash-recovery') { bridge.position={x:1,y:0}; store.addEffect({effectId:'effect_demo',executionId:'execution_demo',context:bridge.context,status:'may-have-dispatched',intent:{kind:'place',x:2,y:0}}); const before=store.pendingEffects().length; store.close(); const reopened=new SQLiteStore(db); const restored=new SessionRuntime(new FakeClientBridge(),reopened).recover(); const after=reopened.pendingEffects().length; reopened.close(); return {scenario,outcome:'reconciled',pendingBefore:before,pendingAfter:after,reconciled:restored.reconciled}; }
+    if (scenario === 'crash-recovery') {
+      // A real execution row must exist before the effect FK; the crash window leaves the
+      // effect pending and a rebuilt runtime must reconcile it from evidence.
+      store.saveExecution({ executionId: 'execution_demo', proposalId: 'proposal_demo', proposalHash: 'demo', goalId: 'goal_demo', skillId: 'place_one', skillVersion: '1.0.0', status: 'running' });
+      bridge.position = { x: 1, y: 0 };
+      store.addEffect({ effectId: 'effect_demo', executionId: 'execution_demo', context: bridge.context, status: 'may-have-dispatched', intent: { kind: 'place', x: 2, y: 0 } });
+      const before = store.pendingEffects().length; store.close();
+      const reopened = new SQLiteStore(db); const restored = new SessionRuntime(new FakeClientBridge(), reopened).recover();
+      const after = reopened.pendingEffects().length; reopened.close();
+      return { scenario, outcome: 'reconciled', pendingBefore: before, pendingAfter: after, reconciled: restored.reconciled };
+    }
     const protocol=new ProtocolSession('fixture-session'); const observations:unknown[]=[]; const unsubscribe=protocol.subscribe(o=>observations.push(o)); protocol.transition('LOGIN'); protocol.transition('CONFIGURATION'); protocol.transition('PLAY'); protocol.observe('position','downstream',{x:1,y:0}); protocol.close(); unsubscribe(); return {scenario,outcome:'fixture-complete',phase:protocol.phase,observations:observations.length,syntheticCapture:true,input:'fake-transport',disconnectCleanup:true};
   } finally { if (scenario !== 'crash-recovery') store.close(); }
 }
