@@ -5,7 +5,7 @@ import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { Executor, type InputArbiter, type Progress } from '../execution/runtime.js';
 import { skillImplementations } from '../skills/skills.js';
-import { findSkills } from '../skills/registry.js';
+import { findSkills, skillManifests } from '../skills/registry.js';
 import type { EventHub } from '../diagnostics/events.js';
 import { redactError } from '../diagnostics/redaction.js';
 import { MemoryService } from '../autonomous/memory.js';
@@ -58,6 +58,18 @@ export class ToolRouter {
   private readonly memory?: MemoryService;
   constructor(private readonly bridge: ClientBridgeCapabilities, private readonly store?: SQLiteStore, private readonly events?: EventHub, executor?: Executor, memory?: MemoryService, private readonly clockNow: () => number = () => Date.now()) {
     if (store) { this.executor = executor ?? new Executor(bridge, store); this.memory = memory ?? new MemoryService(store); }
+  }
+  /** Skills the current body can actually run, derived from capability presence rather than a hard-coded list. */
+  availableSkills(): string[] {
+    const all = skillManifests.map(manifest => manifest.id as string);
+    return all.filter(id => {
+      if (id === 'look_at') return Boolean(this.bridge.lookAt);
+      if (id === 'dig_one') return Boolean(this.bridge.dig);
+      if (id === 'gather_blocks') return Boolean(this.bridge.digBlock && this.bridge.adjacentBlock);
+      if (id === 'collect_nearby') return Boolean(this.bridge.collectNearby);
+      if (id === 'return_to_place') return Boolean(this.bridge.findPlace);
+      return true;
+    });
   }
   async invoke(call: ToolCall): Promise<z.infer<typeof ToolCallResultSchema>> {
     let raw: unknown;

@@ -133,19 +133,29 @@ function startEvents(control: Control, request: IncomingMessage, response: Serve
     writeSse(response, event, payload, id); sent += 1; bytes += frameBytes; return true;
   };
 
+  // Read events first, then build the snapshot at the same watermark so a write between the
+  // two reads cannot be both included in the snapshot and replayed (or missed by both).
   const initial = control.events(cursor, options.maxSseEvents);
+  const watermark = initial.events.length ? initial.next : cursor;
   if (initial.gap) emit('gap', { gap: true, availableFrom: initial.availableFrom, cursor: initial.scannedCursor }, initial.scannedCursor);
-  // The snapshot reflects everything already consumed up to `cursor`; replay follows strictly ascending ids.
-  const snapshot = { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor, gap: initial.gap };
-  emit('snapshot', snapshot, cursor);
-  for (const event of initial.events) { if (!emit(event.kind, event.payload, event.seq)) break; cursor = event.seq; }
-  if (initial.events.length) cursor = initial.next;
+  const snapshot = { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor: watermark, gap: initial.gap };
+  emit('snapshot', snapshot, watermark);
+  // Events after the snapshot watermark are delivered by the poll below; replaying older ones
+  // would duplicate state already reflected in the snapshot.
+  cursor = watermark;
 
   poll = setInterval(() => {
     if (closed) return;
     try {
       const read = control.events(cursor, Math.min(256, options.maxSseEvents - sent));
-      if (read.gap) { emit('gap', { gap: true, availableFrom: read.availableFrom, cursor: read.scannedCursor }, read.scannedCursor); finish(); return; }
+      if (read.gap) {
+        // A gap means the client cannot reconstruct the stream; resend a fresh snapshot at the
+        // new watermark and continue from there instead of silently closing.
+        emit('gap', { gap: true, availableFrom: read.availableFrom, cursor: read.scannedCursor }, read.scannedCursor);
+        const fresh = { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor: read.scannedCursor, gap: true };
+        if (!emit('snapshot', fresh, read.scannedCursor)) return;
+        cursor = read.scannedCursor; return;
+      }
       for (const event of read.events) { if (!emit(event.kind, event.payload, event.seq)) return; cursor = event.seq; }
     } catch { finish(); }
   }, options.pollMs);

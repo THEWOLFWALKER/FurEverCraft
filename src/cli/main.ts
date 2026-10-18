@@ -45,7 +45,7 @@ const parseWords = (line: string) => {
   for (let match = pattern.exec(line); match; match = pattern.exec(line)) words.push(match[1] ?? match[2] ?? match[3] ?? '');
   return words;
 };
-const printJson = (output: NodeJS.WritableStream, value: unknown) => output.write(`${JSON.stringify(redact(value))}\\n`);
+const printJson = (output: NodeJS.WritableStream, value: unknown) => output.write(`${JSON.stringify(redact(value))}\n`);
 async function postCommand(baseUrl: string, command: string, payload: Record<string, unknown>, expectedRevision?: number) {
   const response = await fetch(`${baseUrl}/api/v1/commands`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: commandId(), command, payload, ...(expectedRevision === undefined ? {} : { expectedRevision }) }) });
   return { status: response.status, body: await response.json() };
@@ -87,7 +87,7 @@ export function main(argv = process.argv) {
   const program = new Command();
   program.name('minecraft-agent').option('--profile <profile>', 'profile', 'simulated').option('--db <path>', 'SQLite path');
   program.command('demo').option('--db <path>').option('--scenario <scenario>').action((options) => runDemo(options.db, options.scenario));
-  program.command('serve').option('--db <path>').option('--host <host>', 'bind host', '127.0.0.1').option('--port <port>', 'bind port', '0').action((options, command) => runServe({ ...options, profile: command.parent?.opts().profile }));
+  program.command('serve').option('--db <path>').option('--host <host>', 'bind host', '127.0.0.1').option('--port <port>', 'bind port', '3000').action((options, command) => runServe({ ...options, profile: command.parent?.opts().profile }));
   program.command('attach').requiredOption('--url <url>').action(options => runAttach(options.url));
   program.command('status').option('--db <path>').action((options, command) => { const db = options.db ?? command.parent?.opts().db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'; const runtime = new SessionRuntime(new FakeClientBridge(), new SQLiteStore(db)); try { console.log(JSON.stringify(redact({ simulated: true, status: runtime.store.listGoals().some(g => g.status === 'active') ? 'active' : 'idle', goals: runtime.store.listGoals(), executions: runtime.store.listExecutions() }))); } finally { runtime.store.close(); } });
   program.command('doctor').action((_, command) => { const profile = command.parent?.opts().profile ?? 'simulated'; const runtime = createRuntime({ profile }); try { console.log(JSON.stringify(redact({ profile, simulated: profile === 'simulated', network: 'disabled', credentials: 'not-required-offline', capabilities: { capture_view: 'synthetic-only' }, status: runtime.session.start() }))); } finally { runtime.close(); } });

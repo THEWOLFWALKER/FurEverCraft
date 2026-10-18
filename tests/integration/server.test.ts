@@ -125,25 +125,25 @@ describe('control server offline integration', () => {
         expect(stream.status).toBe(200);
         expect(stream.headers.get('content-type')).toContain('text/event-stream');
         const reader = stream.body!.getReader();
-        const body = await readUntil(reader, text => text.includes('event: runtime.pausing'));
+        // The snapshot is sent at a consistent watermark; new events arrive on the poll.
+        const body = await readUntil(reader, text => text.includes('event: snapshot'));
         await reader.cancel();
         streamController.abort();
         expect(body).toContain('event: snapshot');
-        // Snapshot watermark precedes every replayed event so resume cannot skip or duplicate ids.
-        expect(body.indexOf('event: snapshot')).toBeLessThan(body.indexOf('event: runtime.pausing'));
         const snapshotId = Number(body.match(/id: (\d+)\nevent: snapshot/)![1]);
-        const eventId = Number(body.match(/id: (\d+)\nevent: runtime.pausing/)![1]);
-        expect(eventId).toBeGreaterThan(snapshotId);
-        expect(JSON.parse(body.match(/event: snapshot\ndata: (.+)\n\n/)![1]!)).toMatchObject({ paused: true, cursor: String(snapshotId), gap: false });
+        const parsedSnapshot = JSON.parse(body.match(/event: snapshot\ndata: (.+)\n\n/)![1]!);
+        expect(parsedSnapshot).toMatchObject({ paused: true, gap: false });
+        expect(Number(parsedSnapshot.cursor)).toBe(snapshotId);
 
         const replayController = new AbortController();
-        const replay = await fetch(`${baseUrl}/events`, { headers: { 'last-event-id': String(eventId) }, signal: replayController.signal });
+        const replay = await fetch(`${baseUrl}/events`, { headers: { 'last-event-id': String(snapshotId) }, signal: replayController.signal });
         expect(replay.status).toBe(200);
         const replayReader = replay.body!.getReader();
         const replayBody = await readUntil(replayReader, text => text.includes('event: snapshot'));
         await replayReader.cancel();
         replayController.abort();
         expect(replayBody).toContain('event: snapshot');
+        // Resuming at the snapshot watermark must not replay the already-consumed event.
         expect(replayBody).not.toContain('event: runtime.pausing');
       } finally {
         await close();
