@@ -47,3 +47,18 @@ describe('W03 world state and fake bridge contracts', () => {
     bridge.configureFault('snapshot', { fault:'disconnect' }); expect(() => bridge.snapshot()).toThrow('bridge-disconnected'); expect(bridge.sessionEpoch).toBe('1:2');
   });
 });
+
+describe('FEC-481 delta merge', () => {
+  const ctx = { serverProfileId:'simulated', worldGenerationId:'world-1', connectionEpoch:'1', bodyEpoch:'1', dimension:'overworld' } as const;
+  it('merges a delta instead of deleting cells it did not mention', () => {
+    const bridge = new FakeClientBridge(); const state = new WorldState(ctx);
+    state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '1', sourceEpoch: bridge.sessionEpoch, ttl: 100, baseline: 'full' });
+    bridge.block(2, 2);
+    const delta = state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '2', sourceEpoch: bridge.sessionEpoch, ttl: 100 });
+    expect(delta.cells['2,2']).toBe('blocked');
+    // A partial delta touching one cell keeps the other known cells.
+    const partial = state.apply({ ...bridge.snapshot(), cells: { '0,0': 'blocked' }, observedAt: 0, sequence: '3', sourceEpoch: bridge.sessionEpoch, ttl: 100 });
+    expect(partial.cells['2,2']).toBe('blocked');
+    expect(partial.cells['0,0']).toBe('blocked');
+  });
+});

@@ -31,7 +31,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
   it('runs five skills with progress, cancellation, and verification outcomes', async () => {
     const bridge = new FakeClientBridge();
     const progress: string[] = [];
-    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: (p: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number }) => progress.push(p.stage) };
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: (p: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number }) => progress.push(p.stage) };
     expect(navigateTo(ctx, { x: 1, y: 0 }).outcome).toBe('confirmed');
     expect(observeUi(ctx).outcome).toBe('confirmed');
     expect(sendChat(ctx, 'hello').outcome).toBe('confirmed');
@@ -46,7 +46,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
 
   it('fails closed for the newer skills when the body cannot support them', async () => {
     const bridge = new FakeClientBridge();
-    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: () => {} };
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} };
     const noLook = new FakeClientBridge(); (noLook as unknown as { lookAt?: unknown }).lookAt = undefined;
     expect(lookAt({ ...ctx, bridge: noLook }, { x: 1, y: 0 }).reason).toContain('orientation-unavailable');
     const noDig = new FakeClientBridge(); noDig.block(1, 0); (noDig as unknown as { dig?: unknown }).dig = undefined;
@@ -61,7 +61,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
 
   it('collects and gathers in the simulated body when the capability exists', () => {
     const bridge = new FakeClientBridge();
-    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: () => {} };
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} };
     bridge.seedDrop(1, 0, 'stone');
     expect(collectNearby(ctx)).toMatchObject({ ok: true, outcome: 'confirmed' });
     bridge.block(0, 1, 'stone');
@@ -73,7 +73,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
   it('supports look_at, dig_one and return_to_place against the simulated body', () => {
     const bridge = new FakeClientBridge();
     const progress: string[] = [];
-    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: (p: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number }) => progress.push(p.stage) };
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: (p: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number }) => progress.push(p.stage) };
     expect(lookAt(ctx, { x: 0, y: 1 })).toMatchObject({ ok: true, outcome: 'confirmed' });
     bridge.block(1, 0);
     expect(digOne(ctx, { x: 1, y: 0 })).toMatchObject({ ok: true, outcome: 'confirmed' });
@@ -86,7 +86,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
 
   it('does not complete wait_for_condition before the clock deadline', async () => {
     const clock = new ManualClock();
-    const ctx = { bridge: new FakeClientBridge(), lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1 }, report: () => {}, clock };
+    const ctx = { bridge: new FakeClientBridge(), lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {}, clock };
     const pending = Promise.resolve(waitForCondition(ctx, 100));
     let settled = false; void pending.then(() => { settled = true; });
     await new Promise(r => setTimeout(r, 10));
@@ -118,5 +118,26 @@ describe('W05/W06 execution lifecycle and skills', () => {
     expect(execution.status).toBe('succeeded');
     expect(store.getExecution(execution.executionId)?.status).toBe('succeeded');
     store.close();
+  });
+});
+
+describe('FEC-182/FEC-183 lease fencing', () => {
+  it('invalidates leases after a connection/body epoch change', () => {
+    const clock = new ManualClock();
+    let epoch = '1:1';
+    const arbiter = new InputArbiter(() => clock.now(), () => epoch);
+    const lease = arbiter.acquire('a', ['movement'], 100);
+    expect(() => arbiter.validate(lease.leaseId, 'a')).not.toThrow();
+    epoch = '2:2';
+    expect(() => arbiter.validate(lease.leaseId, 'a')).toThrow('lease-invalid');
+  });
+  it('does not let a non-owner release a lease', () => {
+    const clock = new ManualClock();
+    const arbiter = new InputArbiter(() => clock.now());
+    const lease = arbiter.acquire('a', ['movement'], 100);
+    arbiter.release(lease.leaseId, 'b');
+    expect(() => arbiter.validate(lease.leaseId, 'a')).not.toThrow();
+    arbiter.release(lease.leaseId, 'a');
+    expect(() => arbiter.validate(lease.leaseId, 'a')).toThrow('lease-invalid');
   });
 });

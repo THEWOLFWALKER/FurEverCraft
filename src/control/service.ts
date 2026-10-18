@@ -33,7 +33,9 @@ export class ControlService {
 
   status() {
     const goal = this.runtime.store.listGoals().find(item => item.status === 'active' || item.status === 'paused');
-    return { state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state, paused: this.paused, stopping: this.stopping, goal, executions: this.runtime.store.listExecutions().length, context: this.runtime.bridge.context };
+    const snapshot = this.runtime.bridge.snapshot();
+    // Expose the observed cells so the top-down view reads real state instead of an absent field.
+    return { state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state, paused: this.paused, stopping: this.stopping, goal, executions: this.runtime.store.listExecutions().length, context: { ...this.runtime.bridge.context, cells: snapshot.cells }, position: snapshot.position, inventory: snapshot.inventory };
   }
   capabilities() {
     const bridge = this.runtime.bridge as { capabilities?: unknown };

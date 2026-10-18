@@ -3,7 +3,7 @@ import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { findSkill, type SkillId } from '../skills/registry.js';
 
-export type Lease = { leaseId: string; owner: string; resources: string[]; until: number; generation: number };
+export type Lease = { leaseId: string; owner: string; resources: string[]; until: number; generation: number; contextEpoch: string };
 export type ExecutionStage = 'prepare' | 'dispatch' | 'verify' | 'complete';
 export type Progress = { stage: ExecutionStage; completed: number; total?: number; message?: string; at: number };
 export type ExecutorOptions = { clock?: Clock; leaseTtl?: number; watchdogTtl?: number };
@@ -12,20 +12,21 @@ export class InputArbiter {
   private leases = new Map<string, Lease>();
   private resourceGeneration = new Map<string, number>();
   private generation = 0;
-  constructor(private readonly now: () => number = () => Date.now()) {}
+  constructor(private readonly now: () => number = () => Date.now(), private readonly contextEpoch: () => string = () => '') {}
   acquire(owner: string, resources: string[], ttl = 1000): Lease {
     this.releaseExpired();
     const unique = [...new Set(resources)];
     for (const lease of this.leases.values()) {
       if (lease.resources.some(r => unique.includes(r))) throw new Error('resource-busy');
     }
-    const lease = { leaseId: nextId('lease'), owner, resources: unique, until: this.now() + ttl, generation: ++this.generation };
+    const lease = { leaseId: nextId('lease'), owner, resources: unique, until: this.now() + ttl, generation: ++this.generation, contextEpoch: this.contextEpoch() };
     this.leases.set(lease.leaseId, lease);
     return lease;
   }
   validate(leaseId: string, owner: string): Lease {
     const lease = this.leases.get(leaseId);
-    if (!lease || lease.owner !== owner || lease.until <= this.now() || lease.resources.some(r => (this.resourceGeneration.get(r) ?? 0) > lease.generation)) throw new Error('lease-invalid');
+    // A reconnect to a different body/world invalidates every prior lease.
+    if (!lease || lease.owner !== owner || lease.until <= this.now() || lease.contextEpoch !== this.contextEpoch() || lease.resources.some(r => (this.resourceGeneration.get(r) ?? 0) > lease.generation)) throw new Error('lease-invalid');
     return lease;
   }
   renew(leaseId: string, owner: string, ttl: number): Lease {
@@ -33,7 +34,8 @@ export class InputArbiter {
     lease.until = this.now() + ttl;
     return lease;
   }
-  release(leaseId: string) { this.leases.delete(leaseId); }
+  /** Only the lease owner may release it; a stale finalizer must not drop a new owner's lease. */
+  release(leaseId: string, owner?: string) { const lease = this.leases.get(leaseId); if (!lease) return; if (owner !== undefined && lease.owner !== owner) return; this.leases.delete(leaseId); }
   preempt(owner: string) {
     for (const [id, lease] of this.leases) {
       if (lease.owner !== owner) {
@@ -97,7 +99,7 @@ export class Executor {
       active.watchdog = this.clock.schedule(this.clock.now() + this.watchdogTtl, () => {
         // Timeout must abort the in-flight work, not just flip a flag: the skill keeps
         // performing writes otherwise and the released lease could be re-acquired.
-        if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; active.controller.abort(); execution.status = 'failed'; execution.outcome = 'unknown'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); }
+        if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; active.controller.abort(); execution.status = 'failed'; execution.outcome = 'unknown'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId, execution.executionId); this.active.delete(execution.executionId); }
       });
     };
     const report = (p: Omit<Progress, 'at'>) => {
@@ -136,7 +138,7 @@ export class Executor {
     } finally {
       if (active.watchdog) this.clock.cancel(active.watchdog);
       if (this.active.get(execution.executionId)?.token === active.token) {
-        this.arbiter.release(lease.leaseId); this.active.delete(execution.executionId); this.store.saveExecution(execution);
+        this.arbiter.release(lease.leaseId, execution.executionId); this.active.delete(execution.executionId); this.store.saveExecution(execution);
       }
     }
     return execution;
@@ -153,7 +155,7 @@ export class Executor {
     return this.store.getExecution(executionId);
   }
   progress(executionId: string) { return this.progressByExecution.get(executionId); }
-  watchdog(executionId: string) { const active = this.active.get(executionId); if (active) { active.canceled = true; active.controller.abort(); this.arbiter.release(active.lease.leaseId); this.active.delete(executionId); this.store.updateExecutionStatus?.(executionId, 'failed', 'watchdog-timeout'); } }
+  watchdog(executionId: string) { const active = this.active.get(executionId); if (active) { active.canceled = true; active.controller.abort(); this.arbiter.release(active.lease.leaseId, executionId); this.active.delete(executionId); this.store.updateExecutionStatus?.(executionId, 'failed', 'watchdog-timeout'); } }
   /** Reconcile an effect result without ever promoting an unknown outcome to success. */
   reconcile(executionId: string, outcome: 'confirmed' | 'partial' | 'ambiguous') {
     const status = outcome === 'confirmed' ? 'succeeded' : outcome === 'partial' ? 'suspended' : 'failed';

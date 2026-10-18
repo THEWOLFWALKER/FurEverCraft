@@ -42,7 +42,7 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
   if (lockKey) activeRuntimes.add(lockKey);
   const clock = options.clock ?? (profile === 'simulated' ? new ManualClock() : new SystemClock());
   const session = new SessionRuntime(bridge, store);
-  const arbiter = new InputArbiter(() => clock.now());
+  const arbiter = new InputArbiter(() => clock.now(), () => `${bridge.context.connectionEpoch}:${bridge.context.bodyEpoch}:${bridge.context.worldGenerationId}`);
   const executor = new Executor(bridge, store, arbiter, { clock });
   const provider = options.provider ?? createProvider(options);
   const router = new ToolRouter(bridge, store, session.events, executor, new MemoryService(store), () => clock.now());
