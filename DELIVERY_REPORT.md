@@ -42,7 +42,7 @@ A substantial offline implementation of the v0.2 batch exists and is verified on
 npm run typecheck            pass
 npm run build                pass
 npm run build:web            pass
-npm run test:offline         24 files / 112 tests pass
+npm run test:offline         25 files / 124 tests pass
 npm run test:v:offline       integration (incl. forked relay child) + soak + trace pass
 npm run demo:offline         6 scenarios pass
 npm run demo:autonomy        pass
@@ -52,6 +52,15 @@ npm run test:web             web typecheck + vite build pass
 ```
 
 Loopback smoke: `serve` served the built UI (200 text/html), `/api/v1/status` returned running, `goal.set` returned terminal, and the JS asset loaded (200).
+
+## Additional convergence work (post-review)
+
+- Control server migrated to **Fastify** with one-time local pairing (5-minute code, single use), HttpOnly/SameSite session cookie, CSRF token, loopback/Host/Origin checks, and CLI bearer support.
+- Five-area React console: Overview, Conversation, Tasks, World (Canvas top-down view), Settings/Diagnostics, plus a live event stream.
+- Fail-closed 26.3 codec gate: `assertSupportedProfile` refuses when the pinned dependency lacks 26.3 data, and the summary reports `26.3-codec-data-unavailable`.
+- Trace export/replay CLI (`trace:export`, `trace:replay`).
+- S01–S14 acceptance-mapped integration suite and U04 concurrency tests (identical requestId once, stale CAS conflict).
+- Recovery now attributes a placement only when the effect had actually been dispatched; a blocked cell alone is ambiguous.
 
 ## Review passes performed
 
