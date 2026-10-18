@@ -9,12 +9,13 @@ import { createRawTcpRelay } from '../bridge/relay/raw.js';
 import net from 'node:net';
 import { createRuntime } from '../execution/factory.js';
 import { redact } from '../diagnostics/redaction.js';
-import { readFileSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Server } from 'node:http';
 import { getGameVersionProfile, versionProfileSummary } from '../bridge/version-profile.js';
 import { createControlServer } from '../server/index.js';
+import { TraceRecorder, replayTrace } from '../diagnostics/trace.js';
 
 export async function runDemo(db = process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent-phase2-demo.sqlite', scenario?: string) {
   const names = ['autonomous','obstruction','human-steering','chat-ui','crash-recovery','bridge-fixture'] as const;
@@ -113,6 +114,8 @@ export function main(argv = process.argv) {
   });
   program.command('goal:revise').requiredOption('--id <goalId>').requiredOption('--revision <revision>').requiredOption('--change <change>').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(redact(store.reviseGoal(options.id, Number(options.revision), options.change)))); } finally { store.close(); } });
   program.command('events').option('--cursor <cursor>', 'cursor', '0').option('--limit <limit>', '100').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(new SessionRuntime(new FakeClientBridge(), store).events.read(options.cursor, Number(options.limit)))); } finally { store.close(); } });
+  program.command('trace:export').option('--db <path>').option('--out <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { const recorder = new TraceRecorder(); recorder.appendRead(new SessionRuntime(new FakeClientBridge(), store).events.read('0', 10000)); const document = recorder.export(); if (options.out) { writeFileSync(options.out, JSON.stringify(document)); console.log(JSON.stringify({ written: options.out, records: document.records.length })); } else console.log(JSON.stringify(document)); } finally { store.close(); } });
+  program.command('trace:replay').requiredOption('--file <path>').action((options) => { const document = JSON.parse(readFileSync(options.file, 'utf8')) as ReturnType<TraceRecorder['export']>; const result = replayTrace(document); console.log(JSON.stringify(redact(result))); });
   program.action(() => runDemo(program.opts().db));
   return program.parseAsync(argv);
 }
