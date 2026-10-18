@@ -62,8 +62,8 @@ describe('V01 S01-S14 acceptance-mapped offline scenarios', () => {
         expect(recovery.reconciled.every(item => ['ambiguous', 'confirmed'].includes(item.status))).toBe(true);
         // The ambiguous dispatch applied exactly once; recovery must not decrement again.
         expect(bridge.inventory).toBe(7);
-        expect(recovery.reconciled.length).toBeGreaterThan(0);
-        expect(bridge.inventory).toBe(7);
+        const ambiguous = recovery.reconciled.filter(item => item.status === 'ambiguous');
+        expect(ambiguous.length).toBeGreaterThan(0);
       } finally { reopened.close(); }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -81,9 +81,12 @@ describe('V01 S01-S14 acceptance-mapped offline scenarios', () => {
     const observer = new BoundedObserver({ maxQueuedFrames: 1 });
     const gaps: string[] = [];
     observer.subscribe(event => { if (event.kind === 'observer_gap') gaps.push(event.gap.reason); });
+    // Six single-byte frames with a one-frame queue: overflow must produce an explicit gap,
+    // and the observer receives frames without throwing into the forwarding path.
     observer.attach('client-to-server', new Uint8Array([1, 1, 1, 1, 1, 1]));
-    await new Promise(resolve => setTimeout(resolve, 20));
-    expect(gaps.length + 1).toBeGreaterThan(0);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(gaps.length).toBeGreaterThan(0);
+    expect(gaps.every(reason => typeof reason === 'string')).toBe(true);
     await observer.stop();
   });
 
@@ -100,5 +103,30 @@ describe('V01 S01-S14 acceptance-mapped offline scenarios', () => {
         expect(reopened.store.listGoals()).toHaveLength(1);
       } finally { reopened.close(); }
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('U04 concurrent CLI/Web operations', () => {
+  it('executes a concurrent identical requestId exactly once', async () => {
+    const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }, { text: 'ok', stopReason: 'end_turn' }]) });
+    try {
+      const request = { requestId: 'dup-1', command: 'goal.set' as const, payload: { goalId: 'dup', text: 'only once' } };
+      const [a, b] = await Promise.all([runtime.control.command(request), runtime.control.command(request)]);
+      const states = [a.state, b.state].sort();
+      // One caller actually executes; the other observes the in-flight/terminal outcome.
+      expect(states).toContain('terminal');
+      expect(runtime.store.listGoals().filter(goal => goal.goal_id === 'dup')).toHaveLength(1);
+    } finally { runtime.close(); }
+  });
+
+  it('rejects a stale CAS revision instead of last-write-wins', async () => {
+    const runtime = createRuntime();
+    try {
+      await runtime.control.command({ requestId: 'cas-1', command: 'goal.set', payload: { goalId: 'cas', text: 'one' } });
+      const first = await runtime.control.command({ requestId: 'cas-2', command: 'goal.revise', payload: { goalId: 'cas', expectedRevision: 1, change: 'two' } });
+      expect(first.state).toBe('terminal');
+      const stale = await runtime.control.command({ requestId: 'cas-3', command: 'goal.revise', payload: { goalId: 'cas', expectedRevision: 1, change: 'stale' } });
+      expect(stale.state).toBe('conflict');
+    } finally { runtime.close(); }
   });
 });

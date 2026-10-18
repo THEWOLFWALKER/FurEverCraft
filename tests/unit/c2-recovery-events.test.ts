@@ -62,7 +62,7 @@ describe('C2 receipt and effect recovery contracts', () => {
     cleanup(file);
   });
 
-  it.each(['prepared', 'may-have-dispatched', 'verifying'] as const)('reconciles the %s crash window without replaying input', (status) => {
+  it.each(['may-have-dispatched', 'verifying'] as const)('reconciles the %s crash window without replaying input', (status) => {
     const file = tempDb();
     seedPlaceEffect(file, status);
     const bridge = new FakeClientBridge(12, { context });
@@ -73,6 +73,19 @@ describe('C2 receipt and effect recovery contracts', () => {
     expect(result.reconciled).toEqual([{ effectId: 'effect-c2', status: 'confirmed' }]);
     expect(bridge.inventory).toBe(inventoryBefore);
     expect(store.pendingEffects()).toHaveLength(0);
+    store.close();
+    cleanup(file);
+  });
+
+  it('keeps a prepared (never dispatched) effect ambiguous even if the target is blocked', () => {
+    const file = tempDb();
+    seedPlaceEffect(file, 'prepared');
+    const bridge = new FakeClientBridge(12, { context });
+    bridge.block(1, 0);
+    const store = new SQLiteStore(file);
+    const result = new SessionRuntime(bridge, store).start();
+    expect(result.reconciled).toEqual([{ effectId: 'effect-c2', status: 'ambiguous' }]);
+    expect(store.pendingEffects()).toHaveLength(1);
     store.close();
     cleanup(file);
   });

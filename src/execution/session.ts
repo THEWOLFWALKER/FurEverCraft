@@ -37,9 +37,13 @@ export class SessionRuntime {
         const intent = effect.intent as { kind?: string; x?: number; y?: number };
         if (contextMatches && intent.kind === 'place' && Number.isInteger(intent.x) && Number.isInteger(intent.y)) {
           const cell = snapshot.cells[`${intent.x},${intent.y}`];
-          status = cell === 'blocked' ? 'confirmed' : 'ambiguous';
+          // A blocked target may have been satisfied by someone else. Only a dispatch that was
+          // actually sent (may-have-dispatched or later) can be attributed as our effect; a
+          // merely prepared intent stays ambiguous.
+          const dispatched = effect.status === 'may-have-dispatched' || effect.status === 'verifying';
+          status = dispatched && cell === 'blocked' ? 'confirmed' : 'ambiguous';
         }
-        evidence = { source: 'recovery-observation', revision: snapshot.revision, contextMatched: contextMatches, intent };
+        evidence = { source: 'recovery-observation', revision: snapshot.revision, contextMatched: contextMatches, intent, dispatched: effect.status };
       } catch (error) {
         evidence = { ...evidence, message: error instanceof Error ? error.message : String(error) };
       }
