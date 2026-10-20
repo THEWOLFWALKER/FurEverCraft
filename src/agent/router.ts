@@ -4,7 +4,8 @@ import type { ModelMessage, ModelProvider, ToolCall } from '../providers/scripte
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { Executor, type InputArbiter, type Progress } from '../execution/runtime.js';
-import { type AdmissionDecision } from '../execution/admission.js';import { skillImplementations } from '../skills/skills.js';
+import type { AdmissionDecision, ExecutionAdmission } from '../execution/admission.js';
+import { skillImplementations } from '../skills/skills.js';
 import { findSkills, skillManifests } from '../skills/registry.js';
 import type { EventHub } from '../diagnostics/events.js';
 import { redactError } from '../diagnostics/redaction.js';
@@ -71,7 +72,7 @@ export class ToolRouter {
       return true;
     });
   }
-  async invoke(call: ToolCall, admissionContext: { goalId?: string; goalRevision?: number; signal?: AbortSignal } = {}): Promise<z.infer<typeof ToolCallResultSchema>> {
+  async invoke(call: ToolCall, admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal } = {}): Promise<z.infer<typeof ToolCallResultSchema>> {
     let raw: unknown;
     try { raw = JSON.parse(call.arguments || '{}'); } catch { return { callId: call.id, name: call.name, ok: false, error: 'invalid-json-arguments' }; }
     try {
@@ -132,13 +133,15 @@ export class ToolRouter {
     } catch (error) { return { callId: call.id, name: call.name, ok: false, error: redactError(error) }; }
   }
 
-  private checkAdmission(skillId: string, context: { goalId?: string; goalRevision?: number; signal?: AbortSignal }, admittedContext: BodyContext): AdmissionDecision | undefined {
+  private checkAdmission(skillId: string, context: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal }, admittedContext: BodyContext): AdmissionDecision | undefined {
     if (!this.admission) return undefined;
     return this.admission.check({
       skillId,
       goalId: context.goalId,
       goalRevision: context.goalRevision,
-      owner: this.admission.ownerId,
+      // Without an explicit caller owner, fence against this runtime's own session owner. A
+      // stale finalizer that presents an old owner is rejected instead of dispatching.
+      owner: context.owner ?? this.admission.ownerId,
       context: admittedContext,
       signal: context.signal,
     });
@@ -158,18 +161,19 @@ export class ToolRouter {
     args: Record<string, unknown>,
     executeArgs: unknown,
     sideEffect: boolean,
-    admissionContext: { goalId?: string; goalRevision?: number; signal?: AbortSignal },
+    admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal },
   ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
     const implementation = skillImplementations[skill as keyof typeof skillImplementations];
     if (!implementation || !this.executor || !this.store) return { ok: false, error: 'unsupported-skill' };
     // Capture the context once and re-check it at each dispatch boundary: a connection/body
-    // epoch change between admission and the write must reject the stale plan.
-    const admittedContext = this.currentContext();
+    // epoch change between admission and the write must reject the stale plan. Copy the object
+    // because a bridge may mutate its context in place instead of replacing it.
+    const admittedContext = { ...this.currentContext() };
     const rejected = this.checkAdmission(skill, admissionContext, admittedContext);
     if (rejected && !rejected.ok) return { ok: false, error: rejected.code, result: { code: rejected.code, message: rejected.message } };
     const effectId = sideEffect ? nextId('effect') : undefined;
     let effectPrepared = false;
-    const execution = await this.executor.start('agent', skill, args, (lease, report, signal) => {
+    const execution = await this.executor.start(admissionContext.goalId ?? 'agent', skill, args, (lease, report, signal) => {
       const early = this.checkAdmission(skill, admissionContext, admittedContext);
       if (early && !early.ok) return { ok: false, outcome: 'failed', reason: early.code };
       if (effectId && !effectPrepared) {
@@ -205,13 +209,17 @@ export class ToolRouter {
       return result;
     });
     if (sideEffect && effectId && effectPrepared) {
-      const current = this.store.getEffect(effectId)?.status;
+      const effect = this.store.getEffect(effectId);
+      const current = effect?.status;
+      // Keep the pre-dispatch barrier evidence: settlement must not erase the audit trail that
+      // proves the durable barrier was crossed before any world action.
+      const evidence = { ...(effect?.evidence as Record<string, unknown> | undefined), executionId: execution.executionId, outcome: execution.outcome };
       // Only an explicitly confirmed skill settles the effect. A prepared-but-never-dispatched
       // effect stays distinguishable from one that may have reached the body.
-      if (execution.outcome === 'confirmed') this.store.updateEffect(effectId, 'confirmed', { executionId: execution.executionId, outcome: execution.outcome });
-      else if (execution.outcome === 'partial') this.store.updateEffect(effectId, 'partial', { executionId: execution.executionId, outcome: execution.outcome });
-      else if (current === 'prepared') this.store.updateEffect(effectId, 'prepared', { executionId: execution.executionId, outcome: execution.outcome, dispatched: false });
-      else this.store.updateEffect(effectId, 'ambiguous', { executionId: execution.executionId, outcome: execution.outcome });
+      if (execution.outcome === 'confirmed') this.store.updateEffect(effectId, 'confirmed', evidence);
+      else if (execution.outcome === 'partial') this.store.updateEffect(effectId, 'partial', evidence);
+      else if (current === 'prepared') this.store.updateEffect(effectId, 'prepared', { ...evidence, dispatched: false });
+      else this.store.updateEffect(effectId, 'ambiguous', evidence);
     }
     if (execution.outcome === 'ambiguous' || execution.status === 'failed' || execution.status === 'canceled') {
       return { ok: false, result: execution, error: execution.reason ?? execution.outcome ?? execution.status };
@@ -222,7 +230,7 @@ export class ToolRouter {
 
 export class AgentLoop {
   constructor(private readonly provider: ModelProvider, private readonly router: ToolRouter, private readonly maxTurns = 8) {}
-  async run(messages: ModelMessage[], tools: ToolDefinition[] = defaultTools, signal?: AbortSignal, options: { goalId?: string; goalRevision?: number; store?: SQLiteStore } = {}) {
+  async run(messages: ModelMessage[], tools: ToolDefinition[] = defaultTools, signal?: AbortSignal, options: { goalId?: string; goalRevision?: number; owner?: string; store?: SQLiteStore } = {}) {
     const history = messages.map(message => structuredClone(message));
     const trace: unknown[] = [];
     for (let turn = 0; turn < this.maxTurns; turn++) {
@@ -237,7 +245,7 @@ export class AgentLoop {
       const byId = new Map<string, Awaited<ReturnType<ToolRouter['invoke']>>>();
       for (const call of response.toolCalls) {
         if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
-        byId.set(call.id, await this.router.invoke(call, { goalId: options.goalId, goalRevision: options.goalRevision, signal }));
+        byId.set(call.id, await this.router.invoke(call, { goalId: options.goalId, goalRevision: options.goalRevision, owner: options.owner, signal }));
       }
       if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
       history.push({ role: 'assistant', content: response.text ?? '', toolCalls: response.toolCalls });

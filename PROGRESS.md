@@ -2,6 +2,16 @@
 
 Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Status reflects verified offline behavior only; real servers/worlds, paid APIs, actual Windows input and screenshots remain prohibited.
 
+## Current batch: P01–P04 (production assembly and execution boundary)
+
+| Task | Status | Implementation | Verification |
+|---|---|---|---|
+| P01 gap mapping (this batch) | done-offline | P02-P04 entry points mapped below; the 500/208-item list is not present in the repo, so no item numbers are invented | this table |
+| P02 runtime assembly | done-offline | `src/execution/factory.ts` builds one explicit `RuntimeDependencies` container (Clock/Store/Events/Provider/Body/Nav/Motor), rejects client-offline without a real body, defaults client input off, and exposes owner/inputs/ownership state | `tests/unit/p01-p04.test.ts` |
+| P03 execution/effect boundary | done-offline | `src/execution/admission.ts` + `src/agent/router.ts` check goal revision, owner, epoch and capability before prepare and again before dispatch; prepared is durable before may-have-dispatched; write failures abort before body input; terminal cancel/timeout is never overwritten; barrier evidence survives settlement | `tests/unit/p01-p04.test.ts`, `tests/integration/v01-v04.integration.test.ts`, `tests/integration/s01-s14-acceptance.test.ts` |
+| P04 ownership/recovery | done-offline | `src/execution/ownership.ts` atomic cross-process lock (reclaims only verified-dead same-host owners, never deletes unknown/foreign locks, releases only its own record); `src/execution/session.ts` recovery budget, retry, world/account isolation and cross-epoch reobservation without confirmation | `tests/unit/p01-p04.test.ts`, `tests/unit/c2-recovery-events.test.ts` |
+
+
 | Task group | Status | Implementation evidence | Verification evidence |
 |---|---|---|---|
 | F01 Runtime/Clock/ownership | implemented-offline (partial) | `src/execution/factory.ts` single assembly, injected Clock, profile validation, idempotent close | `tests/unit/runtime.test.ts` |

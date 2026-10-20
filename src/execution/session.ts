@@ -73,7 +73,7 @@ export class SessionRuntime {
     try {
       // Only effects belonging to the body we are attached to may be reconciled. Records of
       // other worlds/accounts are left untouched for their own session to resolve.
-      const stable = this.bridge.context;
+      const stable = { ...this.bridge.context };
       const foreign: Array<{ effectId: string; status: string }> = [];
       for (const effect of this.store.pendingEffects()) {
         const effectId = effect.effect_id ?? effect.effectId;

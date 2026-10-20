@@ -54,6 +54,8 @@ export type RuntimeFactoryOptions = {
   apiKey?: string;
   /** Whether body input may be dispatched. Defaults to on for the simulated profile only. */
   inputsEnabled?: boolean;
+  /** Consecutive recovery attempts allowed before the session stays suspended. */
+  maxRecoveryAttempts?: number;
   lockOptions?: OwnershipLockOptions;
 };
 export type RuntimeAssembly = {
@@ -97,13 +99,15 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     assertRealBody(providedBody);
   }
   const bridge = providedBody ?? new FakeClientBridge();
-  const dbPath = options.db ?? ':memory:';
+  // An injected persistent store is still one storage path and must be protected by the same
+  // cross-process owner lock as a store this factory opens itself.
+  const injectedDb = options.store?.db.name;
+  const dbPath = options.db ?? (injectedDb && injectedDb !== ':memory:' ? injectedDb : ':memory:');
   const ownsStore = options.store === undefined;
   const ownership = dbPath !== ':memory:' ? new RuntimeOwnershipLock(dbPath, options.lockOptions) : undefined;
   // Acquire cross-process ownership before touching the shared store so a second instance fails
   // closed instead of racing migrations. Releasing is only allowed for the record we wrote.
-  try { ownership?.acquire(); }
-  catch (error) { throw error; }
+  ownership?.acquire();
   let store: SQLiteStore;
   try {
     store = options.store ?? new SQLiteStore(dbPath);
@@ -111,59 +115,66 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     ownership?.release();
     throw error;
   }
-  const clock = options.clock ?? (profile === 'simulated' ? new ManualClock() : new SystemClock());
-  const events = options.events ?? new EventHub(1024, store, bridge.context);
-  const inputsEnabled = options.inputsEnabled ?? profile === 'simulated';
-  const session = new SessionRuntime(bridge, store, { events });
-  const arbiter = new InputArbiter(() => clock.now(), () => `${bridge.context.connectionEpoch}:${bridge.context.bodyEpoch}:${bridge.context.worldGenerationId}`);
-  const executor = new Executor(bridge, store, arbiter, { clock, inputsEnabled: () => inputsEnabled });
-  const admission = new ExecutionAdmission(store, bridge, session.ownerId, () => inputsEnabled);
-  const provider = options.provider ?? createProvider(options);
-  const router = new ToolRouter(bridge, store, session.events, executor, new MemoryService(store), () => clock.now(), admission);
-  const loop = new AgentLoop(provider, router);
-  const nav: RuntimeNavPort = options.nav ?? { navigate };
-  const motor = options.motor;
-  const providerName = options.modelProvider ?? inferProviderName(provider);
-  const providerMetadata: ProviderMetadata = {
-    provider: providerName,
-    configured: !(provider instanceof UnavailableProvider),
-    model: options.model,
-    networkEnabled: options.allowModelNetwork ?? false,
-    transport: options.provider ? 'fixture' : provider instanceof UnavailableProvider ? 'unavailable' : 'network',
-  };
-  const control = new ControlService(undefined, providerMetadata);
-  const goalManager = new GoalManager(store, session.events);
-  // The scheduler's wake hook really advances one decision turn through the same AgentLoop.
-  const scheduler = new TaskScheduler(session.events, async (reason) => {
-    if (control.pausedValue || control.stoppingValue) return;
-    // Use the actual active goal (and its revision) so user goals can progress; without one
-    // there is nothing to drive and the wake is a no-op.
-    const active = store.listGoals().find(goal => goal.status === 'active');
-    if (!active) return;
-    await loop.run([{ role: 'user', content: `Scheduler wake: ${reason}. Continue the active goal or report the next blocked step.` }], undefined, undefined, { goalId: active.goal_id, goalRevision: active.revision, store });
-  }, 25);
-  const sessionSupervisor = new SessionSupervisor(session.events);
-  // Wire the scheduler to the event stream so goal/execution/effect/session events coalesce
-  // into a single wake instead of a per-tick model call.
-  const unsubscribeScheduler = session.events.subscribe(event => scheduler.observe(event));
-  const dependencies: RuntimeDependencies = { clock, store, events: session.events, provider, body: bridge, nav, motor };
-  let closed = false;
-  const assembly = {
-    bridge, store, session, router, provider, loop, clock, control, goalManager, scheduler, sessionSupervisor,
-    dependencies, ownerId: session.ownerId, inputsEnabled, ownership,
-    close() {
-      if (closed) return;
-      closed = true;
-      unsubscribeScheduler();
-      scheduler.close();
-      void sessionSupervisor.stop();
-      const shutdown = (bridge as { shutdown?: () => Promise<void> }).shutdown;
-      if (typeof shutdown === 'function') void shutdown.call(bridge).catch(() => undefined);
-      try { if (ownsStore) store.close(); } finally { ownership?.release(); }
-    },
-  } as RuntimeAssembly;
-  control.attach(assembly);
-  return assembly;
+  try {
+    const clock = options.clock ?? (profile === 'simulated' ? new ManualClock() : new SystemClock());
+    const events = options.events ?? new EventHub(1024, store, bridge.context);
+    const inputsEnabled = options.inputsEnabled ?? profile === 'simulated';
+    const session = new SessionRuntime(bridge, store, { events, maxRecoveryAttempts: options.maxRecoveryAttempts });
+    const arbiter = new InputArbiter(() => clock.now(), () => `${bridge.context.connectionEpoch}:${bridge.context.bodyEpoch}:${bridge.context.worldGenerationId}`);
+    const executor = new Executor(bridge, store, arbiter, { clock, inputsEnabled: () => inputsEnabled });
+    const admission = new ExecutionAdmission(store, bridge, session.ownerId, () => inputsEnabled);
+    const provider = options.provider ?? createProvider(options);
+    const router = new ToolRouter(bridge, store, session.events, executor, new MemoryService(store), () => clock.now(), admission);
+    const loop = new AgentLoop(provider, router);
+    const nav: RuntimeNavPort = options.nav ?? { navigate };
+    const motor = options.motor;
+    const providerName = options.modelProvider ?? inferProviderName(provider);
+    const providerMetadata: ProviderMetadata = {
+      provider: providerName,
+      configured: !(provider instanceof UnavailableProvider),
+      model: options.model,
+      networkEnabled: options.allowModelNetwork ?? false,
+      transport: options.provider ? 'fixture' : provider instanceof UnavailableProvider ? 'unavailable' : 'network',
+    };
+    const control = new ControlService(undefined, providerMetadata);
+    const goalManager = new GoalManager(store, session.events);
+    // The scheduler's wake hook really advances one decision turn through the same AgentLoop.
+    const scheduler = new TaskScheduler(session.events, async (reason) => {
+      if (control.pausedValue || control.stoppingValue) return;
+      // Use the actual active goal (and its revision) so user goals can progress; without one
+      // there is nothing to drive and the wake is a no-op.
+      const active = store.listGoals().find(goal => goal.status === 'active');
+      if (!active) return;
+      await loop.run([{ role: 'user', content: `Scheduler wake: ${reason}. Continue the active goal or report the next blocked step.` }], undefined, undefined, { goalId: active.goal_id, goalRevision: active.revision, store, owner: session.ownerId });
+    }, 25);
+    const sessionSupervisor = new SessionSupervisor(session.events);
+    // Wire the scheduler to the event stream so goal/execution/effect/session events coalesce
+    // into a single wake instead of a per-tick model call.
+    const unsubscribeScheduler = session.events.subscribe(event => scheduler.observe(event));
+    const dependencies: RuntimeDependencies = { clock, store, events: session.events, provider, body: bridge, nav, motor };
+    let closed = false;
+    const assembly = {
+      bridge, store, session, router, provider, loop, clock, control, goalManager, scheduler, sessionSupervisor,
+      dependencies, ownerId: session.ownerId, inputsEnabled, ownership,
+      close() {
+        if (closed) return;
+        closed = true;
+        unsubscribeScheduler();
+        scheduler.close();
+        void sessionSupervisor.stop();
+        const shutdown = (bridge as { shutdown?: () => Promise<void> }).shutdown;
+        if (typeof shutdown === 'function') void shutdown.call(bridge).catch(() => undefined);
+        try { if (ownsStore) store.close(); } finally { ownership?.release(); }
+      },
+    } as RuntimeAssembly;
+    control.attach(assembly);
+    return assembly;
+  } catch (error) {
+    // Construction failed after ownership was taken: never leak the shared store or its lock.
+    ownership?.release();
+    if (ownsStore) { try { store.close(); } catch { /* preserve the original failure */ } }
+    throw error;
+  }
 }
 
 function inferProviderName(provider: ModelProvider): 'scripted' | 'openai' | 'anthropic' {

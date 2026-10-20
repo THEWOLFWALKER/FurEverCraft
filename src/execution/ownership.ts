@@ -1,13 +1,13 @@
 import {
   closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync,
 } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
-import { nextId } from '../contracts/index.js';
 
 /**
- * Durable record written into the runtime ownership lock. `epoch` identifies this runtime
- * incarnation; it is compared on release so a stale finalizer can never remove a replacement
- * owner's lock.
+ * Durable record written into the runtime ownership lock. `runtimeId`/`epoch` identify this
+ * runtime incarnation; release compares the stored record so a stale finalizer can never remove
+ * a replacement owner's lock.
  */
 export type OwnershipRecord = {
   pid: number;
@@ -51,7 +51,7 @@ const defaultAlive = (pid: number): boolean => {
  */
 export class RuntimeOwnershipLock {
   readonly lockPath: string;
-  readonly runtimeId = nextId('owner');
+  readonly runtimeId = `owner_${randomUUID()}`;
   readonly epoch = `${this.runtimeId}:${process.pid}`;
   private readonly hostname: string;
   private readonly now: () => number;
@@ -129,7 +129,7 @@ export class RuntimeOwnershipLock {
     }
     try {
       const parsed = JSON.parse(raw) as Partial<OwnershipRecord>;
-      if (!parsed || !Number.isInteger(parsed.pid) || typeof parsed.hostname !== 'string'
+      if (!parsed || typeof parsed.pid !== 'number' || !Number.isInteger(parsed.pid) || typeof parsed.hostname !== 'string'
         || typeof parsed.runtimeId !== 'string' || typeof parsed.epoch !== 'string') return undefined;
       return {
         pid: parsed.pid,
@@ -163,7 +163,7 @@ export class RuntimeOwnershipLock {
   private readPath(file: string): OwnershipRecord | undefined {
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as Partial<OwnershipRecord>;
-      if (!parsed || !Number.isInteger(parsed.pid) || typeof parsed.hostname !== 'string'
+      if (!parsed || typeof parsed.pid !== 'number' || !Number.isInteger(parsed.pid) || typeof parsed.hostname !== 'string'
         || typeof parsed.runtimeId !== 'string' || typeof parsed.epoch !== 'string') return undefined;
       return {
         pid: parsed.pid,
