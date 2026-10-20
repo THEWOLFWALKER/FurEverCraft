@@ -1,6 +1,6 @@
 # FurEverCraft v0.2 Full Batch Progress
 
-Current authorization: F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. Status reflects verified offline behavior only; real servers/worlds, paid APIs, actual Windows input and screenshots remain prohibited.
+Current authorization: P01–P24 in `NEXT_BATCH.md` with five review rounds in `REVIEW.md`. Maintenance ledger: `WORKSTREAM.md`. Status reflects verified offline behavior only; real servers/worlds, paid APIs, actual Windows input and screenshots remain prohibited.
 
 ## Current batch: P01–P04 (production assembly and execution boundary)
 
