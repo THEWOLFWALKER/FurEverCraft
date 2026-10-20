@@ -42,7 +42,7 @@ A substantial offline implementation of the v0.2 batch exists and is verified on
 npm run typecheck            pass
 npm run build                pass
 npm run build:web            pass
-npm run test:offline         26 files / 171 tests pass
+npm run test:offline         26 files / 192 tests pass
 npm run test:v:offline       integration (incl. forked relay child) + soak + trace pass
 npm run demo:offline         6 scenarios pass
 npm run demo:autonomy        pass
@@ -52,6 +52,14 @@ npm run test:web             web typecheck + vite build pass
 ```
 
 Loopback smoke: `serve` served the built UI (200 text/html), `/api/v1/status` returned running, `goal.set` returned terminal, and the JS asset loaded (200).
+
+## P01–P04 convergence (merged)
+
+- `src/execution/factory.ts`: one explicit `RuntimeDependencies` container (Clock/Store/Events/Provider/Body/Nav/Motor); client-offline without a real body fails closed; simulated input defaults on, client input off.
+- `src/execution/admission.ts`: goal-revision, owner, epoch and capability checks before prepare and again before dispatch.
+- `src/execution/ownership.ts`: atomic cross-process lock; only verified-dead same-host owners are reclaimed; unknown/foreign locks are never deleted; only the owning record is released.
+- `src/execution/session.ts`: recovery budget, retry after recoverable failure, world/account isolation, cross-epoch reobservation without false confirmation.
+- `tests/unit/p01-p04.test.ts` adds regression coverage for the above.
 
 ## Additional convergence work (post-review)
 
