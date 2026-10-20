@@ -90,17 +90,20 @@ describe('C2 receipt and effect recovery contracts', () => {
     cleanup(file);
   });
 
-  it('keeps recovery ambiguous when the body context changed', () => {
+  it('reobserves a previous-epoch effect under the new epoch without confirming it', () => {
     const file = tempDb();
     seedPlaceEffect(file);
     const store = new SQLiteStore(file);
     const bridge = new FakeClientBridge(12, { context: { ...context, connectionEpoch: '2' } });
     bridge.block(1, 0);
     const result = new SessionRuntime(bridge, store).start();
-    // The effect belongs to a previous connection epoch: it is left untouched, never re-attributed.
-    expect(result.reconciled).toEqual([]);
-    expect(store.getEffect('effect-c2')).toMatchObject({ status: 'may-have-dispatched', context });
-    expect(store.getEffect('effect-c2')?.evidence).toBeUndefined();
+    // A reconnect changes the epoch but not the world. The historical pending effect is checked
+    // against the new evidence, but a target now blocked cannot prove it was our dispatch.
+    expect(result.reconciled).toEqual([{ effectId: 'effect-c2', status: 'ambiguous' }]);
+    expect(store.getEffect('effect-c2')).toMatchObject({
+      status: 'ambiguous',
+      evidence: { crossEpoch: true, contextMatched: false, reason: 'cross-epoch-reobservation', dispatched: 'may-have-dispatched' },
+    });
     expect(store.pendingEffects()).toHaveLength(1);
     store.close();
     cleanup(file);
@@ -112,7 +115,7 @@ describe('C2 receipt and effect recovery contracts', () => {
     store.saveExecution({ executionId: 'execution-other', proposalId: 'proposal-other', proposalHash: 'hash-other', goalId: 'goal-other', skillId: 'place_one', skillVersion: '1.0.0', status: 'running' });
     store.saveExecution({ executionId: 'execution-c2', proposalId: 'proposal-c2', proposalHash: 'hash-c2', goalId: 'goal-c2', skillId: 'place_one', skillVersion: '1.0.0', status: 'running' });
     const otherWorld = { ...context, worldGenerationId: 'world-other' };
-    const otherAccount = { ...context, bodyEpoch: '9' };
+    const otherAccount = { ...context, serverProfileId: 'other-account' };
     store.addEffect({ effectId: 'effect-other-world', executionId: 'execution-other', context: otherWorld, status: 'may-have-dispatched', intent: { kind: 'place', x: 1, y: 0 } });
     store.addEffect({ effectId: 'effect-other-account', executionId: 'execution-other', context: otherAccount, status: 'verifying', intent: { kind: 'place', x: 1, y: 0 } });
     store.addEffect({ effectId: 'effect-c2', executionId: 'execution-c2', context, status: 'may-have-dispatched', intent: { kind: 'place', x: 1, y: 0 } });

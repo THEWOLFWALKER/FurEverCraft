@@ -1,9 +1,10 @@
 import { z } from 'zod';
-import { nextId } from '../contracts/index.js';
+import { nextId, type BodyContext } from '../contracts/index.js';
 import type { ModelMessage, ModelProvider, ToolCall } from '../providers/scripted/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { Executor, type InputArbiter, type Progress } from '../execution/runtime.js';
+import type { AdmissionDecision, ExecutionAdmission } from '../execution/admission.js';
 import { skillImplementations } from '../skills/skills.js';
 import { findSkills, skillManifests } from '../skills/registry.js';
 import type { EventHub } from '../diagnostics/events.js';
@@ -56,7 +57,7 @@ const argsByTool: Record<string, z.ZodTypeAny> = {
 export class ToolRouter {
   private readonly executor?: Executor;
   private readonly memory?: MemoryService;
-  constructor(private readonly bridge: ClientBridgeCapabilities, private readonly store?: SQLiteStore, private readonly events?: EventHub, executor?: Executor, memory?: MemoryService, private readonly clockNow: () => number = () => Date.now()) {
+  constructor(private readonly bridge: ClientBridgeCapabilities, private readonly store?: SQLiteStore, private readonly events?: EventHub, executor?: Executor, memory?: MemoryService, private readonly clockNow: () => number = () => Date.now(), private readonly admission?: ExecutionAdmission) {
     if (store) { this.executor = executor ?? new Executor(bridge, store); this.memory = memory ?? new MemoryService(store); }
   }
   /** Skills the current body can actually run, derived from capability presence rather than a hard-coded list. */
@@ -71,7 +72,7 @@ export class ToolRouter {
       return true;
     });
   }
-  async invoke(call: ToolCall): Promise<z.infer<typeof ToolCallResultSchema>> {
+  async invoke(call: ToolCall, admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal } = {}): Promise<z.infer<typeof ToolCallResultSchema>> {
     let raw: unknown;
     try { raw = JSON.parse(call.arguments || '{}'); } catch { return { callId: call.id, name: call.name, ok: false, error: 'invalid-json-arguments' }; }
     try {
@@ -100,46 +101,22 @@ export class ToolRouter {
           // The effect row references the execution, so it is written by the executor hook once the
           // execution exists. Prepared intent is persisted before dispatch; only a confirmed outcome settles it.
           const sideEffect = skill === 'place_one' || skill === 'send_chat' || skill === 'dig_one' || skill === 'gather_blocks';
-          const effectId = sideEffect ? nextId('effect') : undefined;
-          let effectStarted = false;
-          const execution = await this.executor.start('agent', skill, args, (lease, report, signal) => {
-            if (effectId && !effectStarted) {
-              effectStarted = true;
-              // Intent is durable before dispatch, but it stays `prepared` until the skill
-              // actually reports that it reached the dispatch stage. Failing admission must
-              // not look like a possibly-sent side effect.
-              this.store!.addEffect({ effectId, executionId: lease.owner, context: this.bridge.context, status: 'prepared', intent: { kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : 'dig', x: typeof executeArgs === 'object' ? executeArgs?.x : undefined, y: typeof executeArgs === 'object' ? executeArgs?.y : undefined, text: skill === 'send_chat' ? String(executeArgs) : undefined, block: skill === 'gather_blocks' ? String(args.block) : undefined } });
-            }
-            const guardedReport = (progress: Omit<Progress, 'at'>) => {
-              // Persisting the dispatch barrier must succeed before any world action; a failed
-              // write aborts the skill so an unsent effect is never dispatched.
-              if (effectId && progress.stage === 'dispatch' && progress.completed > 0) {
-                this.store!.updateEffect(effectId, 'may-have-dispatched');
-              }
-              report(progress);
-            };
-            const result = (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report: guardedReport, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs);
-            if (result instanceof Promise) return result.catch(error => { throw error; });
-            return result;
-          });
-          result = execution;
-          if (sideEffect && effectId) {
-            // Only an explicitly confirmed skill settles the effect; unknown/partial stays observable.
-            this.store.updateEffect(effectId, execution.outcome === 'confirmed' ? 'confirmed' : execution.outcome === 'partial' ? 'partial' : 'ambiguous', { executionId: execution.executionId, outcome: execution.outcome });
+          const run = await this.runWriteSkill(call, skill, args, executeArgs, sideEffect, admissionContext);
+          if (!run.ok) {
+            this.events?.publish(`tool.${call.name}`, { callId: call.id, result: run.result }, false);
+            return { callId: call.id, name: call.name, ok: false, result: run.result, error: run.error };
           }
-          if (execution.outcome === 'ambiguous' || execution.status === 'failed' || execution.status === 'canceled') {
-            this.events?.publish(`tool.${call.name}`, { callId: call.id, result }, false);
-            return { callId: call.id, name: call.name, ok: false, result, error: execution.reason ?? execution.outcome ?? execution.status };
-          }
+          result = run.result;
           break;
         }
         case 'send_chat': {
           if (!this.executor || !this.store) return { callId: call.id, name: call.name, ok: false, error: 'executor-unavailable' };
-          result = await this.executor.start('agent', 'send_chat', { text: args.text }, (lease, report, signal) => skillImplementations.send_chat({ bridge: this.bridge, lease, report, isCanceled: () => signal.aborted }, String(args.text)));
-          if ((result as any).outcome === 'ambiguous' || (result as any).status === 'failed' || (result as any).status === 'canceled') {
-            this.events?.publish(`tool.${call.name}`, { callId: call.id, result }, false);
-            return { callId: call.id, name: call.name, ok: false, result, error: (result as any).reason ?? (result as any).outcome ?? (result as any).status };
+          const run = await this.runWriteSkill(call, 'send_chat', args, String(args.text), true, admissionContext);
+          if (!run.ok) {
+            this.events?.publish(`tool.${call.name}`, { callId: call.id, result: run.result }, false);
+            return { callId: call.id, name: call.name, ok: false, result: run.result, error: run.error };
           }
+          result = run.result;
           break;
         }
         case 'cancel_execution': {
@@ -155,11 +132,105 @@ export class ToolRouter {
       return { callId: call.id, name: call.name, ok: true, result };
     } catch (error) { return { callId: call.id, name: call.name, ok: false, error: redactError(error) }; }
   }
+
+  private checkAdmission(skillId: string, context: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal }, admittedContext: BodyContext): AdmissionDecision | undefined {
+    if (!this.admission) return undefined;
+    return this.admission.check({
+      skillId,
+      goalId: context.goalId,
+      goalRevision: context.goalRevision,
+      // Without an explicit caller owner, fence against this runtime's own session owner. A
+      // stale finalizer that presents an old owner is rejected instead of dispatching.
+      owner: context.owner ?? this.admission.ownerId,
+      context: admittedContext,
+      signal: context.signal,
+    });
+  }
+
+  private currentContext() { return this.bridge.context; }
+
+  /**
+   * Run a body-input skill through the executor with per-write admission and a durable
+   * prepared -> may-have-dispatched barrier. The skill function is not invoked until the
+   * prepared effect is persisted; the barrier is persisted before any dispatch report is
+   * forwarded to the body. A failed barrier write aborts before the skill can act.
+   */
+  private async runWriteSkill(
+    call: ToolCall,
+    skill: string,
+    args: Record<string, unknown>,
+    executeArgs: unknown,
+    sideEffect: boolean,
+    admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal },
+  ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+    const implementation = skillImplementations[skill as keyof typeof skillImplementations];
+    if (!implementation || !this.executor || !this.store) return { ok: false, error: 'unsupported-skill' };
+    // Capture the context once and re-check it at each dispatch boundary: a connection/body
+    // epoch change between admission and the write must reject the stale plan. Copy the object
+    // because a bridge may mutate its context in place instead of replacing it.
+    const admittedContext = { ...this.currentContext() };
+    const rejected = this.checkAdmission(skill, admissionContext, admittedContext);
+    if (rejected && !rejected.ok) return { ok: false, error: rejected.code, result: { code: rejected.code, message: rejected.message } };
+    const effectId = sideEffect ? nextId('effect') : undefined;
+    let effectPrepared = false;
+    const execution = await this.executor.start(admissionContext.goalId ?? 'agent', skill, args, (lease, report, signal) => {
+      const early = this.checkAdmission(skill, admissionContext, admittedContext);
+      if (early && !early.ok) return { ok: false, outcome: 'failed', reason: early.code };
+      if (effectId && !effectPrepared) {
+        // Durable prepare must succeed before the skill can reach a dispatch report.
+        this.store!.addEffect({
+          effectId,
+          executionId: lease.owner,
+          context: this.bridge.context,
+          status: 'prepared',
+          intent: {
+            kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : 'dig',
+            x: typeof executeArgs === 'object' && executeArgs !== null ? (executeArgs as { x?: number }).x : undefined,
+            y: typeof executeArgs === 'object' && executeArgs !== null ? (executeArgs as { y?: number }).y : undefined,
+            text: skill === 'send_chat' ? String(executeArgs) : undefined,
+            block: skill === 'gather_blocks' ? String(args.block) : undefined,
+          },
+        });
+        effectPrepared = true;
+      }
+      const guardedReport = (progress: Omit<Progress, 'at'>) => {
+        if (effectId && progress.stage === 'dispatch') {
+          if (!effectPrepared) throw new Error('effect-not-prepared');
+          // Every dispatch report is the last synchronous boundary before the skill body
+          // performs input. Admission is re-evaluated, then the durable barrier is written.
+          const barrier = this.checkAdmission(skill, { ...admissionContext, signal }, admittedContext);
+          if (barrier && !barrier.ok) throw new Error(barrier.code);
+          this.store!.updateEffect(effectId, 'may-have-dispatched', { barrier: 'pre-dispatch', goalId: admissionContext.goalId, goalRevision: admissionContext.goalRevision });
+        }
+        report(progress);
+      };
+      const result = (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)({ bridge: this.bridge, lease, report: guardedReport, isCanceled: () => signal.aborted, clock: { now: this.clockNow, schedule: (at, fn) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: id => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } } }, executeArgs);
+      if (result instanceof Promise) return result.catch(error => { throw error; });
+      return result;
+    });
+    if (sideEffect && effectId && effectPrepared) {
+      const effect = this.store.getEffect(effectId);
+      const current = effect?.status;
+      // Keep the pre-dispatch barrier evidence: settlement must not erase the audit trail that
+      // proves the durable barrier was crossed before any world action.
+      const evidence = { ...(effect?.evidence as Record<string, unknown> | undefined), executionId: execution.executionId, outcome: execution.outcome };
+      // Only an explicitly confirmed skill settles the effect. A prepared-but-never-dispatched
+      // effect stays distinguishable from one that may have reached the body.
+      if (execution.outcome === 'confirmed') this.store.updateEffect(effectId, 'confirmed', evidence);
+      else if (execution.outcome === 'partial') this.store.updateEffect(effectId, 'partial', evidence);
+      else if (current === 'prepared') this.store.updateEffect(effectId, 'prepared', { ...evidence, dispatched: false });
+      else this.store.updateEffect(effectId, 'ambiguous', evidence);
+    }
+    if (execution.outcome === 'ambiguous' || execution.status === 'failed' || execution.status === 'canceled') {
+      return { ok: false, result: execution, error: execution.reason ?? execution.outcome ?? execution.status };
+    }
+    return { ok: true, result: execution };
+  }
 }
 
 export class AgentLoop {
   constructor(private readonly provider: ModelProvider, private readonly router: ToolRouter, private readonly maxTurns = 8) {}
-  async run(messages: ModelMessage[], tools: ToolDefinition[] = defaultTools, signal?: AbortSignal, options: { goalId?: string; goalRevision?: number; store?: SQLiteStore } = {}) {
+  async run(messages: ModelMessage[], tools: ToolDefinition[] = defaultTools, signal?: AbortSignal, options: { goalId?: string; goalRevision?: number; owner?: string; store?: SQLiteStore } = {}) {
     const history = messages.map(message => structuredClone(message));
     const trace: unknown[] = [];
     for (let turn = 0; turn < this.maxTurns; turn++) {
@@ -174,7 +245,7 @@ export class AgentLoop {
       const byId = new Map<string, Awaited<ReturnType<ToolRouter['invoke']>>>();
       for (const call of response.toolCalls) {
         if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
-        byId.set(call.id, await this.router.invoke(call));
+        byId.set(call.id, await this.router.invoke(call, { goalId: options.goalId, goalRevision: options.goalRevision, owner: options.owner, signal }));
       }
       if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
       history.push({ role: 'assistant', content: response.text ?? '', toolCalls: response.toolCalls });

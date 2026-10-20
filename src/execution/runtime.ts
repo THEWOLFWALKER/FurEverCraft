@@ -2,11 +2,13 @@ import { nextId, type Clock, type Execution, SystemClock } from '../contracts/in
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { findSkill, type SkillId } from '../skills/registry.js';
+import { INPUT_SKILLS } from './admission.js';
 
 export type Lease = { leaseId: string; owner: string; resources: string[]; until: number; generation: number; contextEpoch: string };
 export type ExecutionStage = 'prepare' | 'dispatch' | 'verify' | 'complete';
 export type Progress = { stage: ExecutionStage; completed: number; total?: number; message?: string; at: number };
-export type ExecutorOptions = { clock?: Clock; leaseTtl?: number; watchdogTtl?: number };
+export type ExecutorOptions = { clock?: Clock; leaseTtl?: number; watchdogTtl?: number; inputsEnabled?: () => boolean };
+const executionTerminal = new Set(['succeeded', 'failed', 'canceled']);
 
 export class InputArbiter {
   private leases = new Map<string, Lease>();
@@ -58,6 +60,7 @@ export class Executor {
   private readonly clock: Clock;
   private readonly leaseTtl: number;
   private readonly watchdogTtl: number;
+  private readonly inputsEnabled: () => boolean;
   private readonly progressByExecution = new Map<string, Progress>();
   private readonly active = new Map<string, { lease: Lease; watchdog?: string; canceled: boolean; controller: AbortController; token: symbol }>();
 
@@ -71,6 +74,7 @@ export class Executor {
     this.arbiter = arbiter ?? new InputArbiter(() => this.clock.now());
     this.leaseTtl = options.leaseTtl ?? 1000;
     this.watchdogTtl = options.watchdogTtl ?? this.leaseTtl;
+    this.inputsEnabled = options.inputsEnabled ?? (() => true);
   }
 
   private readonly arbiter: InputArbiter;
@@ -88,6 +92,12 @@ export class Executor {
       return existing as Execution;
     }
     const execution: Execution = { executionId: nextId('execution'), proposalId, proposalHash, goalId, skillId, skillVersion: findSkill(skillId)?.version ?? '1.0.0', status: 'queued' };
+    // Input-disabled profiles must fail before any lease, effect or sink side effect exists.
+    if (INPUT_SKILLS.has(skillId) && !this.inputsEnabled()) {
+      execution.status = 'failed'; execution.reason = 'input-disabled';
+      this.store.saveExecution(execution);
+      return execution;
+    }
     this.store.saveExecution(execution);
     let lease: Lease;
     try { lease = this.arbiter.acquire(execution.executionId, this.resourcesFor(skillId), this.leaseTtl); }
@@ -99,6 +109,9 @@ export class Executor {
       active.watchdog = this.clock.schedule(this.clock.now() + this.watchdogTtl, () => {
         // Timeout must abort the in-flight work, not just flip a flag: the skill keeps
         // performing writes otherwise and the released lease could be re-acquired.
+        // A timeout never overwrites an execution that already reached a terminal status.
+        const persisted = this.store.getExecution(execution.executionId);
+        if (executionTerminal.has(execution.status) || (persisted && executionTerminal.has(persisted.status))) return;
         if (this.active.get(execution.executionId)?.token === active.token) { active.canceled = true; active.controller.abort(); execution.status = 'failed'; execution.outcome = 'unknown'; execution.reason = 'watchdog-timeout'; this.store.saveExecution(execution); this.arbiter.release(lease.leaseId, execution.executionId); this.active.delete(execution.executionId); }
       });
     };
@@ -157,7 +170,7 @@ export class Executor {
     return this.store.getExecution(executionId);
   }
   progress(executionId: string) { return this.progressByExecution.get(executionId); }
-  watchdog(executionId: string) { const active = this.active.get(executionId); if (active) { active.canceled = true; active.controller.abort(); this.arbiter.release(active.lease.leaseId, executionId); this.active.delete(executionId); this.store.updateExecutionStatus?.(executionId, 'failed', 'watchdog-timeout'); } }
+  watchdog(executionId: string) { const execution = this.store.getExecution(executionId); if (execution && executionTerminal.has(execution.status)) return; const active = this.active.get(executionId); if (active) { active.canceled = true; active.controller.abort(); this.arbiter.release(active.lease.leaseId, executionId); this.active.delete(executionId); this.store.updateExecutionStatus?.(executionId, 'failed', 'watchdog-timeout', 'unknown'); } }
   /** Reconcile an effect result without ever promoting an unknown outcome to success. */
   reconcile(executionId: string, outcome: 'confirmed' | 'partial' | 'ambiguous') {
     const status = outcome === 'confirmed' ? 'succeeded' : outcome === 'partial' ? 'suspended' : 'failed';
