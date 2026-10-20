@@ -1,374 +1,108 @@
-# FurEverCraft v0.2：下一批完整实施计划
+# FurEverCraft 下一批开发补丁：生产装配与完整离线能力
 
-## 0. 最终要交付的行为
+日期：2026-10-18。基线来自开发者报告，规划方本轮没有重新审计源码，也没有独立核验其 171 测试结论。设计 v0.2 随包参考，本文件明确更新之处优先；不要把老设计中的开发状态当成现状。
 
-用户能启动一个simulated服务，在网页或CLI对同一个Agent发目标/消息，看到真实执行进展；Agent用生产模型serializer＋fixture transport做多轮工具决策，在局部可观察三维世界探索、采集、记录地点并返回。改向、取消、模型故障、外部改图、观察缺口与进程重建都走真实执行/持久化路径。
+## 1. 六项规划决策（已定案）
 
-同时交付可运行的原始TCP Relay、26.3版本观察适配、分域失效与生产输入/生命周期接线代码；离线三角色socket和已具备来源的数据样本检验其边界。真实原版/Windows/API互通仍不宣称完成。
+1. **26.3 codec**：接受候选档案和 fail-closed 作为数据缺失时的真实状态，但不是本批整体完成的替代。核实当前锁定依赖与既有研究中指定的固定候选，候选实际存在、版本身份与 schema/native 一致且离线验证通过才允许注册为 experimental adapter。允许锁定上游提交、最小 vendor 和可重复 codegen；不猜字段，不凭报告中的 SHA 直接信任，不把最新版依赖等同于26.3。没有证据时保持该 decoder unavailable，完成版本注册、导入校验和其余通路。protocol/data version 也必须保留可核对来源，不静默更改目标游戏版本。
+2. **Motor 接入**：本批明确授权且必须实现。独立 M 模块不算完成，工具 → Skill → Executor → Navigation/Motor → 输入仲裁 → BodyAdapter 必须贯通。生产路径禁止落回二维 bridge.walk。真实输入不开启，使用相同装配链的 injected sink 做离线验证。
+3. **208 条未实现**：逐项映射本包、既有设计和明确排除项。不是全部无条件实现，也不能因以前标 design-gap 就永远不做。与 P01–P24 等价的全部纳入；高级战斗/水下/飞行/自动生成代码/完整生产技能等继续明确排除。没有原清单则用现有任务与设计映射，不臆造编号。
+4. **Observer**：解压边界、压缩状态与独立方向状态跟踪纳入。可验证的通用 framing/compression 必须完成；依赖缺失26.3字段的阶段转移和领域投影局部受阻。unknown 不得猜测同步；观察不可用时 relay 仍可转发，动作准入关闭。仅写 unsupported 不算完成可独立实现部分。
+5. **五项争议审计**：不预判旧报告对错，按最终实现重新判断。无静态路由只能说明旧路径不适用；新增静态路由要测路径限制。进程内锁只满足进程内合同，需单 Runtime 所有权。未使用 hash 不作为保护证明：删除死路径或给出实际用途。Origin/Host 按浏览器请求、CLI token 与 SSE 分别验证。E2E not-run 可以诚实报告，恒成功脚本不能叫测试；本批实现真实 E2E。
+6. **提交轨迹**：沿用当前已集成历史，不重写、不强拆过去提交。新任务按可审阅增量提交，记录实际基线。遇用户并行改动先识别并保留，不覆盖。仅当无法安全合并的具体冲突才请求处理。
 
-这是一批30项必做任务，不是30个独立迭代待用户选择。工程依赖按下表推进，可交错实施但不能跳过末尾项目。
+## 2. 不被调研阻塞的架构边界
 
-| 顺序 | 任务 | 贯通结果 |
-|---|---|---|
-| 1 | F01–F06 | 旧执行/恢复/状态/provider合同补齐 |
-| 2 | B01–B06 | 26.3 raw relay与旁路观察、身体适配基础 |
-| 3 | U01–U04 | 同一Runtime的服务、CLI和网页 |
-| 4 | M01–M05 | 三维状态、动作图、闭环Motor与独立模拟身体 |
-| 5 | A01–A05 | 持续自主任务、组合技能、记忆与会话恢复 |
-| 6 | V01–V04 | 集成、故障、长运行、文档及协同review |
+保留 Node22 / TypeScript strict / ESM / npm / SQLite / Zod、Fastify + SSE、React + Vite、CLI 与网页共用 ControlService。使用现有依赖，不为本批引入消息中间件、向量数据库或第二套状态机框架。
 
-F底座先完成；B与U中独立项可交错；M依赖中立接口，不必等真实环境证据；A依赖F/M。真实26.3数据无法补齐时，其解析能力如实降级，但不让它阻止其他实现。所有生产代码和模拟代码共用领域逻辑，能力档案分开。
+独立 relay 进程、observer worker、Windows helper、一个 Runtime 所有者；网页与 attach CLI 不能各自创建新 Runtime。控制循环不等待 LLM、SQLite 长操作或解压。允许不具备真实数据的 adapter 保持 unavailable；不得默认创建 FakeBridge 冒充 client profile。
 
-### 固定证据状态，不许“有缺口就问用户选什么”
+长期 scope 为 serverProfile/account/worldGeneration/dimension；connection/body/registry epoch 用于当前证据和控制 fencing。重连不是删除历史知识/副作用的理由；旧输入不可重放，历史 pending 用新证据核对。
 
-- exact上游获取失败：保留失败命令/原因，冻结对应adapter为unavailable，仍完成接口、Relay和其余实现；不随意改用master或其他版本。
-- 字段/组件没有可靠格式：缺失codec必须fail closed，不按void继续消费；不能编造长度跳过，也不为看起来绿灯而删包。
-- 缺独立黄金样本：完成有明确schema来源的离线测试，标schema-fixture；独立样本验证单列not-run，不能宣称真实兼容。
-- 碰撞只有近似数据：允许明确标approximate做诊断，不进入可靠路径。模拟场景使用明确定义的测试形状，不冒充26.3原版形状。
-- 无Windows/浏览器/Node22：按后文约定取得运行时或完成代码/可执行替代检查；实际没跑的分开列。无需索要API Key或真服务器。
+只复用已有技能研究的流程/失败案例，不在本批导入整套 Mineflayer 技能，不引入未经核实的26.3知识全集。调研结果若到达：先登记证据、评估接口兼容；在本包 adapter 边界内补齐数据，不临时扩大成新的完整开发阶段。
 
-不得把“无法确认真实兼容”写成“没有必要实现任何代码”。同样不得把“代码实现了”写成“真实环境验证通过”。
+## 3. 任务与验收（P01–P24）
 
-## 1. F：旧遗留与运行时底座
+### A. 基线、合同与执行（P01–P04）
 
-### F01 — 统一Runtime装配、Clock和控制所有权
+**P01 现状与缺口映射**：读取实际源码、当前设计与500项分类（若存在），建立任务到入口/模块/测试的映射，避免重做已实现部分。记录所报修复的现行不变量，不再机械找500条问题。验收：每项 P 有执行路径或明确待实现位置，208项能追溯归属或资料缺失。
 
-createRuntime接受受校验profile和明确注入的Bridge/Store/Clock/Provider，返回唯一ControlService、Executor/InputArbiter、EventHub、Session、AgentLoop。Router不自行new另一套Executor；所有执行共享Clock，生产单调时钟＋真实调度，ManualClock只用于显式测试。
+**P02 Runtime 装配统一**：所有 profile 使用同一显式依赖容器，注入 Clock/Store/Events/Provider/Body/Nav/Motor。client profile 无真实能力必须返回不可用，不能切 Fake。验收：从公开启动入口追踪到实际实例；禁用输入时无 sink side effect；所有权和实例数有断言。
 
-client-offline不得静默创建FakeBridge。该profile装配Relay IPC/真实能力适配；默认门禁关闭则清楚显示unavailable，而不是伪装simulated。simulated明确装配独立世界/身体。单实例锁防两个Runtime控制同DB/body，异常退出的锁可验证PID/进程代次后恢复，不删除活锁。
+**P03 执行/效果边界补全**：逐写检查 goal revision、owner、epoch、capability；prepared 持久化成功才允许进入 may-have-dispatched 边界，派发开始后崩溃保持不确定。receipt 与 effect 各有明确状态，不以 handler 返回冒充观察确认。取消、超时不覆盖终态、不隐式回滚。验收：写盘失败/派发前后崩溃/并发取消/旧 finalizer/部分效果，均验证外部动作次数与数据库结果。
 
-清理统一有界、幂等，尽力执行所有close/release步骤并汇总错误。没有创建成功的资源也不导致清理再次异常。Clock、Provider、Worker、Store和输入所有权均可注入测试。
+**P04 会话恢复和资源所有权**：存储路径同一时只允许一个 Runtime owner，attach 客户端不持锁；使用适配现有依赖的原子所有权机制，不能仅靠 PID 文件存在判断存活或随意删除未知锁。实现死进程恢复、恢复预算、recoverable failure 可重试、跨 epoch 新证据核对。验收：双进程争用、崩溃后重启、world隔离、不完整快照、恢复失败再试；不删除 pending 制造成功。
 
-### F02 — 执行结果、取消和工具准入纠正
+### B. 原始转发、观察与进程（P05–P09）
 
-必须消除src/execution/runtime.ts读取outcome后无条件改confirmed的路径。执行lifecycle、SkillResult、effect确定性、目标满足和因果归因分别保存。ambiguous/partial不会被finally或reconcile普通路径升级确认；取消不是回滚。
+**P05 真正原始 TCP relay**：实现 downstream listener / upstream connector、连接生命周期、connect前有限缓冲、双向背压、半关闭、错误与资源释放。只允许显式配置的初始 handshake 地址映射，其余字节不变；不自动应答协议控制包。验收：本地无游戏引擎 sockets 上分片/合并/慢消费者/断连；核对双向字节，包括 observer 不认识的数据。生产 live 路径实现但不连游戏服务器。
 
-异步行为测试必须await并使用rejects，不能对Promise用同步toThrow；不把fake初始库存/固定sequence当真实事实。
+**P06 framing / compression**：有界 VarInt、帧长、解压输出、声明长度核对、超时/预算与非阻塞隔离；阈值启用前后逐方向维护，禁止共享一个 phase/compression 变量。压缩比可作防护但不假定高压缩比一定非法。缺少可识别控制事件时状态 unknown，停止解释而不是扫描猜边界。验收：截断/超长/损坏zlib/长度不符/同chunk多frame/切换边界/合法高压缩样本。禁止游戏数据透传受观察解析阻塞；转发自身背压仍按资源政策关闭或限流。
 
-每个运行实例有owner token、AbortSignal、lease和上下文；取消真实传播至技能/子技能/调度，不继续传isCanceled:()=>false。终态不可被普通cancel覆盖，旧watchdog/finalizer不能覆盖新owner。
+**P07 adapter 导入和能力矩阵**：固定版本 manifest、schema/native/data provenance、哈希、可重现生成入口；安装目录内容核实与报告区分。公开支持矩阵按 packet/domain 展示 verified-fixture、experimental、unsupported，不能用一个 supported=true 概括。验收：版本错配、native缺失、未知字段、错误schema拒绝；自编合成夹具不能标作原版互通证据。
 
-同轮模型工具严格原始顺序准入，不再先并行读再写。逐个写动作在dispatch前检查goalRevision/decisionGeneration/context/Abort；模型请求前检查不够。长技能返回accepted/executionId，读取须显式查询完成状态，不能把accepted当succeeded。
+**P08 领域投影**：用实际有证据的 schema 实现位置/朝向、方块/区块、实体、背包/UI、聊天和生命周期的独立 projector。未知变长字段使该完整包不可安全解析时拒绝投影，不能跳字节。观察队列丢失控制信息则全局不确定；已分类非控制域丢失可以局部降级。验收：provenance、sequence gap、复位、sticky unknown、重同步、旧epoch拒绝。无26.3数据域用显式 synthetic projector合同夹具验证装配，保持真实域 unavailable。
 
-wait_for_condition真实注册定时/事件谓词并等待，可取消，不能schedule空回调后立即成功。navigate成功基于实际位置/终态，不基于计划步数。所有工具严格schema、有限数值、unknown字段拒绝，读工具未知值也不得伪填。
+**P09 进程编排**：实现服务启动/停止、relay/helper子进程与observer worker监控、有限IPC队列、退出传播、退避重启预算、日志脱敏、优雅关闭期限。helper失活先撤销控制；重启不恢复旧held输入或未确认动作。验收：从进程入口做子进程退出/IPC关闭/队列拥塞测试，不能只测 ChildSupervisor 单类。不开真实native sink。
 
-### F03 — durable dispatch、回执与恢复
+### C. 导航和 Motor 接入（P10–P13）
 
-chat/place及后续dig共用同一副作用路径：事务intent/prepared→持久化may-have-dispatched屏障→最后准入复核→Bridge dispatch→receipt→verifying→confirmed/partial/ambiguous。屏障持久化失败不得发送。dispatch后即使取消仍保留调和任务。
+**P10 三维桥合同迁移**：新增或完善异步 BodyAdapter / Observation / InputSink 合同；世界坐标、速度/朝向和维度不再复用二维x/y。2D demo留在明确 legacy/simulated profile，用户工具默认走新合同。兼容入口显式迁移，禁止悄悄把z=0补成真实三维。验收：工具schema、持久化位置、网页/CLI目标、技能、日志中的坐标一致。
 
-统一receipt区分not_dispatched/accepted_for_delivery/injection_attempted/possibly_dispatched/outbound_intent_observed/effect_observed。accepted或SendInput计数不等于世界成功；出站包与command无法唯一关联则记录限制。去重pending/completed/unknown跨Runtime所需部分持久化；相同commandId不同payload拒绝，在途重复合并/拒绝。
+**P11 导航到 Motor 全链路**：现有有界3D动作图A*与Motor真正接入 navigate_to / return_to_place / explore / gather。路线携带预期前提、落点/容差、可支持动作和观察版本；执行前再验证。只实现已有证据支撑的基础转向、平地步行、停止及已定义基础跳跃动作；物理证据不足动作禁止真实启用。验收：调用公开工具驱动 input sink 并由独立 simulated body 更新世界，不可直接改位置作为“执行”。
 
-SessionRuntime不再用旧connection/body相等作为历史调和前提。先按serverProfile/account/worldGeneration/dimension筛选，再新鲜证据核对；旧epoch仍严格禁止继续输入。目标格已被他人满足与动作因果确认分开，不凭blocked一项认定我放置成功。
+**P12 实时控制与动态变化**：使用单调时钟、有限控制预算、进度检测、方向/位置偏差判断和局部重规划；未知地形不得视为空气。暂停/换目标/断连/观察过期/焦点丢失立即撤销租约并释放输入。单次卡住有恢复预算和临时失败边记录，不能无限重试。验收：障碍插入、过期观察、位置修正、目标CAS变化、停机和模型慢响应时输入行为。
 
-prepared/dispatch屏障/外部应用/receipt/最终commit各窗口可注入故障。重新打开DB、新Runtime/租约，外部FakeWorld独立保留。模糊结果不自动重发、不删除pending，不阻断无关执行。
+**P13 独立离线身体与局限**：复用已有体素sim body但不调用规划器的可达性函数作为执行真值；至少提供解析几何可核对场景，并标明仍共享的模型假设。固定seed、虚拟时间、延迟和扰动注入。验收：非零z、头部障碍、台阶/边缘unsupported、跳跃可用性限制、偏航与停止。报告只能称模拟控制闭环，不能称真实26.3物理兼容。
 
-### F04 — Store、身份、事件与状态
+### D. 用户控制与 Agent（P14–P18）
 
-使用SQLite迁移事务、外键、版本、CAS、scope查询/分页和effect状态守卫；确认态不被普通迟到upsert倒退，允许显式有证据的版本化纠错。测试旧schema升级/中断回滚，不换内存替代生产存储。
+**P14 完整 attach CLI**：实现help/status、goal set/show、pause/resume/stop/cancel、chat、executions/effects/events/places/provider、save/quit。命令调用同一ControlService，区分退出CLI和停止Runtime。参数错误不崩服务；断连/重连及状态订阅明确。验收：readline输入驱动真实控制面并核对状态，不能仅解析命令字符串。
 
-稳定scope固定serverProfileId/accountId/worldGenerationId/dimensionId；世界代次来自本地明确档案，不把localhost临时端口或每次connection作为世界身份。registryEpoch只属解释版本，不切割长期记忆。身份不明隔离旧数据，不猜测合并。
+**P15 网页完成主工作流**：沿用现有界面，至少覆盖状态/目标与控制、执行/效果、事件、世界/地点、provider与能力配置；展示来源/新鲜度/unknown/ambiguous、真实禁用原因。支持取消、恢复、错误反馈和连接状态。不要以只有五个区域作为缺陷，按功能覆盖验收；不引入冗余页面。验收：每个写操作能观察到服务状态改变，网页不复制业务状态机。
 
-Session idle/starting/running/recoverable-failure/closing/closed；并发start/recover只有一个owner，失败清理后能重试，shutdown竞态不能复活资源。
+**P16 安全与 SSE 一致性**：完成本地配对、同源Host/Origin策略、CSRF、CLI bearer、SSE授权/断连清理；未提供Origin的非浏览器请求不能借此绕过token。静态路由限制到构建目录，SPA fallback不能吞API错误。快照和事件cursor一致，溢出明确gap并重同步。验收：未经配对、错误来源、过期凭证、目录穿越编码变体、CLI合法访问、cursor replay和重连，不记录凭证。
 
-WorldState输入先校验，读取时算TTL，sticky unknown需明确覆盖基线解除；新source full snapshot可从任意seq开始，缺基线delta不能算完整。状态通知不可变、订阅异常隔离。
+**P17 Provider 完整多轮与切换**：OpenAI Chat Completions / Anthropic Messages完整规范历史转换、工具ID和顺序、并行工具准入、图像块离线fixture、流取消/截断/非法JSON拒绝。共享retry budget、超时、队列上限、退避；写工具已执行后不可因模型重试而再次执行。切换provider从canonical history重建且保留任务一致性。验收：注入transport记录实际请求，覆盖429/5xx/abort/不完整tool args/切换后的tool结果；网络gate在factory到transport贯通。
 
-EventHub live {bootEpoch,sequence}与durable eventId分开，kind过滤不制造gap，返回scannedCursor。订阅有界/可取消，慢消费者显式gap。关键目标/effect事务耐久，高频运动不逐tick fsync。
+**P18 技能与调度收口**：打通现有11技能的生命周期、暂停/取消、前提、进度、partial/ambiguous语义；采集数量不足不能报目标完成，实体消失不等于本玩家拾取，free cell不单独证明动作因果。模型负责任务/工具，不逐tick输入。高优先级人类控制打断旧计划；认证只做有明确观察和策略的有界流程，凭证脱敏；无证据不自动乱发命令。验收：任务中调整目标、部分采集、重复失败预算、工具后再检查abort、认证夹具，不增加全套craft/smelt。
 
-### F05 — 两家生产provider贯通
+### E. 知识、诊断与交付（P19–P24）
 
-canonical history支持文本、图片引用、工具调用/结果、终止原因；OpenAI/Anthropic独立serializer，保留工具配对/错误和多轮历史。切换取消fence旧请求，从规范历史重建，不直接转发私有消息块；不可迁移内容记录lossy和摘要策略，不展示隐藏推理。
+**P19 知识基础接线**：实现版本化source manifest、knowledge release、实际source_version、coverage和查询限额；有证据的小规则可查询，未验证示例单独测试命名空间。规则与经验/空间/现场事实分离；最小工具支持查事实、查来源与覆盖情况。无真实数据不伪造26.3知识量。验收：发布原子切换、查询固定release、缺源unknown、冲突可见；不需要本批实现完整获取超图求解。
 
-SSE持续UTF8 decoder、索引重组、完整结束验证、流中error/截断处理；半JSON不进执行层。限制SSE单record1MiB、整响应8MiB、单工具参数256KiB，超本地预算报limit错误不谎称供应商格式非法。图片fixture使用可解码synthetic PNG。
+**P20 空间与经验记忆**：地点可创建/查询/更新/失效并供return_to_place使用；scope隔离、新鲜度、来源可见。执行经验记录具体前提/失败类别/证据，不能把一次失败改写为世界规则。索引与分页有界，避免全库塞模型。验收：跨重启、跨维度、过期地点、世界重建、错误scope、历史经验不直接授权动作。
 
-生产fetch实际发送前检查allowModelNetwork/配置；test transport显式标记且绝不退回真实fetch。无Key的生产选择返回未配置；API测试全部注入Fake/Record transport。
+**P21 doctor / trace / replay**：doctor读取实际Runtime和Store能力，不返回静态乐观答案。可回放事件/输入意图/效果状态，敏感字段脱敏，大小/保留策略有界。Replay必须禁用真实输入、网络和付费API；不是重发历史side effect。验收：故障trace解释为何停机、导出不含secret、cursor gap、重放无外部派发。
 
-默认单个活动决策请求＋一个合并唤醒。每逻辑请求总期限60s，最多额外2次重试，指数基值500ms/上限8s并遵守Retry-After和总期限；每目标修订共享最多6次重试。工具已提交后不能通过重试模型回合重放写操作。原生fetch不叠SDK自动重试。
+**P22 真正 Playwright E2E**：运行本地服务与网页，用headless浏览器完成配对、设置目标、观察执行、暂停/恢复/取消、效果查看、断线重连；至少一条CLI与网页共同控制同一个Runtime的用例。使用隔离端口/DB、测试结束清理，不截图不录屏。启动失败、浏览器缺失、断言失败必须非零退出；不得恒成功。若环境无法安装浏览器则明确not-run阻塞，仍完成可运行实现；这不是通过。
 
-### F06 — 当前规则与报告纠偏
+**P23 故障组合与长期离线验证**：在已有场景上增加跨子进程崩溃、慢observer、IPC背压、DB写失败、目标竞争、provider中断、Motor停机的组合。虚拟时间60分钟场景验证预算/资源上界，短墙钟进程smoke验证真实调度与关闭，不能把虚拟时长当长期稳定证明。使用独立临时目录，无sleep堆时长，低资源串行或有限worker。
 
-更新入口文件中旧1.20.4/765、无Web、禁止一切薄层自研的冲突；v0.2三设计为当前架构，历史文档标过期。把“基础修复已有”与“完全完成”分开。已有问题只做修改相邻合同review，不重新扫200项。
+**P24 最终一致性与五轮review**：执行REVIEW.md；统一当前文档、配置示例、脚本、能力声明和Node22 CI。保留历史但标明过期。列任务完成证据与限定范围，测试数量只是信息。最终报告不得以“未测真实环境”遮蔽内部未接线，也不得把真实环境未测写成代码通过。CI实际运行结果与本地Node版本分开报告。
 
-## 2. B：26.3原始Relay与旁路观察
+## 4. 阻塞分类与完成标准
 
-### B01 — 版本档案与最小适配依赖
+- 外部数据阻塞：缺26.3实际schema/native/物理或知识来源，只影响相应decoder/数据/真实动作资格。记录来源、缺字段、需要资料；框架、装配、synthetic合同测试仍继续。
+- 外部环境阻塞：真实游戏/Windows输入/截图/付费API本批禁止，统一未验证；Node22或浏览器无法实际运行时记录实际错误，不假称CI通过。
+- 内部待开发：socket、进程、Motor接线、CLI/Web、恢复、E2E代码等，必须做，不能归入“等调研”。
+- 现有研究未证实的数据，只能标候选。获取此前明确指定源码可继续，不能自行开展新一轮网页搜索。
 
-GameVersionProfile固定release26.3，登记protocol/dataVersion/Java需求/SDL3和来源。精确候选：
+每项状态只用：done-offline、done-limited（清楚列实现范围与验证边界）、blocked-external、not-done。发现部分外部受阻时拆子项，不整项涂绿。最后不得保留没有解释的内部not-done；若任务客观未完要诚实交接，不伪造完成。
 
-| 范围 | 固定引用 | 决策 |
-|---|---|---|
-| data #1301 | 924e26d6b3bb8f97a5d1e73d6190b09879c2e1e2 | schema/data候选，与前置内容核对，不只加版本号 |
-| data #1300 | e4cbec4b17815d6ce8d8ba991dd3b2d9d8f4a57d | scaffold前置，不另当完整支持 |
-| NMP #1538 | a1a33809c49553e544a7efd3d8bc03eb0867f4ab | entityDelta契约，interpret/compiled一致 |
-| NMP #1532 | a3c018efbf1b8645f16427e7b4a8185ea4218ee2 | 版本前置；不重复叠加已含提交 |
-| chunk #334 | 7382b4fef1c56290524665e7b9af58b7d1f34791 | 核对前置映射和global palette，不盲合多个PR |
-| vecDelta测试 | f8f8a20a300e9bf3914580b8cea6573691c55036 | 仅参考向量，不并装第二线上codec |
+实际可复用已有检查命令；至少覆盖typecheck/build/build:web、全部适用离线测试、demo、doctor、TCP fixture、headless E2E与Node22 CI配置。测试命令按仓库真实脚本，不新建同义脚本凑数。最终修改后重跑受影响检查；第五轮结束后做最终标准检查，失败修复后定向回归。
 
-这些是研究候选、不是已验证锁文件。获取固定源码、核对祖先和必要生成步骤，做一个隔离兼容adapter。npm minecraft-data消费物需data.js/版本索引/codegen齐全；仅把数据仓当npm包安装不算完成。所有生成产物可重复构建，保存exact refs/lock/integrity和许可来源。
+## 5. 不在本批范围
 
-复用NMP createDeserializer/ProtoDef；framing/compression内部路径只出现于adapter。若现有Transform无法满足有界性，固定自研薄VarInt/frame/zlib wrapper，使用Node zlib并测试边界，不重写全部codec/完整physics。上游release升级不是本批自由选择项，不改追踪master。
+真实服务器互通测试、游戏资产/客户端运行、真实native输入和截图、完整正版登录、战斗/跑酷/游泳/飞行/全地形运动、模型训练、动态生成代码执行、全量Wiki/26.3规则导入、完整合成熔炼生产系统。后两类待现行研究返回后规划，不阻塞本批。
 
-已知五项无codec组件进入显式unsupported清单，禁止沿用void假装消费。近似shape保留来源标记，不能verified。提供版本/数据诊断命令，能显示覆盖矩阵，不输出“26.3全部支持”。
+## 6. 禁止留下开放题（用户最新约束）
 
-### B02 — 真正的原始TCP Relay
-
-实现独立Relay进程，Node net/stream监听127.0.0.1，固定目标映射，一个LOGIN身体绑定一个上游连接。STATUS是独立探测连接；不把ping当占用身体。双向直接socket原始字节，不创建高层NMP client/server，不通过writeRaw重封。
-
-默认handshake不改。显式配置启用时仅改首次完整handshake的host/port，保留其他字段和后续所有字节；目标来自档案，不受客户端任意host重定向。默认handshake上限8KiB/期限5s，超限拒绝该会话，记录这是产品限额。
-
-双向独立pause/resume/drain，应用在途字节计数；默认每方向高水位256KiB、低水位64KiB、硬上限4MiB、write-stall30s。达到硬限额受控关闭，不静默丢字节。错误、half-close、flush、双端shutdown幂等；关闭flush最长2s。
-
-observer异常不修改主通路，默认保留转发并暂停自主控制。Relay crash断线；Runtime crash时Relay可继续，必须由独立本地Supervisor持有进程生命周期。不得声称同socket热恢复。
-
-### B03 — 有界Observer与控制状态
-
-Relay只做有界frame追踪/投递，重型解压、typed parse、chunk/NBT进Worker。双向各自维护byteOffset/frameSeq/phase/compression，registry解释版本和跨向因果状态单独记录。不能用单个inPlay/compressionEnabled布尔值。
-
-初始限额：完整帧8MiB、解压32MiB、观察队列128frames且合计32MiB、解压并发2、单任务期限2s；压缩比超过256且展开超过1MiB视为观察预算拒绝。以上是可配置本地预算，不是MC官方最大值；超观察预算降级观察，原始转发仍按独立流控。
-
-前置字节/framing/解压无法保留控制连续性时全局unknown，不能丢任意TCP chunk后继续猜同步。只有已解出ID/phase且确认非控制包，才允许按域跳过完整包；发domain gap。压缩后未知类别的队列超载不能假定关键包没丢。
-
-实现LOGIN/CONFIG/PLAY/STATUS及热重配置跟踪；两方向压缩切换不按墙钟粗暴同步。没有可证明因果边界时有限挂起并标compression-ambiguous；schema可parse本身不足以认定唯一解释。不主动发送同步包解决歧义。
-
-未知包不能排除控制作用时phase unknown；加密请求立即收缩能力，协商进入密文后停止明文framing。worker迟到结果fence；worker重启没有无缺口检查点/重放则不得恢复healthy。主通路不持久化原始游戏流。
-
-### B04 — 领域投影与按依赖降级
-
-实际实现以下adapter：本地姿态报告/服务端修正、health/food、聊天、inventory/window/cursor、实体spawn/move/remove、chunk load/unload/block/light、respawn/dimension、registry事件。按固定schema实现，未证实字段不填默认0。
-
-每项带scope/context、source、frameSeq、observed/received时标、版本、完整性和证据引用。entityDelta相对轨迹与PositionPath绝对轨迹分开；missing relative delta使该实体轨迹unknown。entityId加spawnGeneration。
-
-unknown item component不能包内盲跳；整包不提交，相关库存/窗口incomplete，下一frame仍可继续。chunk无法定位受影响坐标时扩大失效范围；light失败不自动抹掉独立完整的碰撞信息。全量恢复只解除其coverage覆盖的缺口。
-
-CapabilityProvider动态计算，不因对象存在就ready；source fixture/simulated/client不可升格。完整新baseline后发布恢复，模型/技能执行时再次检查。实现domain coverage查询，网页和CLI看同一真值。
-
-### B05 — Windows真实命令分支与异步Bridge
-
-Bridge拆BodyReader/WorldReader/Capabilities/InputGateway，不暴露可写position、size、单个inventory数值、同步walk/place。真实Bridge适配Relay IPC＋Windows helper；模拟Bridge适配独立身体。生产技能不引用Fake类。
-
-helper同一解析/绑定/期限/去重/held-set状态机，最后INativeSink分real/no-op。完整键盘＋鼠标集合替换；PID/进程开始时间/HWND/bindingEpoch精确核对，未知focus/窗口状态拒绝。
-
-独立C# worker单调watchdog，stdin阻塞不阻塞期限检查；driver heartbeat成功后更新状态。pending/completed/unknown去重有界，helper重启control-uncertain，重新绑定前拒绝输入，不重放旧增量/文本。清理release/shutdown/transport.close分别尽力。
-
-SDL3 physical/logical key与Win32 scan code分开建映射和calibration profile，未校准真实运动unverified。当前不执行真实输入/截图；Linux只能报告静态/平台无关测试，Windows若可用只跑no-op分支。
-
-### B06 — IPC、Supervisor和CLI装配
-
-Relay采用Node child_process IPC/版本化Zod消息；Observer用worker_threads。IPC只包含控制状态、脱敏观察/引用、能力与诊断，不向Runtime暴露任意socket write。hello/session epoch、requestId、timeout、背压和断连有明确语义，默认IPC请求期限5s。
-
-本地Supervisor分别持有Runtime、Relay；Runtime退出不能让Relay误继承新的控制owner。helper心跳默认250ms，owner失联默认1s撤权/尽力release。Supervisor显式quit关闭全部；不自动重启游戏进程。进程重启最多3次/60s，超过暂停，避免坏循环。
-
-CLI bridge --mode fixture执行独立两端peer＋本项目relay的真实socket场景；inspect只本地装配检查；live代码存在、门禁关闭默认拒绝，本轮不运行。测试peer不是Minecraft引擎。
-
-## 3. U：CLI＋网页完整可操作控制台
-
-### U01 — ControlService、服务模式和附着CLI
-
-共享一个Runtime/ControlService，提供goal set/show、message、pause、resume、stop、cancel、chat、executions、effects、events、places、provider、save、status、doctor、quit/help。
-
-pause停止新决策/准入并等稳定交接，显示pausing；resume用新鲜状态；stop撤销自主goal generation并尽力停身体；cancel指定execution及子执行；save是Runtime checkpoint不是保存游戏世界。
-
-命令requestId＋payload hash幂等、expectedRevision CAS、明确accepted与terminal；所有写动作同Executor。人类控制消息和游戏聊天权限不同；未认证远端文本不能变内部命令。
-
-`npm run serve -- --profile simulated`启动持久服务，默认127.0.0.1:3000；`npm run cli -- attach --url http://127.0.0.1:3000`操控同实例。保留standalone兼容但不能共享同body/DB。服务默认DB为用户配置数据目录，测试用临时目录；status/doctor读实际组件，不new一个空内存Runtime作答。
-
-SIGINT/EOF/quit统一清理；attach EOF仅关闭CLI连接，不终止服务，明确shutdown命令才关闭Runtime。浏览器关闭/刷新也不改变Agent生命周期。
-
-### U02 — Fastify API、SSE和本地配对
-
-/api/v1提供status/capabilities、goals/tasks、executions/effects、places/memories、provider/config脱敏分页查询，POST /commands提交统一命令。共享Zod DTO；冲突409、未知/不允许字段400、无能力返回稳定code，不能用200伪装成功。
-
-SSE /events快照＋一致cursor避免订阅竞态，gap触发重新拉查询快照。每连接最多256事件/1MiB，heartbeat15s，客户端不可保留无限history。事件只包含脱敏领域数据，不原样推provider/协议流。
-
-默认loopback，同源生产静态托管，开发Vite proxy。初次一次性配对码交换HttpOnly/SameSite会话；不把token放URL，校验Host/Origin和写入CSRF token；无Origin的CLI使用本地配对取得独立bearer凭据，CLI认证方式不能绕过浏览器Origin检查。配对码单次、5分钟有效，不写日志/历史；终端受控展示。默认不配置公网/远程TLS。
-
-### U03 — 实用React网页
-
-React/TS/Vite，简单CSS和Canvas2D，无额外大型UI/3D框架。至少五个区：
-
-1. 对话/控制：给Agent的自然语言消息、目标/暂停/继续/停止/取消；游戏聊天单独入口，清楚显示已接纳/处理中/结果未知/已完成。
-2. 总览：会话/观察/身体/模型健康、当前目标与技能相位、等待原因、budget和恢复。
-3. 任务/执行/effect：依赖列表、时间线、取消、证据摘要、ambiguous解释，不提供强制成功按钮。
-4. 世界/记忆：姿态、维度、背包、地点/经历查询，选择高度层的已知局部顶视图；未知/历史/近似不同显示，不展示隐藏矿藏或fixture全图。
-5. 设置/诊断：provider选择/切换、profile/能力限制、过滤事件、trace导出；秘密只configured，不提供明文Key读取/编辑。
-
-自然语言消息实际进入ControlService/canonical conversation，不只是聊天气泡；展示Agent公开说明和工具摘要，不展示隐藏推理。UI处理空态、过期、断开、重连、拒绝；accepted不乐观变succeeded。按钮依能力禁用，后端仍校验。
-
-前端最多10Hz批更新，列表分页/窗口化、地图局部增量。浏览器重连不重放离线写命令，先按requestId查询。synthetic capture明确来源，不做真实桌面采集或网页WASD遥控。
-
-### U04 — CLI/Web同时操作与UI测试
-
-实现readline持续输入与序列化事件输出；CLI和网页同时改目标应CAS冲突，不last-write-wins覆盖。相同requestId从两入口提交只执行一次。服务退出有界，客户端离开清理订阅不泄漏Runtime。
-
-新增dev:web/build:web/test:web/test:web:e2e；测试React组件使用真实DTO和受控后端响应。Playwright E2E仅本地headless：配对→发目标→实际进展→改向→effect→刷新仍同Runtime→CLI attach取消→SSE重连。禁止截图，E2E操作网页不等于真实SendInput。
-
-环境缺浏览器时先检查已有可执行文件；没有则代码和HTTP/组件测试仍完成，E2E留明确not-run。可安装普通依赖，不以浏览器缺失为由做静态假页面。
-
-## 4. M：三维状态、规划与闭环Motor
-
-### M01 — 稀疏三维投影和几何资格
-
-连续Pose与BlockPos分开，y垂直，旧二维平面y→新z仅显式兼容层。稀疏chunk/section，状态ID按registry/data profile解释；未知区块/形状不当空气。
-
-查询AABB、支撑、净空、触达面、危险/流体；shapeOrigin与validationProfile独立保存。原版数据可靠项可用，approximate不放进可靠路径。首批模拟用明确定义full cube/上下半砖；stairs/door/fence/water复杂行为没有资格就unsupported。
-
-Motor近身内存一致视图，Skill局部前提，模型有限摘要；碰撞/可见/资源发现用途分开。区块已接收不等于玩家看见；模型和地图不得看到fixture未探索隐藏资源。
-
-### M02 — 局部动作图与预算A*
-
-ActionEdge关联primitive/version、入口/终点域、几何依赖、资源/风险、能力档案。固定首批walk、slab step、上升最多1格的短跳、下降最多1格的落步；不生成未知水/梯子/长跳/施工边。
-
-swept-volume查整段、禁止对角穿角，跳跃用有限轨迹和净空/落点检查。默认每搜索20,000扩展上限、每256次让出；重型搜索用worker，旧快照返回复核相关依赖，不阻塞Motor。
-
-结果固定COMPLETE/PARTIAL/NEEDS_OBSERVATION/BUDGET_EXHAUSTED/NO_PATH_IN_KNOWN_GRAPH/UNSUPPORTED_TRANSITION。partial终点必须可稳定，搜索预算耗尽不报永久不可达。动态障碍/地形只失效受影响段。
-
-### M03 — 五原语闭环和输入期限
-
-实现orient_to、walk_corridor、step_up、jump_short、controlled_drop。默认20Hz软实时，用观察位移/角度/支撑核对；相位包含检查/运行/核对/稳定/取消交接。跳跃接近→离地→空中→落地→稳定，撞头/未起跳/偏离分原因。
-
-InputPlan含context、owner/lease、issue time/clock domain、maxAge、deadline、snapshot/观察年龄、held-set/有限增量。过期不重新封装延长；鼠标丢回执读新朝向，不补发历史增量。UI/focus/校准未知拒绝。
-
-逻辑资源映射实际keyboard/pointer冲突，复合原子申请；地面正常改向停稳，空中有已验证恢复才接管。旧finally不能global clear新owner。无适用身体模式能力报control-lost/unsupported，不凭空保证松键安全。
-
-### M04 — 独立VoxelFixtureWorld/SimulatedBody
-
-世界独立持久/对象生命周期，不随Runtime重建清空。身体消费生产InputPlan，按版本化有限规则产生连续位置、yaw、碰撞、支撑、重力/短跳；不得沿规划path直接teleport或set目标位置。
-
-fixture控制面可注入改图、输入drop、观察延迟/gap、server correction、掉落/库存变化，Agent只读受限局部观察。生产规划/技能只依中立Bridge，不拿场景答案。保留旧二维测试做兼容，明确不能证明原版物理。
-
-### M05 — 进展与恢复控制器
-
-区分观察没更新、观察新但无进展、相位等待、外部阻挡、控制通道异常；不能以到终点欧氏距离每帧下降判进展。共享failureSignature/budget，连续相同失败3次冷却30s；无新证据不换ID无限试。
-
-局部纠偏→相关路段重规划→任务改选/暂停。observer局部失效只禁依赖动作，全局phase/framing失效撤自主身体控制；仅有独立新鲜证据和适配恢复器时允许有限稳定，否则control-lost。trace记录原因和接管owner。
-
-## 5. A：自主任务、记忆与技能闭环
-
-### A01 — GoalManager/TaskScheduler与事件驱动Agent
-
-任务有依赖/优先级/revision/budget/checkpoint/完成谓词，状态proposed/ready/running/waiting/succeeded/failed/canceled。模型提案最多32节点，拒绝环、未知技能/无能力；Runtime授予执行权，模型不授租约。
-
-唤醒固定目标变化、相关观察、技能结束、异常、有限idle timer；去重合并，不每tick调用模型。无模型时继续有效有限任务，到决策边界waiting-provider，不用隐藏全能硬编码Agent假装模型决策。
-
-人类message/goal最高正常改向来源，游戏聊天参与合作但不获内部权限。checkpoint保存任务语义/证据，恢复重算动作，不还原旧按键或脚本栈。status能解释当前工作、等待对象和继续条件。
-
-### A02 — 三类知识记忆实际工具
-
-Knowledge为版本化JSON规则文件；Spatial/Episodic用现有SQLite扩展。真实实现query_knowledge/query_memory/remember_place，规则与经历不能同函数返回同一places数组凑数。
-
-按稳定scope、类型、条件查询，默认最多20条/16KiB文本，分页；证据/时间/observed或inferred/再验证条件完整，冲突版本保留。关键完成/失败自动形成结构化经历摘要，无须额外模型调用。
-
-地点、frontier、路线摘要带版本/验证时间；重连不分库失忆。按知识版本过滤再检索，失败按primitive/环境条件检索防重复。普通轨迹可归档，pending effect/关键恢复证据不被清理。
-
-### A03 — 十一项技能与统一生命周期
-
-补齐旧五项navigate_to/place_one/send_chat/observe_ui/wait_for_condition，并增加look_at、explore_area、dig_one、collect_nearby、gather_blocks、return_to_place六项。
-
-- look_at走Motor并核验朝向。
-- explore到可执行frontier→观察→记录，按半径/步数/期限停止，不读真值地图。
-- dig检查站位/触达/目标/工具→瞄准→有限持续输入→释放→观察变化，接effect账本。
-- collect据实体/背包核对，消失不单独等于拾取成功。
-- gather分解已观察目标→导航→dig→collect→库存增量，外部抢先改变可换目标。
-- return查询scope内地点，重验路线，失败明确，不传送。
-
-生命周期validate/admit/run/verify/settled、子执行/cancel、资源/预算/能力统一。注册不可变version/schema/effect class/test profile，可配置禁用；未知版本fail closed。fixture只实现声明的普通方块/掉落规则，不宣称全MC合成/工具/掉落支持。真实profile无能力则拒绝，不能直接改真实世界投影制造成功。
-
-### A04 — SessionSupervisor、认证与客户端生命周期
-
-连接状态offline/connecting/observing/ready/disconnected/reconnecting/recovering/suspended；默认退避1/2/4/8/16/30s上限，连续8次暂停，人工resume开启新预算。只一个恢复owner。
-
-disconnect撤lease、fence模型、保留effects；新身份/基线后恢复任务。死亡bodyEpoch变化，重新读取实际库存；即使keepInventory配置也不伪造保留数量。
-
-Relay重连不等于原版客户端重新点进服务器。实现ClientLifecycleAdapter生产命令接线和fixture验证；真实菜单/截图能力未验证时unavailable，等待人工，不另起bot。当前不要求启动游戏验证。
-
-AuthCoordinator用配置化allowlisted模板＋提示证据＋secretRef，不硬编码唯一/login字符串。模型可建议模板/引用，但看不到密码、不任意指定外发目标或命令。fixture至少两种提示/模板，认证结果来自后续流程证据，不以发送成功认定。未知流程进入waiting-configuration并说明缺项，不反复猜密码；这不是向用户开放技术选型题。
-
-敏感输入refcount/token，结束后聊天历史仍可能有秘密；屏蔽capture与普通日志/history/trace敏感payload，不丢弃整个无关世界流。认证响应丢失保留ambiguous，attempt budget有界。
-
-### A05 — 按需视觉、能力目录与有界长期运行
-
-capture_view带用途/来源/帧时间/相关版本/敏感标记，真实capture未验证不启用；synthetic PNG走两个provider图片请求fixture，不截图真实桌面。不建设渲染重建。
-
-工具目录随能力发布，旧调用执行时再核验。所有边界ModelProvider/ClientBridge/WorldReader/LocalPlanner/PrimitiveController/SkillRegistry/MemoryStore可替换，沿用现有有效目录结构，不为了命名重构全库。
-
-默认上限：event ring1024、trace ring4096、普通history200条或256KiB、chat queue16、Task最多32活动节点、运行command去重4096条/24h（durable pending/unknown不因缓存TTL删除）。history裁剪保留工具配对并保留目标/未决effect引用；旧归档可分页查询。单个饱和对象有明确拒绝/合并/归档策略，禁止无限数组。
-
-## 6. V：综合验证、长运行和交付
-
-### V01 — 十四个贯通场景
-
-每场景使用真实RuntimeFactory/ControlService/Router/Executor/Store，只注入时钟/模型传输/身体/外部世界。不能直接save succeeded或打印预置成功字段。
-
-| 场景 | 必须出现的证据 |
-|---|---|
-| S01 网页＋CLI改向 | 尚未完成的运动中换目标，旧响应不能写，新目标实际推进 |
-| S02 三维净空/绕障 | swept collision拒绝穿角/撞头，逐周期输入产生位置变化 |
-| S03 外部堵路 | 相关route失效并绕行/解释无已知路，预算有界 |
-| S04 探索与地点 | 局部观察发现frontier/地点，重启后检索和重验返回 |
-| S05 采集组合 | observe→navigate→dig→collect→库存谓词，别人先挖也能处理 |
-| S06 ambiguous保留 | 技能ambiguous不被Executor/Router改confirmed，依赖受限 |
-| S07 dispatch崩溃 | place/chat/dig应用后丢receipt，重建不盲重发 |
-| S08 跨会话scope | 同世界新epoch可核对，异账号/世界/维度不误确认，旧输入被拒 |
-| S09 provider故障 | 429/截断/取消/切换，多轮实际请求合法且无重复写 |
-| S10 真socket Relay | 三角色字节相等，拆包/合包、半关闭、背压、握手唯一改写 |
-| S11 Observer失效 | worker异常/队列超限不改转发字节，domain/global失效正确 |
-| S12 26.3领域 | entityDelta/PositionPath区分、void组件拒绝、chunk/light可用范围与来源明确 |
-| S13 认证/生命周期 | 两类fixture模板、重连新epoch、secret不落日志、真实菜单不可用诚实显示 |
-| S14 UI/进程重建 | 刷新不重启Agent，CLI看同execution，服务崩溃恢复且Relay边界清楚 |
-
-T1传输、T2 framing/control、T3领域、T4真实原版证据分别报告。T4本轮不运行。S09/S01至少有生产provider serializer＋录制transport路径，不能全靠ScriptedProvider证明两家API集成。
-
-T2用明确格式的frame/压缩fixture测试边界和歧义，schema测试标schema来源。T3优先使用研究提供vecDelta对照向量，记录它是上游作者来源，不称本团队抓包；缺独立PositionPath/chunk/config样本则not-run oracle检查，但实现/故障合同测试继续。
-
-### V02 — 崩溃、写失败与低资源长运行
-
-实际Store写入/commit边界注入失败；覆盖CAS冲突、过期checkpoint、旧finalizer、start失败重试、shutdown竞态。数据库独立临时目录并清理，不固定/tmp文件串测试。外部世界跨Runtime保留。
-
-固定seed虚拟时间60分钟，至少50次任务转换、10次fixture连接中断/恢复、5次Runtime/Store重建。数值来自事件计数；不要求物理真实世界时间。检查队列/历史上限、租约/监听器/计时器/worker和pending promise清理，合理pending effects仍保留。
-
-短真实调度smoke默认30s，不访问外网；记录事件循环延迟、RSS和队列峰值，不设机器相关虚假性能保证。默认测试单worker、虚拟时钟、不忙等或长sleep；失败先核对测试前提，不能弱化/跳过必做行为制造绿色。
-
-### V03 — trace、回放与操作指南
-
-有界JSONL trace包含scope/context及goal/execution/primitive/effect/command ID、证据引用、阶段/能力/错误和恢复关联。敏感值脱敏，原始协议默认不录。CLI trace export/replay，仅诊断回放，无输入/游戏外发；gap明确影响哪些视图。
-
-提供真正可执行的统一命令：
-
-```
-npm run typecheck
-npm run build
-npm run build:web
-npm run test:offline
-npm run test:integration:offline
-npm run test:soak:offline
-npm run test:web
-npm run test:web:e2e
-npm run demo:offline
-npm run demo:autonomy -- --scenario gather-return
-npm run doctor -- --profile simulated
-npm run bridge:fixture
-npm run cli -- bridge --mode inspect --config configs/client-offline.example.json
-npm run serve -- --profile simulated
-npm run cli -- attach --url http://127.0.0.1:3000
-```
-
-serve/attach作为持续运行入口不要求最终验证永不退出，使用受控子进程脚本验证后shutdown。demo必须实际走共享应用路径，旧CLI默认demo行为可兼容，但README主入口改serve。
-
-### V04 — Node22 CI、协同review与准确交付
-
-目标Node22。优先使用已有Node22，缺少时允许安装该开发运行时；若网络/环境阻止，记录实际版本，仍完成CI配置和其他任务。不得把Node20结果称满足minecraft-protocol的>=22要求。CI不访问游戏/API，Node依赖安装与本地夹具是允许项；浏览器E2E单独job，Windows helper no-op可用则独立job，没实际运行的云端job不能写通过。
-
-最终只更新已有PROGRESS/DELIVERY_REPORT/PLANNING_AGENT_HANDOFF和必要README，不新建重复文档集。每个F/B/U/M/A/V编号记录：implemented-offline / implemented-unverified / blocked / not-implemented，具体主要文件、实际测试名/命令和限制。实现状态与验证状态两列，不能有测试没实现或有实现冒充真环境通过。
-
-报告必须单列：
-
-- 哪些旧遗留真正解决，哪些仍未解决及根因。
-- 支持矩阵simulated/protocol-fixture/Windows-no-op/真实client，代码存在、测试运行、能力启用分开。
-- exact依赖与生成方式、原版样本来源/缺口、Node22与Windows实际证据。
-- 本地HEAD、提交列表、review反馈及最终复验；不默认推送。
-
-本批review只集中修改的契约和交界，不再全仓200项审计。先交完整可审阅工作，再处理用户review；不要提前以“剩下未来补”结束本批核心范围。
-
-## 7. 明确暂不实现，避免范围漂移
-
-本批不实现26.4快照/多历史协议、正版认证/加密MITM、双端终止代理、额外bot、服务端权限、客户端Mod/注入、完整战斗/合成科技树/建造/搭桥/水中攀爬、训练、自动生成代码执行、向量数据库、公网多用户部署。数据缺失不靠视觉重建、未知形状默认空气或模拟传送绕过。
-
-这不缩减F/B/U/M/A/V既定30项；完整实现其中可实现代码、完成离线证据，并诚实保留确实需要外部数据/环境的验证边界。
+开发 Agent 不需要再次询问是否做上述功能、是否接Motor、是否做Web/E2E、是否实现socket、是否保持unsupported。以上均已决定。常规模块命名、文件拆分和局部编码方案由开发 Agent 在现有架构内决定并落地，不向用户抛选项。
+
+- codec固定顺序：核实当前锁定数据 → 核实既有研究指定的固定候选 → 对通过来源与schema/native一致性检查的候选做可复现vendor/codegen。都不满足则该26.3域保持unavailable，继续其余任务；不切旧版游戏、不凭空手写未知字段、不要求用户在方案中二选一。
+- 导航继续现有有界3D动作图A*，Motor继续既有确定性闭环；不等待算法调研再接线，也不本批更换成MPC或学习策略。未知动作禁用。
+- 同存储目录Runtime采用独立、原子、跨进程的所有权锁；复用仓库已有合适实现，否则实现薄层并验证进程竞争。锁不能确认可回收就拒绝第二实例，不删除未知owner锁；CLI/Web通过attach工作。
+- 本批知识实现来源/版本/coverage与有界查询，不实现全量数据导入或获取规划器；生产数据缺失返回unknown。研究返回后另行规划扩大功能。
+- 五轮全面review由当前Agent连续完成；不要求用户安排五个人，不以等待协同review作为中途停止条件。
+- 缺失外部资料以精确补件清单报告，不成为架构选择题；仅遇必须由用户处理的权限、不可安全解决的用户修改冲突或硬边界变更才暂停相关操作。
