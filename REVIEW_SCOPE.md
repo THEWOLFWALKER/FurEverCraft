@@ -1,9 +1,11 @@
 # Review Scope — FurEverCraft P01–P23 离线开发分支
 
-> 分支：`review/furevercraft-p01-p23-2026-10-24`
+> 分支：`review/furevercraft-p24-round2-2026-10-24`
 > 基线：`main@c27dcfa`（用户报告的已知基线）
-> 本分支 HEAD：撰写本文时的合并结果；以 `git log -1` 为准
+> 本分支 HEAD：P01–P23 + P24 准备项 + 内部 Review Round 1–2 修复（以 `git log -1` 为准）
 > 运行环境：Linux x86_64，Node `v22.23.4`，npm `10.9.9`
+>
+> **外部 review 交接**：按用户最新指令，内部五轮 review 在 Round 2 后停止，Round 3–5 改由外部 review 给出问题。P24 不标记完成；外部问题返回后逐项修复并回归。
 
 本文用于说明这次 review 应该看什么、哪些是已完成、哪些是明确未完成或受外部阻塞，尽量避免把“尚未实现/按设计保持不可用”误报为回归缺陷。**这不是对 review 范围的限制**；任何真实的正确性、并发、安全、资源上界、测试可信度问题都欢迎指出。
 
@@ -83,7 +85,7 @@ E2E 使用 Playwright 1.64.1 + Chrome for Testing 156.0.8078.4（headless，无�
 | P21 doctor/trace/replay | done-offline | `src/diagnostics/doctor.ts`、`trace.ts`，`tests/diagnostics/**`（15） |
 | P22 Playwright E2E | done-offline（模拟 body + 真实 server/浏览器） | `tests/e2e/**`，2 tests passed |
 | P23 组合故障/长时 | done-offline | `tests/unit/p23-*`、`tests/integration/p23-process-faults.test.ts`、`tests/soak/p23-fault-soak.test.ts` |
-| P24 最终一致性与五轮 review | **未完成** | 见第 5 节；Round 1–2 已完成 |
+| P24 最终一致性与五轮 review | **未完成（外部 review 接管）** | 内部 Round 1–2 已完成并合并；按用户指令停止内部 Round 3–5，等待外部 review 问题后收尾 |
 
 状态词只表示：`done-offline` = 离线可执行并有测试；`done-limited` = 实现范围/验证边界受限，限制见下。
 
@@ -91,7 +93,7 @@ E2E 使用 Playwright 1.64.1 + Chrome for Testing 156.0.8078.4（headless，无�
 
 ## 5. 明确尚未完成的部分（请勿按缺陷计数，但可以指出实现上会 blocking 的点）
 
-1. **P24 与五轮 review 进行中**：P24 的脚本/端点/文档已落地；Round 1（完整性与真实接线）与 Round 2（并发、崩溃与生命周期）已执行并修复发现，Round 3–5 尚未执行。
+1. **P24 与五轮 review 未完成（外部 review 接管）**：P24 的脚本/端点/文档已落地；内部 Round 1（完整性与真实接线）与 Round 2（并发、崩溃与生命周期）已完成并合并。按用户最新指令，内部 Round 3–5 不再执行，改由外部 review 给出问题；P24 不标记完成，待外部结果修复后再收尾。
 2. **仓库进度文档已更新到 P24 Round 2**：`PROGRESS.md`、`WORKSTREAM.md`、`DELIVERY_REPORT.md`、`CLAUDE.md` 反映当前状态；最终一致性整理仍待 P24 收尾。
 3. **`trace:export` / `trace:replay` npm scripts 已在 P24 加入**，并有真实 CLI 调用记录。
 4. **`/api/v1/doctor` 已在 P24 加入**，复用 `ControlService.diagnostics()` 与同一条认证路径。
@@ -151,6 +153,6 @@ npm run demo:offline && npm run doctor
 
 ## 9. 分支说明
 
-- 本分支：`review/furevercraft-p01-p23-2026-10-24`
-- 早先 P22 子任务曾推送过 `review/p22-e2e`；以本分支为准，`review/p22-e2e` 可视为中间产物。
+- 本分支：`review/furevercraft-p24-round2-2026-10-24`（含 P01–P23、P24 准备项、Round 1–2 修复）
+- 上一检查点：`review/furevercraft-p01-p23-2026-10-24`、更早的 `review/p22-e2e`，均可视为中间产物。
 - 未推送 `main`，未部署、未发布。

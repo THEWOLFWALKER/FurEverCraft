@@ -10,6 +10,10 @@ The v0.2 design in `docs/design/` and implementation batch in `NEXT_BATCH.md` re
 
 The target game profile is Minecraft Java 26.3. Protocol/data/runtime values are candidate evidence and must be validated against the pinned dependency manifest. This repository is not yet evidence of live 26.3 interoperability.
 
+## External review checkpoint
+
+The latest external-review checkpoint branch is `review/furevercraft-p24-round2-2026-10-24`. Start with `REVIEW_SCOPE.md` for what to review, current P01–P24 status, known gaps and suggested focus areas, then the v0.2 architecture documents in `docs/design/`. The internal five-round review stopped after Round 2 by user instruction; Rounds 3–5 are owned by the external review. P24 remains `not-done` until those findings are fixed.
+
 ## Scope
 
 This development batch is **P01–P24** in `NEXT_BATCH.md`. The older F/B/U/M/A/V groups are historical traceability labels, not the current task numbering. The batch closes the C1/C2/C3 convergence work and related prior-stage runtime gaps; it is not a demo-only slice.

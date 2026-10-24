@@ -49,14 +49,15 @@ P24 work adds `tests/integration/p24-doctor.test.ts`, the authenticated doctor e
 | P21 doctor/trace/replay | done-offline | `src/diagnostics/doctor.ts`, `src/diagnostics/trace.ts`, `src/control/service.ts` `diagnostics()`; `trace:export`/`trace:replay` CLI; authenticated `GET /api/v1/doctor` added in P24 | `tests/diagnostics/doctor.test.ts` (8), `tests/diagnostics/trace.test.ts` (7), `tests/integration/p24-doctor.test.ts` |
 | P22 Playwright E2E | done-offline (real server/browser; simulated body) | `tests/e2e/**`, `playwright.config.ts` — pairing, goal, execution, effects, cancel, pause/resume, SSE reconnect; browser+CLI share one Runtime | 2 Chromium tests passed; no screenshot/video/trace |
 | P23 fault combinations/soak | done-offline | `tests/unit/p23-fault-combinations.test.ts`, `tests/unit/p23-provider-motor.test.ts`, `tests/integration/p23-process-faults.test.ts`, `tests/soak/p23-fault-soak.test.ts` — child crashes, slow observer, IPC backpressure, write failures, provider/Motor faults; 60 virtual minutes + short wall-clock smoke | 4 integration tests, 1 soak test, combined-fault units |
-| **P24 final consistency + five reviews** | **not-done (in progress)** | P24 adds trace npm scripts, authenticated `/api/v1/doctor` plus integration test, current docs, Round 1 fixes and Round 2 lifecycle/crash fixes; Rounds 3–5 not started | `package.json`, `src/server/index.ts`, `tests/integration/p24-doctor.test.ts`, `tests/unit/p24-round2.test.ts`, `tests/integration/integration-wiring.test.ts`; review table below |
+| **P24 final consistency + five reviews** | **not-done (external review handoff)** | P24 adds trace npm scripts, authenticated `/api/v1/doctor` plus integration test, current docs, Round 1 fixes and Round 2 lifecycle/crash fixes. Per user instruction the internal five-round contract stopped after Round 2; Rounds 3–5 are replaced by the user's external review, and P24 stays `not-done` until those findings are fixed | `package.json`, `src/server/index.ts`, `tests/integration/p24-doctor.test.ts`, `tests/unit/p24-round2.test.ts`, `tests/integration/integration-wiring.test.ts`; review table below |
 
 ## P24 status at start of this work
 
 - The worktree was initially created from the P01–P04 lineage (`c27dcfa`), then fast-forwarded to the actual `p24-final` HEAD `ccb9f8e` before review; Round 2 started at `033f29a`.
 - At the start, **zero of the five review rounds from `REVIEW.md` had been completed**, so P24 remains `not-done`.
 - The P24 documentation/consistency items completed before Round 1 are: missing `trace:export`/`trace:replay` npm scripts, authenticated `GET /api/v1/doctor`, its integration test, and truthful updates to `CLAUDE.md`, `PROGRESS.md`, `WORKSTREAM.md`, `DELIVERY_REPORT.md`.
-- Round 1 is recorded in `DELIVERY_REPORT.md`; it fixed the public 3D wiring, capability routing, effect/receipt gaps and 3D/2D state leaks. Round 2 is also recorded there and fixed stop/pause terminality, bridge-service control enforcement, crash-restart execution/receipt settlement, account/dimension fencing, abort-aware waits, graceful child shutdown and bounded retention. Rounds 3–5 and the post-round final consistency pass remain owed.
+- Round 1 is recorded in `DELIVERY_REPORT.md`; it fixed the public 3D wiring, capability routing, effect/receipt gaps and 3D/2D state leaks. Round 2 is also recorded there and fixed stop/pause terminality, bridge-service control enforcement, crash-restart execution/receipt settlement, account/dimension fencing, abort-aware waits, graceful child shutdown and bounded retention.
+- Per the user's latest instruction, the internal five-round review stopped after Round 2 and passes to the user's external review. **Rounds 3–5 were not run internally**, and P24 remains `not-done`. Findings returned by the external review will be fixed with targeted regression before P24 is closed.
 
 ## Review rounds
 
@@ -64,9 +65,9 @@ P24 work adds `tests/integration/p24-doctor.test.ts`, the authenticated doctor e
 |---|---|---|
 | Round 1 — completeness/real wiring | completed 2026-10-24 | Whole-repo scan and four chain traces; 9 findings fixed, 1 external projection boundary documented; see `DELIVERY_REPORT.md` |
 | Round 2 — concurrency/crash/lifecycle | completed 2026-10-24 | Whole-repo chain trace with injected ordering/failures; 10 findings fixed; see `DELIVERY_REPORT.md` |
-| Round 3 — protocol/data/permissions | not-done | not started |
-| Round 4 — user flows/test credibility | not-done | not started |
-| Round 5 — final independent reread/regression | not-done | starts only after rounds 1–4 are closed |
+| Round 3 — protocol/data/permissions | not-run — external review | internal contract stopped after Round 2 by user instruction; external review owns this round |
+| Round 4 — user flows/test credibility | not-run — external review | internal contract stopped after Round 2 by user instruction; external review owns this round |
+| Round 5 — final independent reread/regression | not-run — external review | internal contract stopped after Round 2 by user instruction; external review owns this round |
 
 ## Known limits and external blocks
 

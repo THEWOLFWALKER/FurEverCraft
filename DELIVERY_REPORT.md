@@ -47,7 +47,7 @@ Full evidence paths and test counts are in `PROGRESS.md`; implementation/test lo
 | Control/Agent | P14–P18 | P14–P16 done-offline (CLI, web, security/SSE); P17/P18 done-limited (injected provider transport, limited skill lifecycle) |
 | Knowledge/Diagnostics | P19–P21 | P19/P20 done-limited (fixture knowledge, bounded scoped memory with optional z); P21 done-offline (doctor/trace/replay) |
 | Verification | P22/P23 | done-offline — real headless Playwright E2E with fixture body; combined faults + 60 virtual-minute soak + wall-clock smoke |
-| Finalization | P24 | **not-done / in progress** — docs, trace scripts, doctor endpoint, Round 1 and Round 2 complete; Rounds 3–5 not started |
+| Finalization | P24 | **not-done / external review handoff** — docs, trace scripts, doctor endpoint, Round 1 and Round 2 complete; internal Rounds 3–5 stopped by user instruction and replaced by external review |
 
 ## Exact 26.3 data gaps
 
@@ -71,13 +71,11 @@ The installed dependency tree does not provide verified Minecraft 26.3 codec/dom
 - **No screenshots:** E2E explicitly disables screenshots, video and traces; no visual evidence is claimed.
 - **CI unobserved:** Node 22 and Playwright pass locally; cloud CI results are not known.
 
-## What P24 and the remaining rounds owe
+## External review handoff (P24)
 
-1. Rounds 3–5 of `REVIEW.md` are still owed; Rounds 1–2 are complete and recorded below.
-2. Round 3 (protocol/data/permissions), Round 4 (user flows/test credibility) and Round 5 (independent reread/regression) each still need the same start/end commit, coverage, finding and regression evidence.
-3. After round 5, perform the final consistency pass over docs/config/scripts/capability claims/Node-22 CI, then rerun the standard checks.
-4. Only then mark P24 complete. P24 and Rounds 3–5 remain **not-done** at the time of this report.
-5. The real 26.3 relay→decoder→projector→WorldState chain remains blocked on 26.3 schema/native/data; the current observer emits frame metadata only.
+Per the user's latest instruction, the internal five-round review contract was stopped after Round 2 and is replaced by the user's external review. **Rounds 3–5 were not run internally.** P24 therefore remains `not-done`; findings returned by the external review will be fixed with targeted regression, and only then can P24 be closed.
+
+`REVIEW_SCOPE.md` is the handoff document: architecture chains, P01–P23 status, review focus areas, known limitations, and the items that are deliberately unimplemented or externally blocked. The real 26.3 relay→decoder→projector→WorldState chain remains blocked on missing 26.3 schema/native/data; the current observer emits frame metadata only.
 
 ## Honest limits that must not be misreported
 
@@ -136,7 +134,7 @@ No finding was dismissed as false-premise. The only external block remains the r
 
 ### Remaining affected tasks
 
-- P24 remains **in progress**: Rounds 2–5 and the final consistency pass are owed.
+- P24 remains **not-done**: internal Round 3–5 stopped after Round 2 and replaced by the user's external review.
 - P08 remains **done-limited / externally blocked** for real 26.3 projection; the observer emits no typed packet payload, and synthetic projectors are not a production substitute.
 - P02/P03/P11/P13/P20 moved from the previously limited/injected-only state to an explicit public `simulated-3d` assembly; they remain simulated evidence, not real-client validation.
 - The `simulated-3d` fixture body and the legacy fake bridge can still carry separate state for legacy-only tools (place/look/chat); this is documented as a fixture limitation, not production capability.
@@ -191,6 +189,6 @@ No finding was dismissed as false-premise. One behavior was deliberately retaine
 
 ### Remaining affected tasks
 
-- P24 remains **in progress**: Rounds 3–5 and the final consistency pass are still owed.
+- P24 remains **not-done**: internal Rounds 3–5 were stopped after Round 2 and replaced by the user's external review.
 - P08/P10/P11/P17/P18/P19/P20 remain `done-limited`/externally blocked exactly as recorded above; Round 2 changed lifecycle/fencing behavior but did not create 26.3 decode or live evidence.
 - No new external block was introduced. The bridge-service control gate is test-verified; a production attachment still needs its operator/observation arming step, which is the existing P09 contract.

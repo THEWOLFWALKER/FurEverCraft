@@ -57,7 +57,7 @@ The child-process integration tests are conditionally skipped only when `dist/` 
 | P21 doctor/trace/replay | done-offline | `src/diagnostics/doctor.ts`, `trace.ts`, `ControlService.diagnostics`; diagnostics 15; P24 adds `/api/v1/doctor` + test |
 | P22 Playwright E2E | done-offline (simulated body) | `tests/e2e/**`, `playwright.config.ts`; 2 Chromium tests |
 | P23 fault combinations/soak | done-offline | `tests/unit/p23-*`, `tests/integration/p23-process-faults.test.ts` (4), `tests/soak/p23-fault-soak.test.ts` (1) |
-| P24 final consistency/five reviews | not-done (in progress) | P24 scripts/endpoint/test/docs done; Round 1 and Round 2 completed and fixed; Rounds 3–5 not started |
+| P24 final consistency/five reviews | not-done (external review handoff) | P24 scripts/endpoint/test/docs done; Rounds 1–2 completed and fixed; internal Rounds 3–5 stopped by user instruction and replaced by external review |
 
 ## P24 work items
 
@@ -67,8 +67,8 @@ The child-process integration tests are conditionally skipped only when `dist/` 
 | Authenticated `GET /api/v1/doctor` | done-offline | `src/server/index.ts` uses the same `authorizeRequest` path; returns `redact(control.diagnostics())` |
 | Doctor endpoint integration test | done-offline | `tests/integration/p24-doctor.test.ts` — 401 without auth, 403 foreign Origin, paired session and CLI bearer both get the truthful P21 report, no secrets |
 | Current docs | done-offline | `CLAUDE.md`, `PROGRESS.md`, `WORKSTREAM.md`, `DELIVERY_REPORT.md` |
-| Five review rounds | in progress | Round 1 completed; Round 2 completed (`b6d7f42`); Rounds 3–5 pending |
-| Final post-review consistency/checks | not-done | depends on the five rounds |
+| Five review rounds | external review handoff | Round 1 completed; Round 2 completed (`b6d7f42`); internal Rounds 3–5 stopped by user instruction, external review supplies findings |
+| Final post-review consistency/checks | not-done | depends on external review findings |
 
 ## Review rounds
 
@@ -78,9 +78,9 @@ Rounds are executed **one at a time**; a round is not closed until its findings 
 |---|---|---|
 | Round 1 — completeness/real wiring | completed 2026-10-24 | Whole-repo + chain review; 9 findings fixed, projection boundary documented; evidence in `DELIVERY_REPORT.md` |
 | Round 2 — concurrency/crash/lifecycle | completed 2026-10-24 | Whole-repo chain trace with injected ordering/failures; 10 findings fixed (`b6d7f42`); evidence in `DELIVERY_REPORT.md` |
-| Round 3 — protocol/data/permissions | not-done | pending |
-| Round 4 — user flows/test credibility | not-done | pending |
-| Round 5 — final independent reread/regression | not-done | pending |
+| Round 3 — protocol/data/permissions | not-run — external review | internal contract stopped after Round 2 by user instruction |
+| Round 4 — user flows/test credibility | not-run — external review | internal contract stopped after Round 2 by user instruction |
+| Round 5 — final independent reread/regression | not-run — external review | internal contract stopped after Round 2 by user instruction |
 
 ## Prior work included in the baseline
 
