@@ -96,6 +96,7 @@ export class MotionController {
   private currentRoute?: NavRoute;
   private running = false;
   private inputIssued = false;
+  private releaseFailed = false;
   private readonly budget: ControlBudget;
   private readonly progress: ProgressController;
 
@@ -143,6 +144,7 @@ export class MotionController {
     this.currentLeaseId = request.leaseId;
     this.releasePromise = undefined;
     this.inputIssued = false;
+    this.releaseFailed = false;
     this.running = true;
     let ticks = 0;
     let replans = 0;
@@ -159,7 +161,7 @@ export class MotionController {
       return {
         status, outcome,
         ...(reason ? { reason } : {}), ...(reasonCode ? { reasonCode } : {}),
-        pose: finalPose ? { ...finalPose } : null, ticks, replans, released: true,
+        pose: finalPose ? { ...finalPose } : null, ticks, replans, released: !this.releaseFailed,
         ...(this.currentRoute ? { route: this.currentRoute } : {}),
         target: { ...target },
         evidence: 'simulated-control-loop',
@@ -418,10 +420,13 @@ export class MotionController {
   }
 
   private reached(pose: Pose3D, target: BlockPos, tolerance: number, supported: boolean): boolean {
+    void tolerance;
     const block = poseBlock(pose);
+    // The destination is a block. Being inside it with the expected vertical
+    // level is the landing contract; a perpendicular offset inside the same
+    // block is not a failure for cardinal-only movement.
     return supported
       && block.x === target.x && block.y === target.y && block.z === target.z
-      && horizontalDistance(pose, { x: target.x + 0.5, z: target.z + 0.5 }) <= tolerance
       && Math.abs(pose.y - target.y) <= 0.2;
   }
 
@@ -445,7 +450,13 @@ export class MotionController {
 
   private async releaseInput(): Promise<void> {
     if (!this.currentOwnerToken) return;
-    try { await this.body.release(this.currentOwnerToken); } catch { /* release is best effort; the sink owns its own audit */ }
+    try {
+      await this.body.release(this.currentOwnerToken);
+    } catch {
+      // A rejecting sink may still hold input. Report that honestly instead of
+      // claiming release succeeded. Never touches a different owner.
+      this.releaseFailed = true;
+    }
   }
 
   private async stopAndRelease(): Promise<void> {

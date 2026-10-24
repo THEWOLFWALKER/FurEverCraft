@@ -61,11 +61,22 @@ export function stepMatchesPose(step: RouteStep, pose: Pose3D): boolean {
   return block.x === step.edge.to.x && block.y === step.edge.to.y && block.z === step.edge.to.z;
 }
 
-/** True when the horizontal position is within the edge's landing tolerance. */
+/**
+ * Landing check for one grid edge. The body must be inside the destination
+ * cell, supported vertically, and within tolerance along the travel axis. The
+ * perpendicular offset is not required to be near the centre: a body that
+ * starts off-centre in that axis cannot correct it with a cardinal walk, and
+ * demanding a radial centre would make ordinary starts fail and overshoot.
+ */
 export function stepLanded(step: RouteStep, pose: Pose3D): boolean {
-  return stepMatchesPose(step, pose)
-    && horizontalDistance(pose, centerOf(step.edge.to)) <= step.landingTolerance
-    && Math.abs(pose.y - step.edge.to.y) <= 0.2;
+  const block = poseBlock(pose);
+  if (block.x !== step.edge.to.x || block.y !== step.edge.to.y || block.z !== step.edge.to.z) return false;
+  if (Math.abs(pose.y - step.edge.to.y) > 0.2) return false;
+  const from = centerOf(step.edge.from);
+  const to = centerOf(step.edge.to);
+  if (to.x !== from.x) return step.edge.to.x > step.edge.from.x ? pose.x >= to.x - step.landingTolerance : pose.x <= to.x + step.landingTolerance;
+  if (to.z !== from.z) return step.edge.to.z > step.edge.from.z ? pose.z >= to.z - step.landingTolerance : pose.z <= to.z + step.landingTolerance;
+  return horizontalDistance(pose, to) <= step.landingTolerance;
 }
 
 /** World-space direction of an edge, used for turning and body-relative input. */

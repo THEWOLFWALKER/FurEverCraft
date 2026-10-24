@@ -142,7 +142,9 @@ export function selectExploreTarget(body: BodyAdapter, observation: WorldObserva
   for (const cell of observation.cells.values()) {
     if (cell.cell !== 'free') continue;
     const dx = Math.abs(cell.pos.x - origin.x), dz = Math.abs(cell.pos.z - origin.z), dy = Math.abs(cell.pos.y - origin.y);
-    if (dx > radius || dz > radius || dy > 1) continue;
+    // Only same-level frontiers are executable with the current walk/jump profile;
+    // a cell one block down would need a controlled drop, which is disabled.
+    if (dx > radius || dz > radius || dy !== 0) continue;
     if (dx + dz === 0) continue;
     if (world.support(cell.pos).status !== 'blocked') continue;
     if (world.queryAabb({ minX: cell.pos.x + 0.15, minY: cell.pos.y, minZ: cell.pos.z + 0.15, maxX: cell.pos.x + 0.85, maxY: cell.pos.y + 1.8, maxZ: cell.pos.z + 0.85 }).status !== 'clear') continue;
@@ -160,6 +162,10 @@ export async function exploreBody(
   options: BodyNavigationOptions,
 ): Promise<BodyControllerResult & { executionId: string; path: string[]; exploreTarget?: BlockPos }> {
   const observation = await body.observe();
+  const usable = observationUsable(observation, { maxAgeMs: 500, now: clock.now(), context: body.context });
+  if (!isReal3DObservation(observation) || !usable.ok) {
+    return { ...failedNavigation(usable.reason ?? 'legacy-observation-not-3d') };
+  }
   const target = selectExploreTarget(body, observation, radius, clock.now());
   if (!target) {
     return { ...failedNavigation('no-executable-frontier') };
@@ -196,6 +202,10 @@ export async function gatherBody(body: BodyAdapter, clock: Clock, block: string,
   const target = await body.findBlock(block);
   if (!target) return { executionId, status: 'failed', reason: `no-observed-block:${block}`, collected: 0, items: [], observedFree: false };
   const observation = await body.observe();
+  const initialUsable = observationUsable(observation, { maxAgeMs: 500, now: clock.now(), context: body.context });
+  if (!isReal3DObservation(observation) || !initialUsable.ok) {
+    return { executionId, status: 'failed', reason: initialUsable.reason ?? 'legacy-observation-not-3d', target, collected: 0, items: [], observedFree: false };
+  }
   const stand = standingPosition(observation, target);
   if (!stand) return { executionId, status: 'failed', reason: 'no-supported-standing-cell', target, collected: 0, items: [], observedFree: false };
   const current = poseBlock(observation.pose);
@@ -205,6 +215,17 @@ export async function gatherBody(body: BodyAdapter, clock: Clock, block: string,
     if (navigation.status !== 'confirmed') {
       return { executionId, status: navigation.status === 'canceled' ? 'canceled' : 'failed', reason: navigation.reason ?? 'navigation-failed', target, navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path, ...(navigation.reason ? { reason: navigation.reason } : {}) }, collected: 0, items: [], observedFree: false };
     }
+  }
+  // Re-observe after navigation: the dig must be based on fresh evidence that the
+  // target is still present, not on the observation that selected the route.
+  const beforeDigObservation = await body.observe();
+  const freshUsable = observationUsable(beforeDigObservation, { maxAgeMs: 500, now: clock.now(), context: body.context });
+  if (!isReal3DObservation(beforeDigObservation) || !freshUsable.ok) {
+    return { executionId, status: 'failed', reason: freshUsable.reason ?? 'legacy-observation-not-3d', target, ...(navigation ? { navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path } } : {}), collected: 0, items: [], observedFree: false };
+  }
+  const targetCell = beforeDigObservation.cells.get(`${target.x},${target.y},${target.z}`);
+  if (targetCell?.cell !== 'blocked') {
+    return { executionId, status: 'failed', reason: 'target-not-observed-blocked', target, ...(navigation ? { navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path } } : {}), collected: 0, items: [], observedFree: false };
   }
   // Navigation is not the side effect; the dispatch boundary is immediately
   // before the dig so the caller can persist its barrier while all preconditions

@@ -94,11 +94,14 @@ export class SimulatedBody implements InputGateway, BodyReader {
     if (now > plan.deadline || now - plan.generatedAt > plan.maxAge) return { commandId: plan.commandId, accepted: false, reason: 'input-expired', observedRevision: String(this.revision) };
     if (this.owner && this.owner !== plan.ownerToken) return { commandId: plan.commandId, accepted: false, reason: 'old-owner', observedRevision: String(this.revision) };
     this.owner = plan.ownerToken;
+    // Store a private copy: held-input bookkeeping (one-shot jump consumption) must
+    // never mutate the caller's plan object.
+    const stored: InputPlan3D = { ...plan, delta: { ...plan.delta }, heldSet: [...plan.heldSet] };
     // Held input is a set, not a growing log: a new plan for the same owner replaces it.
     for (const [id, existing] of this.active) if (existing.ownerToken === plan.ownerToken) this.active.delete(id);
     this.pending = this.pending.filter(entry => entry.plan.ownerToken !== plan.ownerToken);
-    if (this.options.latencyTicks > 0) this.pending.push({ due: this.tickCount + this.options.latencyTicks, plan });
-    else this.active.set(plan.commandId, plan);
+    if (this.options.latencyTicks > 0) this.pending.push({ due: this.tickCount + this.options.latencyTicks, plan: stored });
+    else this.active.set(stored.commandId, stored);
     return { commandId: plan.commandId, accepted: true, observedRevision: String(this.revision) };
   }
 
@@ -176,6 +179,9 @@ export class SimulatedBody implements InputGateway, BodyReader {
           // head stops the jump rather than clipping through.
           this.lastAction = 'jump-blocked'; this.jumpsBlocked += 1;
         }
+        // Jump is a one-shot primitive. The plan may stay active to keep applying
+        // forward/strafe during the arc, but it must not re-fire on landing.
+        current.delta.jump = false;
       }
     }
     this.moveWithAxisSeparation(vx, vy, vz, dt);

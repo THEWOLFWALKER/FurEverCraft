@@ -216,6 +216,58 @@ describe('P11 navigation → Motor → sink chain', () => {
     expect(explored.exploreTarget).toBeDefined();
   });
 
+  it('navigates from an off-centre starting pose without overshooting the route', async () => {
+    const { adapter, body, clock } = makeHarness({ start: { x: 0.95, z: 0.05 } });
+    const result = await navigateToBody(adapter, clock, { x: 3, y: 0, z: 2 }, navOptions());
+    expect(result.status).toBe('confirmed');
+    expect(poseBlock(result.pose!)).toEqual({ x: 3, y: 0, z: 2 });
+    expect(poseBlock(body.currentPose)).toEqual({ x: 3, y: 0, z: 2 });
+  });
+
+  it('reports released=false when the sink rejects release', async () => {
+    const { adapter, clock } = makeHarness();
+    const rejecting: BodyAdapter = {
+      context: adapter.context, capabilities: adapter.capabilities, source: 'simulated', clock: adapter.clock,
+      observe: () => adapter.observe(),
+      advance: ticks => adapter.advance!(ticks),
+      submit: plan => adapter.submit(plan),
+      release: async () => { throw new Error('release-failed'); },
+    };
+    const result = await navigateToBody(rejecting, clock, { x: 1, y: 0, z: 0 }, navOptions());
+    expect(result.released).toBe(false);
+  });
+
+  it('refuses gather and explore on stale or gapped observations', async () => {
+    for (const defect of [{ freshness: 'stale' as const }, { gap: true }] as const) {
+      const gatherHarness = makeHarness();
+      gatherHarness.world.setBlock({ x: 3, y: 0, z: 1 }, 'full_cube', 'coal_ore');
+      gatherHarness.adapter.setObservationOverride(defect);
+      const gather = await gatherBody(gatherHarness.adapter, gatherHarness.clock, 'coal_ore', navOptions());
+      expect(gather.status).toBe('failed');
+      expect(gather.reason).toMatch(/observation-(stale|gap)/);
+
+      const exploreHarness = makeHarness();
+      exploreHarness.adapter.setObservationOverride(defect);
+      const explore = await exploreBody(exploreHarness.adapter, exploreHarness.clock, 3, navOptions());
+      expect(explore.status).toBe('failed');
+      expect(explore.reason).toMatch(/observation-(stale|gap)/);
+    }
+  });
+
+  it('does not choose a one-block-down frontier that needs a disabled controlled drop', async () => {
+    const { adapter } = makeHarness();
+    const base = await adapter.observe();
+    const cells = new Map([
+      ['0,0,0', { pos: { x: 0, y: 0, z: 0 }, cell: 'free' as const, shape: 'air' as const, revision: '1' }],
+      ['0,-1,0', { pos: { x: 0, y: -1, z: 0 }, cell: 'blocked' as const, shape: 'full_cube' as const, revision: '1' }],
+      ['1,-1,0', { pos: { x: 1, y: -1, z: 0 }, cell: 'free' as const, shape: 'air' as const, revision: '1' }],
+      ['1,0,0', { pos: { x: 1, y: 0, z: 0 }, cell: 'free' as const, shape: 'air' as const, revision: '1' }],
+      ['1,-2,0', { pos: { x: 1, y: -2, z: 0 }, cell: 'blocked' as const, shape: 'full_cube' as const, revision: '1' }],
+    ]);
+    const observation = { ...base, cells };
+    expect(selectExploreTarget(adapter, observation, 3, observation.observedAt)).toBeUndefined();
+  });
+
   it('gathers only after navigating to a supported standing cell and observing the target free', async () => {
     const { adapter, body, world, clock } = makeHarness();
     world.setBlock({ x: 3, y: 0, z: 1 }, 'full_cube', 'coal_ore');
@@ -555,8 +607,13 @@ describe('P13 independent offline body scenarios', () => {
     expect(body.jumpStats.accepted).toBe(1);
     body.tick(); maxY = Math.max(maxY, body.currentPose.y);
     body.tick(); maxY = Math.max(maxY, body.currentPose.y);
+    // The held jump did not re-fire; a second explicit jump plan is refused in the air.
     expect(body.jumpStats.accepted).toBe(1);
-    expect(body.jumpStats.blocked).toBeGreaterThan(0);
+    expect(body.jumpStats.blocked).toBe(0);
+    body.submit({ ...plan, commandId: 'j2' });
+    body.tick(); maxY = Math.max(maxY, body.currentPose.y);
+    expect(body.jumpStats.accepted).toBe(1);
+    expect(body.jumpStats.blocked).toBe(1);
     expect(JUMP_MAX_RISE).toBe(1);
     // Measure the actual arc: it must clear a one-block step but stay below two blocks.
     body.release('o');
