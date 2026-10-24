@@ -200,6 +200,12 @@ export class ControlService {
   diagnostics(options?: DoctorOptions): DoctorReport { return collectDoctorReport(this.runtime, options); }
   doctor(options?: DoctorOptions): DoctorReport { return this.diagnostics(options); }
 
+  /** Command receipts are scoped by server profile and, when known, account. */
+  private commandScope(): string {
+    const context = this.runtime.bridge.context;
+    return `control:${context.serverProfileId}${context.accountId ? `:${context.accountId}` : ''}`;
+  }
+
   async command(input: unknown): Promise<CommandResult> {
     const parsed = CommandRequestSchema.safeParse(input);
     if (!parsed.success) return { requestId: typeof (input as any)?.requestId === 'string' ? (input as any).requestId : 'invalid', command: 'message', state: 'rejected', code: 'invalid-command', payloadHash: canonicalPayloadHash(input) };
@@ -207,7 +213,7 @@ export class ControlService {
     const payloadHash = canonicalPayloadHash({ command: request.command, payload: request.payload, expectedRevision: request.expectedRevision });
     // Once closed the store is gone; refuse every command rather than touching a closed DB.
     if (this.closed) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'runtime-closed', payloadHash };
-    const scope = `control:${this.runtime.bridge.context.serverProfileId}`;
+    const scope = this.commandScope();
     // Atomic claim: a concurrent identical request must not execute twice. The in-flight set
     // closes the read-then-insert race that separate processes/SQLite statements leave open.
     const claimKey = `${scope}:${request.requestId}`;
@@ -278,7 +284,9 @@ export class ControlService {
       case 'chat': { const p = ChatPayloadSchema.parse(payload); if (this.paused) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'paused', payloadHash: '' }; const result = await this.runtime.router.invoke({ id: request.requestId, name: 'send_chat', arguments: JSON.stringify({ text: p.text }) }, { signal: this.abortSignal, owner: this.runtime.ownerId }); if (this.stopping) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', result, payloadHash: '' }; return { requestId: request.requestId, command: request.command, state: result.ok ? 'terminal' : 'unknown', result, payloadHash: '' }; }
       case 'pause': {
         // Abort first so the pausing event precedes any command receipt that reflects the abort.
-        this.abortActive(); this.paused = true; this.stopping = false; this.pausing = true;
+        // Stop/quit is terminal: a later pause must not clear `stopping`, or a replay of resume
+        // could reopen a runtime whose scheduler and body were already shut down.
+        this.abortActive(); this.paused = true; this.pausing = true;
         // Pause reaches the real scheduler and skill lifecycle, not just a control flag.
         try { this.runtime.scheduler.pause(); } catch { /* scheduler already stopped */ }
         try { this.runtime.lifecycle.humanControl('pause'); } catch { /* lifecycle already terminal */ }
@@ -333,7 +341,7 @@ export class ControlService {
         const result: CommandResult = { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled, body, closed: true }, payloadHash: '' };
         // The quit decision and its control event are durable before close so a replayed read
         // after restart sees a terminal receipt, not a pending one.
-        const scope = `control:${this.runtime.bridge.context.serverProfileId}`;
+        const scope = this.commandScope();
         try { this.runtime.store.updateActionReceipt(scope, request.requestId, 'completed', result.result); } catch { /* store may already be unavailable */ }
         this.runtime.session.events.publish('control.quit', { requestId: request.requestId, state: 'accepted', result: result.result }, true);
         this.committedRequestId = request.requestId;

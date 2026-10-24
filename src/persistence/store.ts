@@ -271,6 +271,23 @@ export class SQLiteStore {
 
   hasActionReceipt(scope: string, commandId: string) { return this.getActionReceipt(scope, commandId) !== undefined; }
 
+  /**
+   * Settle receipts that were still pending when the previous process died. The command may or
+   * may not have taken effect, so the only truthful durable state is `unknown`; a replay must not
+   * keep reporting `accepted` for work nothing is progressing.
+   */
+  recoverPendingReceipts(reason = 'recovered-after-restart') {
+    return this.transaction(() => {
+      const pending = this.db.prepare("SELECT scope, command_id FROM action_receipts WHERE status='pending'").all() as Array<{ scope: string; command_id: string }>;
+      const update = this.db.prepare(`UPDATE action_receipts SET status='unknown', context_json=COALESCE(context_json, ?), updated_at=?
+        WHERE scope=? AND command_id=? AND status='pending'`);
+      const timestamp = now();
+      const recoveryContext = json({ recovery: reason });
+      for (const row of pending) update.run(recoveryContext, timestamp, row.scope, row.command_id);
+      return pending.length;
+    });
+  }
+
   addCriticalEvent(e: any) {
     this.db.prepare(`INSERT OR IGNORE INTO critical_events(event_seq,event_id,kind,context,payload_json)
       VALUES (?,?,?,?,?)`).run(String(e.seq), e.eventId, e.kind, json(e.context ?? 'simulated'), json(e.payload));

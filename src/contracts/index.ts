@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const BodyContextSchema = z.object({ serverProfileId: z.string(), worldGenerationId: z.string().optional(), connectionEpoch: z.string(), bodyEpoch: z.string(), dimension: z.string() });
+export const BodyContextSchema = z.object({ serverProfileId: z.string(), accountId: z.string().optional(), worldGenerationId: z.string().optional(), connectionEpoch: z.string(), bodyEpoch: z.string(), dimension: z.string() });
 export type BodyContext = z.infer<typeof BodyContextSchema>;
 export const CellSchema = z.enum(['free','blocked','unknown']);
 export const FieldEvidenceSchema = z.object({ source: z.enum(['simulated','observed-server','predicted','historical','model']), observedAt: z.number(), expiresAt: z.number().optional(), freshness: z.enum(['current','stale','unknown']), available: z.boolean(), evidenceRef: z.string().optional() });

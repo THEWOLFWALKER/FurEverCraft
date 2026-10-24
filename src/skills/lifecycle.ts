@@ -102,6 +102,13 @@ export class SkillLifecycle {
   }
 
   async run(skillId: string, program: SkillProgram, options: SkillLifecycleOptions = {}): Promise<SkillRunSnapshot> {
+    // Retain a bounded history of finished runs; active/suspended runs are never evicted.
+    if (this.runs.size >= 256) {
+      for (const [runId, entry] of this.runs) {
+        if (this.runs.size < 256) break;
+        if (terminal.has(entry.snapshot.state)) this.runs.delete(runId);
+      }
+    }
     const manifest = this.manifestFor(skillId);
     const createdAt = this.now();
     const runId = nextId('skillrun');

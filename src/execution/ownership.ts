@@ -1,5 +1,5 @@
 import {
-  closeSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeSync,
+  closeSync, fsyncSync, linkSync, openSync, readFileSync, renameSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -102,21 +102,27 @@ export class RuntimeOwnershipLock {
 
   private tryCreate(): OwnershipRecord | undefined {
     const record = this.newRecord();
-    let fd: number;
-    try { fd = openSync(this.lockPath, 'wx', 0o600); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return undefined;
-      throw error;
-    }
+    // Write the full record to a private temp file first, then publish it with an atomic hard
+    // link. `link` either creates the lock with complete contents or fails with EEXIST; there is
+    // no observable window where the lock exists but is unreadable after a crash.
+    const temp = `${this.lockPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 10)}`;
+    const fd = openSync(temp, 'wx', 0o600);
     try {
       writeSync(fd, JSON.stringify(record));
       fsyncSync(fd);
     } catch (error) {
       try { closeSync(fd); } catch { /* already closed */ }
-      try { unlinkSync(this.lockPath); } catch { /* best effort */ }
+      try { unlinkSync(temp); } catch { /* best effort */ }
       throw error;
     }
     closeSync(fd);
+    try { linkSync(temp, this.lockPath); }
+    catch (error) {
+      try { unlinkSync(temp); } catch { /* best effort */ }
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return undefined;
+      throw error;
+    }
+    try { unlinkSync(temp); } catch { /* a stray temp file is not an ownership record */ }
     return record;
   }
 
