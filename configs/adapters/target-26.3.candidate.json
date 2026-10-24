@@ -1,0 +1,158 @@
+{
+  "manifestVersion": 1,
+  "release": "26.3",
+  "protocolVersion": 777,
+  "dataVersion": 5023,
+  "javaRequirement": "25",
+  "inputBackend": "SDL3",
+  "adapterVersion": "furevercraft-26.3-candidate",
+  "status": "unsupported",
+  "dependencies": [
+    {
+      "name": "minecraft-data",
+      "version": "3.87.0",
+      "commit": "924e26d6b3bb8f97a5d1e73d6190b09879c2e1e2",
+      "installed": true
+    },
+    {
+      "name": "minecraft-protocol",
+      "version": "1.57.0",
+      "commit": "a1a33809c49553e544a7efd3d8bc03eb0867f4ab",
+      "installed": true
+    }
+  ],
+  "provenance": {
+    "schema": {
+      "kind": "schema",
+      "source": "minecraft-data pc/26.3 protocol schema",
+      "version": "26.3",
+      "verified": false,
+      "notes": [
+        "research reference only; not installed"
+      ]
+    },
+    "data": {
+      "kind": "data",
+      "source": "node_modules/minecraft-data/minecraft-data/data/pc/26.3/version.json",
+      "version": "26.3",
+      "commit": "924e26d6b3bb8f97a5d1e73d6190b09879c2e1e2",
+      "verified": false,
+      "notes": [
+        "dataVersion 5023 has no verified fixture in the pinned tree"
+      ]
+    },
+    "native": {
+      "kind": "native",
+      "source": "native/windows/FurEverCraft.Helper.ps1",
+      "version": "unhashed-candidate",
+      "verified": false,
+      "notes": [
+        "not validated on a real Windows host in this batch"
+      ]
+    }
+  },
+  "artifacts": [
+    {
+      "role": "native",
+      "path": "native/windows/FurEverCraft.Helper.ps1",
+      "sha256": "1b45e6546a427cd8aa1fec27292a9d71875eac59b120650401ea66ca5f64fd10",
+      "bytes": 10266
+    },
+    {
+      "role": "fixture",
+      "path": "node_modules/minecraft-data/package.json",
+      "sha256": "a7d17cf393a58a543eb19be14e14a3f5fa1b86e6159d79bc02daed13f5ff4f4a",
+      "bytes": 1293
+    },
+    {
+      "role": "fixture",
+      "path": "node_modules/minecraft-protocol/package.json",
+      "sha256": "84935256bdc1309fdf813e1eb7f53f08931100a97c531916d410d69fea257400",
+      "bytes": 1805
+    }
+  ],
+  "capabilities": [
+    {
+      "domain": "blocks",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    },
+    {
+      "domain": "chat",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    },
+    {
+      "domain": "compression",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    },
+    {
+      "domain": "entities",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    },
+    {
+      "domain": "framing",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    },
+    {
+      "domain": "inventory",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    },
+    {
+      "domain": "lifecycle",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    },
+    {
+      "domain": "position",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    },
+    {
+      "domain": "registry",
+      "status": "unsupported",
+      "evidence": "none",
+      "limitations": [
+        "26.3-codec-data-unavailable"
+      ]
+    }
+  ],
+  "unavailableReasons": [
+    "26.3-native-provenance-unverified: native helper has no validated Windows-host provenance",
+    "26.3-protocol-data-absent: node_modules/minecraft-data/minecraft-data/data/pc/26.3/version.json",
+    "26.3-schema-unavailable: no verified 26.3 protocol schema (protocol 777, data 5023)"
+  ],
+  "generator": {
+    "tool": "furevercraft-adapter-manifest",
+    "version": "1",
+    "reproducible": true
+  }
+}
