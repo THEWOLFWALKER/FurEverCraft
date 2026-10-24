@@ -38,6 +38,15 @@ const coreScope = (value: unknown): Partial<Record<(typeof MEMORY_SCOPE_KEYS)[nu
   for (const key of MEMORY_SCOPE_KEYS) if (typeof record[key] === 'string' && record[key]) scope[key] = record[key] as string;
   return scope;
 };
+/** Strict scope predicate: an omitted stable field matches only rows that also omit it. */
+const scopePredicate = (scope: Partial<Record<(typeof MEMORY_SCOPE_KEYS)[number], string>>) => {
+  const clauses: string[] = []; const values: unknown[] = [];
+  for (const key of MEMORY_SCOPE_KEYS) {
+    if (scope[key] !== undefined) { clauses.push(`json_extract(context, '$.${key}')=?`); values.push(scope[key]!); }
+    else clauses.push(`json_extract(context, '$.${key}') IS NULL`);
+  }
+  return { sql: clauses.join(' AND '), values };
+};
 
 export class SQLiteStore {
   readonly db: Database.Database;
@@ -393,9 +402,8 @@ export class SQLiteStore {
     if (context === undefined) return this.getPlace(placeId);
     const core = coreScope(context);
     if (!core) return this.getPlace(placeId, context);
-    const entries = Object.entries(core);
-    const where = entries.map(([key]) => `json_extract(context, '$.${key}')=?`).join(' AND ');
-    return this.placeRow(this.db.prepare(`SELECT rowid, * FROM places WHERE place_id=? AND ${where} ORDER BY rowid DESC LIMIT 1`).get(placeId, ...entries.map(([, value]) => value)) as any);
+    const predicate = scopePredicate(core);
+    return this.placeRow(this.db.prepare(`SELECT rowid, * FROM places WHERE place_id=? AND ${predicate.sql} ORDER BY rowid DESC LIMIT 1`).get(placeId, ...predicate.values) as any);
   }
 
   /** Bounded page over the stable scope fields (legacy string contexts still match exactly). */
@@ -408,8 +416,9 @@ export class SQLiteStore {
     let where = '';
     if (context !== undefined) {
       if (core) {
-        where = Object.entries(core).map(([key]) => `json_extract(context, '$.${key}')=?`).join(' AND ');
-        values.push(...Object.values(core));
+        const predicate = scopePredicate(core);
+        where = predicate.sql;
+        values.push(...predicate.values);
       } else { where = 'context=?'; values.push(json(context)); }
     }
     if (options.status) { where = where ? `${where} AND status=?` : 'status=?'; values.push(options.status); }
