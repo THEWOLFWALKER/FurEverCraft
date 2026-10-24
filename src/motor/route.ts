@@ -9,7 +9,7 @@ import type { BlockPos, NavRoute, Pose3D, RouteStep, ShapeKind } from './types.j
  * from the observation stay unknown; they are never promoted to air.
  */
 export function worldFromObservation(observation: WorldObservation, now: () => number = () => observation.observedAt): SparseVoxelWorld {
-  const source = observation.source === 'observed-server' ? 'fixture' : observation.source === 'simulated' ? 'simulated' : 'fixture';
+  const source = observation.source === 'legacy-simulated' ? 'fixture' : observation.source;
   const world = new SparseVoxelWorld(observation.context, {
     id: `body-observation:${observation.source}`,
     registryVersion: observation.revision,

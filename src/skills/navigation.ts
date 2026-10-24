@@ -133,8 +133,8 @@ export async function returnToPlaceBody(
 }
 
 /** Choose a deterministic reachable frontier cell from the observed local volume. */
-export function selectExploreTarget(body: BodyAdapter, observation: WorldObservation, radius: number): BlockPos | undefined {
-  const usable = observationUsable(observation, { maxAgeMs: 500, now: observation.observedAt, context: body.context });
+export function selectExploreTarget(body: BodyAdapter, observation: WorldObservation, radius: number, now = observation.observedAt): BlockPos | undefined {
+  const usable = observationUsable(observation, { maxAgeMs: 500, now, context: body.context });
   if (!usable.ok || !isReal3DObservation(observation)) return undefined;
   const world = worldFromObservation(observation);
   const origin = poseBlock(observation.pose);
@@ -160,7 +160,7 @@ export async function exploreBody(
   options: BodyNavigationOptions,
 ): Promise<BodyControllerResult & { executionId: string; path: string[]; exploreTarget?: BlockPos }> {
   const observation = await body.observe();
-  const target = selectExploreTarget(body, observation, radius);
+  const target = selectExploreTarget(body, observation, radius, clock.now());
   if (!target) {
     return { ...failedNavigation('no-executable-frontier') };
   }

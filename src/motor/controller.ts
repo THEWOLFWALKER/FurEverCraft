@@ -192,7 +192,7 @@ export class MotionController {
         const issue = this.observationIssue(observed);
         if (issue) { this.abort(issue); return await finish('failed', 'failed', issue, issue); }
 
-        if (this.reached(observed.pose, target, tolerance)) return await finish('confirmed', 'confirmed');
+        if (this.reached(observed.pose, target, tolerance, observed.supported)) return await finish('confirmed', 'confirmed');
 
         if (!observed.supported) {
           // Airborne/unsupported start is not a stable planning anchor. Wait for
@@ -213,6 +213,12 @@ export class MotionController {
           const outcome: NavigationOutcome = planned.status === 'NEEDS_OBSERVATION' ? 'partial' : 'failed';
           // Unreachable/unsupported is declared, not executed. Held input is still released.
           return await finish(status, outcome, planned.reason ?? planned.status.toLowerCase(), `plan:${planned.status}`);
+        }
+        if (planned.steps.length === 0) {
+          // The body is already in the target block but the corner distance exceeds
+          // the landing tolerance. There is no finer edge to execute; walking out
+          // and back would be worse than accepting the observed target block.
+          return await finish('confirmed', 'confirmed');
         }
         const validated = planner.validateRoute(this.currentRoute, world, { start: poseBlock(observed.pose) });
         if (!validated.ok) {
@@ -262,7 +268,7 @@ export class MotionController {
             this.noteStepFailure(step, executed.reason ?? 'step-failed');
             return await finish('failed', 'failed', executed.reason ?? 'step-failed', executed.reason ?? 'step-failed');
           }
-          this.progress.reset(`nav:${step.edge.edgeId}`);
+          this.progress.clearFailure(step.edge.edgeId);
           this.options.onProgress?.('execute', stepIndex + 1, this.currentRoute.steps.length, step.edge.edgeId);
         }
         if (replanNeeded) continue;
@@ -273,7 +279,7 @@ export class MotionController {
         pose = finalObserved.pose;
         const finalIssue = this.observationIssue(finalObserved);
         if (finalIssue) { this.abort(finalIssue); return await finish('failed', 'failed', finalIssue, finalIssue); }
-        if (this.reached(finalObserved.pose, target, tolerance)) return await finish('confirmed', 'confirmed');
+        if (this.reached(finalObserved.pose, target, tolerance, finalObserved.supported)) return await finish('confirmed', 'confirmed');
         this.progress.noteFailure('route-end', 'target-not-reached');
         if (replans >= this.budget.maxReplans) return await finish('failed', 'failed', 'target-not-reached', 'target-not-reached');
         replans += 1;
@@ -411,9 +417,10 @@ export class MotionController {
     await new Promise<void>(resolve => { this.clock.schedule(this.clock.now() + 20, resolve); });
   }
 
-  private reached(pose: Pose3D, target: BlockPos, tolerance: number): boolean {
+  private reached(pose: Pose3D, target: BlockPos, tolerance: number, supported: boolean): boolean {
     const block = poseBlock(pose);
-    return block.x === target.x && block.y === target.y && block.z === target.z
+    return supported
+      && block.x === target.x && block.y === target.y && block.z === target.z
       && horizontalDistance(pose, { x: target.x + 0.5, z: target.z + 0.5 }) <= tolerance
       && Math.abs(pose.y - target.y) <= 0.2;
   }

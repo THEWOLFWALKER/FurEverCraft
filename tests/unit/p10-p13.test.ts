@@ -3,9 +3,10 @@ import { ManualClock, type BodyContext } from '../../src/contracts/index.js';
 import { SparseVoxelWorld } from '../../src/motor/geometry.js';
 import { ActionPlanner, JUMP_MAX_RISE } from '../../src/motor/action-graph.js';
 import { MotionController } from '../../src/motor/controller.js';
+import { ProgressController } from '../../src/motor/progress.js';
 import { resolveTarget3D, isReal3DObservation, NavigationTarget3DSchema, type BodyAdapter, type WorldObservation } from '../../src/motor/contracts.js';
 import { poseBlock } from '../../src/motor/route.js';
-import { SimulatedBody } from '../../src/fixtures/simulated-body.js';
+import { SimulatedBody, SIMULATOR_ASSUMPTIONS } from '../../src/fixtures/simulated-body.js';
 import { SimulatedBodyAdapter, Legacy2DBodyAdapter } from '../../src/fixtures/body-adapter.js';
 import { VoxelFixtureWorld } from '../../src/fixtures/voxel-world.js';
 import { gatherBody, navigateToBody, returnToPlaceBody, exploreBody, selectExploreTarget, toSkillResult, navigateToSkill } from '../../src/skills/navigation.js';
@@ -386,6 +387,52 @@ describe('P12 realtime control and recovery', () => {
     expect(result.ticks).toBeLessThanOrEqual(6);
   });
 
+  it('never confirms a target while the body is airborne or unsupported', async () => {
+    const pose = { x: 2.5, y: 0, z: 0.5, yaw: 0, pitch: 0 };
+    let supported = false;
+    const cells = new Map([
+      ['2,0,0', { pos: { x: 2, y: 0, z: 0 }, cell: 'free' as const, shape: 'air' as const, revision: '1' }],
+      ['2,1,0', { pos: { x: 2, y: 1, z: 0 }, cell: 'free' as const, shape: 'air' as const, revision: '1' }],
+      ['2,-1,0', { pos: { x: 2, y: -1, z: 0 }, cell: 'blocked' as const, shape: 'full_cube' as const, revision: '1' }],
+    ]);
+    const clock = new ManualClock();
+    const adapter: BodyAdapter = {
+      context, capabilities: { threeDimensional: true, turn: true, walk: true, stop: true, jump: 'none', jumpMaxRise: 0, stepUp: false, controlledDrop: false },
+      source: 'simulated', clock,
+      observe: async () => ({ context, dimension: context.dimension, revision: '1', observedAt: clock.now(), pose, velocity: { x: 0, y: -0.1, z: 0 }, supported, freshness: 'current', gap: false, source: 'simulated', threeDimensional: true, coordinateMapping: 'world-xyz', cells, worldRevision: '1' }),
+      submit: async plan => ({ commandId: plan.commandId, accepted: true, observedRevision: '1' }),
+      release: async () => undefined,
+      advance: () => undefined,
+    };
+    const falling = await navigateToBody(adapter, clock, { x: 2, y: 0, z: 0 }, navOptions({ budget: { maxTicks: 20 } }));
+    expect(falling.status).toBe('failed');
+    expect(falling.reason).toBe('unstable-start-budget-exhausted');
+
+    supported = true;
+    const landed = await navigateToBody(adapter, clock, { x: 2, y: 0, z: 0 }, navOptions());
+    expect(landed.status).toBe('confirmed');
+  });
+
+  it('accepts an observed target block without burning replans when the corner exceeds tolerance', async () => {
+    const clock = new ManualClock();
+    const pose = { x: 2.05, y: 0, z: 0.5, yaw: 0, pitch: 0 };
+    const cells = new Map([
+      ['2,0,0', { pos: { x: 2, y: 0, z: 0 }, cell: 'free' as const, shape: 'air' as const, revision: '1' }],
+      ['2,1,0', { pos: { x: 2, y: 1, z: 0 }, cell: 'free' as const, shape: 'air' as const, revision: '1' }],
+      ['2,-1,0', { pos: { x: 2, y: -1, z: 0 }, cell: 'blocked' as const, shape: 'full_cube' as const, revision: '1' }],
+    ]);
+    const adapter: BodyAdapter = {
+      context, capabilities: { threeDimensional: true, turn: true, walk: true, stop: true, jump: 'none', jumpMaxRise: 0, stepUp: false, controlledDrop: false },
+      source: 'simulated', clock,
+      observe: async () => ({ context, dimension: context.dimension, revision: '1', observedAt: clock.now(), pose, velocity: { x: 0, y: 0, z: 0 }, supported: true, freshness: 'current', gap: false, source: 'simulated', threeDimensional: true, coordinateMapping: 'world-xyz', cells, worldRevision: '1' }),
+      submit: async plan => ({ commandId: plan.commandId, accepted: true, observedRevision: '1' }),
+      release: async () => undefined,
+    };
+    const result = await navigateToBody(adapter, clock, { x: 2, y: 0, z: 0 }, navOptions());
+    expect(result.status).toBe('confirmed');
+    expect(result.replans).toBe(0);
+  });
+
   it('bounds retries against an unreachable target and records temporary failures', async () => {
     const second = makeHarness();
     // Remove all support around a target so no graph edge can reach it.
@@ -410,6 +457,26 @@ describe('P12 realtime control and recovery', () => {
     expect(result.status).toBe('partial');
     expect(result.reasonCode).toBe('plan:NEEDS_OBSERVATION');
     expect(result.replans).toBe(0);
+  });
+});
+
+describe('P12/P13 review regressions', () => {
+  it('clears the temporary failure and stall budget for an edge after it succeeds', () => {
+    const clock = new ManualClock();
+    const progress = new ProgressController(clock);
+    progress.record({ kind: 'observation_new_no_progress', failureSignature: 'nav:edge-1', hasNewEvidence: true, ownerToken: 'o' });
+    progress.noteFailure('edge-1', 'blocked', 2_000);
+    expect([...progress.avoidedEdges()]).toContain('edge-1');
+    progress.clearFailure('edge-1');
+    expect([...progress.avoidedEdges()]).not.toContain('edge-1');
+    expect(progress.failures()).toEqual([]);
+  });
+
+  it('rejects a stale exploration observation instead of using old terrain', async () => {
+    const { adapter } = makeHarness();
+    const observation = await adapter.observe();
+    expect(selectExploreTarget(adapter, observation, 3, observation.observedAt)).toBeDefined();
+    expect(selectExploreTarget(adapter, observation, 3, observation.observedAt + 1_000)).toBeUndefined();
   });
 });
 
@@ -481,14 +548,54 @@ describe('P13 independent offline body scenarios', () => {
     const { body, clock, world } = makeHarness();
     void world;
     const plan = { commandId: 'j1', executionId: 'e', context, leaseId: 'l', sequence: '1', sourceEpoch: '1', generatedAt: clock.now(), clockDomain: 'virtual', maxAge: 1000, observationRef: 'r', leaseUntil: clock.now() + 1000, kind: 'walk' as const, payload: {}, ownerToken: 'o', deadline: clock.now() + 1000, snapshotRevision: 'r', heldSet: [] as string[], delta: { jump: true } };
+    const groundY = body.currentPose.y;
+    let maxY = groundY;
     body.submit(plan);
-    body.tick();
+    body.tick(); maxY = Math.max(maxY, body.currentPose.y);
     expect(body.jumpStats.accepted).toBe(1);
-    body.tick();
-    body.tick();
+    body.tick(); maxY = Math.max(maxY, body.currentPose.y);
+    body.tick(); maxY = Math.max(maxY, body.currentPose.y);
     expect(body.jumpStats.accepted).toBe(1);
     expect(body.jumpStats.blocked).toBeGreaterThan(0);
     expect(JUMP_MAX_RISE).toBe(1);
+    // Measure the actual arc: it must clear a one-block step but stay below two blocks.
+    body.release('o');
+    for (let index = 0; index < 24; index++) { body.tick(); maxY = Math.max(maxY, body.currentPose.y); }
+    expect(maxY - groundY).toBeGreaterThanOrEqual(1);
+    expect(maxY - groundY).toBeLessThan(2);
+    expect(SIMULATOR_ASSUMPTIONS.jumpApex).toBeLessThan(2);
+
+    // A two-block platform is outside the validated profile: no edge may reach it.
+    const high = flatWorld();
+    high.setBlock({ x: 1, y: 0, z: 0 }, 'full_cube', 'stone');
+    high.setBlock({ x: 1, y: 1, z: 0 }, 'full_cube', 'stone');
+    const twoHigh = new ActionPlanner(high).plan({ x: 0, y: 0, z: 0 }, { x: 1, y: 2, z: 0 });
+    expect(twoHigh.status).not.toBe('COMPLETE');
+    expect(twoHigh.edges.some(edge => edge.to.y === 2)).toBe(false);
+  });
+
+  it('revalidates jump preconditions against fresh geometry before execution', () => {
+    const world = flatWorld();
+    world.setBlock({ x: 1, y: 0, z: 0 }, 'full_cube', 'stone');
+    const planner = new ActionPlanner(world);
+    const route = planner.planRoute({ x: 0, y: 0, z: 0 }, { x: 1, y: 1, z: 0 });
+    expect(route.status).toBe('COMPLETE');
+    expect(route.steps.some(step => step.edge.kind === 'jump_short')).toBe(true);
+    // Insert an obstruction in the landing space after planning.
+    world.setBlock({ x: 1, y: 2, z: 0 }, 'full_cube', 'stone');
+    const landingBlocked = planner.validateRoute(route, world, { start: { x: 0, y: 0, z: 0 } });
+    expect(landingBlocked.ok).toBe(false);
+    expect(landingBlocked.reason).toMatch(/^blocked-(clearance|jump-arc)/);
+
+    // A ceiling over the takeoff cell also invalidates the plan before any input.
+    const headWorld = flatWorld();
+    headWorld.setBlock({ x: 1, y: 0, z: 0 }, 'full_cube', 'stone');
+    const headPlanner = new ActionPlanner(headWorld);
+    const headRoute = headPlanner.planRoute({ x: 0, y: 0, z: 0 }, { x: 1, y: 1, z: 0 });
+    headWorld.setBlock({ x: 0, y: 1, z: 0 }, 'full_cube', 'stone');
+    const headBlocked = headPlanner.validateRoute(headRoute, headWorld, { start: { x: 0, y: 0, z: 0 } });
+    expect(headBlocked.ok).toBe(false);
+    expect(headBlocked.reason).toMatch(/^blocked-(takeoff-headroom|jump-arc)/);
   });
 
   it('marks slab stairs and unsupported drops as unsupported transitions, never as steps', () => {

@@ -2,18 +2,22 @@ import type { BodyContext, Clock } from '../contracts/index.js';
 import type { InputPlan3D, InputReceipt, Pose3D, BodyObservation, BodyCorrection, InputGateway, BodyReader } from '../motor/types.js';
 import type { SparseVoxelWorld } from '../motor/geometry.js';
 import { BODY_HALF_WIDTH, FULL_BODY_HEIGHT } from '../motor/contracts.js';
+import { JUMP_APEX } from '../motor/action-graph.js';
 
 /**
  * Fixture physics constants. These are simulator assumptions, not Minecraft
- * 26.3 constants and not evidence of real-client physics.
+ * 26.3 constants and not evidence of real-client physics. The jump arc apex is
+ * above one block (the maximum planned landing rise) but below two blocks, so a
+ * two-block rise is physically unreachable as well as unplanned.
  */
 export const SIMULATOR_ASSUMPTIONS = {
   gravityPerTick: 0.08,
-  jumpVelocityPerTick: 0.55,
+  jumpVelocityPerTick: 0.45,
   walkSpeedPerTick: 0.1,
   bodyHeight: FULL_BODY_HEIGHT,
   bodyHalfWidth: BODY_HALF_WIDTH,
   jumpMaxRise: 1,
+  jumpApex: JUMP_APEX,
   /** Unknown geometry is treated as blocking, never as air. */
   unknownIsBlocking: true,
 } as const;
@@ -185,7 +189,7 @@ export class SimulatedBody implements InputGateway, BodyReader {
   }
 
   private headAabb() {
-    return { minX: this.pose.x - BODY_HALF_WIDTH, minY: this.pose.y + FULL_BODY_HEIGHT, minZ: this.pose.z - BODY_HALF_WIDTH, maxX: this.pose.x + BODY_HALF_WIDTH, maxY: this.pose.y + FULL_BODY_HEIGHT + 0.8, maxZ: this.pose.z + BODY_HALF_WIDTH };
+    return { minX: this.pose.x - BODY_HALF_WIDTH, minY: this.pose.y + FULL_BODY_HEIGHT, minZ: this.pose.z - BODY_HALF_WIDTH, maxX: this.pose.x + BODY_HALF_WIDTH, maxY: this.pose.y + FULL_BODY_HEIGHT + JUMP_APEX, maxZ: this.pose.z + BODY_HALF_WIDTH };
   }
 
   private collisionAt(pos: { x: number; y: number; z: number }) {

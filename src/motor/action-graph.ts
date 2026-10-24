@@ -8,9 +8,15 @@ export const BODY_HEIGHT = 1.8;
 export const LANDING_TOLERANCE = 0.35;
 /** The only validated jump profile in this batch rises exactly one block. */
 export const JUMP_MAX_RISE = 1;
+/**
+ * Conservative vertical envelope of the fixture jump arc. The landing rise is
+ * one block; the body's head can rise further, so headroom checks and the
+ * execution-time arc validation cover this apex, not just the landing cell.
+ */
+export const JUMP_APEX = 1.9;
 
 const bodyAabb = (p: BlockPos) => ({ minX: p.x + 0.15, minY: p.y, maxX: p.x + 0.85, maxY: p.y + BODY_HEIGHT, minZ: p.z + 0.15, maxZ: p.z + 0.85 });
-const headroomAabb = (p: BlockPos) => ({ minX: p.x + 0.15, minY: p.y + BODY_HEIGHT, maxX: p.x + 0.85, maxY: p.y + BODY_HEIGHT + JUMP_MAX_RISE + 0.4, minZ: p.z + 0.15, maxZ: p.z + 0.85 });
+const headroomAabb = (p: BlockPos) => ({ minX: p.x + 0.15, minY: p.y + BODY_HEIGHT, maxX: p.x + 0.85, maxY: p.y + BODY_HEIGHT + JUMP_APEX, minZ: p.z + 0.15, maxZ: p.z + 0.85 });
 
 const makeEdge = (kind: ActionKind, from: BlockPos, to: BlockPos, snapshotRevision: string, clearance: string[], takeoffHeadroom?: string[]): ActionEdge => {
   const support = blockKey({ ...to, y: to.y - 1 });
@@ -160,6 +166,11 @@ export class ActionPlanner {
         const headroom = world.queryAabb(headroomAabb(step.edge.from));
         if (headroom.status === 'unknown') return { ok: false, invalidStep: index, reason: 'unknown-takeoff-headroom' };
         if (headroom.status !== 'clear') return { ok: false, invalidStep: index, reason: 'blocked-takeoff-headroom' };
+        // The arc is re-checked against the fresh world: an obstacle inserted
+        // after planning must invalidate the jump before any input is issued.
+        const arc = this.swept(world, step.edge.from, step.edge.to, 1);
+        if (arc.status === 'unknown') return { ok: false, invalidStep: index, reason: 'unknown-jump-arc' };
+        if (arc.status !== 'clear') return { ok: false, invalidStep: index, reason: 'blocked-jump-arc' };
       }
       expectedFrom = step.edge.to;
     }
@@ -194,7 +205,7 @@ export class ActionPlanner {
     if (floor.status === 'unknown') return { kind: 'unknown' };
     // Air beneath the body is not support: walking off an edge is a fall, not a walk.
     if (floor.status !== 'blocked') return { kind: 'unsupported' };
-    const sweep = this.swept(from, to);
+    const sweep = this.swept(this.world, from, to);
     if (sweep.status === 'unknown') return { kind: 'unknown' };
     if (sweep.status !== 'clear') return { kind: 'unsupported' };
     return { kind: 'edge', edge: makeEdge('walk', from, to, this.currentRevision, clearance.dependencies) };
@@ -212,16 +223,16 @@ export class ActionPlanner {
     if (headroom.status !== 'clear') return { kind: 'unsupported' };
     // For a jump the swept volume starts one block above the takeoff feet so the
     // raised landing block itself is not mistaken for an obstruction during the arc.
-    const sweep = this.swept(from, to, 1);
+    const sweep = this.swept(this.world, from, to, 1);
     if (sweep.status === 'unknown') return { kind: 'unknown' };
     if (sweep.status !== 'clear') return { kind: 'unsupported' };
     return { kind: 'edge', edge: makeEdge('jump_short', from, to, this.currentRevision, clearance.dependencies, headroom.dependencies) };
   }
 
-  private swept(a: BlockPos, b: BlockPos, minYOffset = 0) {
+  private swept(world: SparseVoxelWorld, a: BlockPos, b: BlockPos, minYOffset = 0) {
     const minX = Math.min(a.x, b.x) + 0.15, maxX = Math.max(a.x, b.x) + 0.85;
     const minZ = Math.min(a.z, b.z) + 0.15, maxZ = Math.max(a.z, b.z) + 0.85;
-    return this.world.queryAabb({ minX, minY: Math.min(a.y, b.y) + minYOffset, minZ, maxX, maxY: Math.max(a.y, b.y) + BODY_HEIGHT, maxZ });
+    return world.queryAabb({ minX, minY: Math.min(a.y, b.y) + minYOffset, minZ, maxX, maxY: Math.max(a.y, b.y) + BODY_HEIGHT + minYOffset, maxZ });
   }
 
   private heuristic(a: BlockPos, b: BlockPos): number {

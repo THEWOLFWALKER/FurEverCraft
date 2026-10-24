@@ -59,6 +59,12 @@ export class ProgressController {
     return [...this.temporary.values()].filter(failure => failure.until > now);
   }
 
+  /** Clear the attempt and temporary-failure record for one edge after it succeeds. */
+  clearFailure(edgeId: string): void {
+    this.attempts.delete(`nav:${edgeId}`);
+    this.temporary.delete(edgeId);
+  }
+
   reset(signature?: string): void {
     if (signature) { this.attempts.delete(signature); this.temporary.delete(signature); }
     else { this.attempts.clear(); this.temporary.clear(); this.cooldownUntil = 0; }
