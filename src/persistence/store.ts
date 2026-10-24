@@ -102,6 +102,14 @@ export class SQLiteStore {
       this.scopeMemoryKeys('episodes', 'episode_id');
       this.ensureMemoryColumns('places', ['revision INTEGER NOT NULL DEFAULT 0', 'provenance_json TEXT', 'invalidated_reason TEXT', 'updated_at TEXT']);
       this.ensureMemoryColumns('episodes', ['revision INTEGER NOT NULL DEFAULT 0', 'provenance_json TEXT', 'updated_at TEXT']);
+      // Indexes back the bounded, scope-filtered pagination; no query loads the whole table.
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_places_scope ON places(place_id,
+        json_extract(context, '$.serverProfileId'), json_extract(context, '$.accountId'),
+        json_extract(context, '$.worldGenerationId'), json_extract(context, '$.dimensionId'))`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_episodes_scope ON episodes(episode_id,
+        json_extract(context, '$.serverProfileId'), json_extract(context, '$.accountId'),
+        json_extract(context, '$.worldGenerationId'), json_extract(context, '$.dimensionId'),
+        json_extract(summary_json, '$.kind'))`);
     })();
   }
 
