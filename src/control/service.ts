@@ -75,11 +75,41 @@ export class ControlService {
   status() {
     // After a quit the store is closed; the control surface must still report the stopped state
     // instead of throwing on every status read until the caller shuts the server down.
-    if (this.closed) return { state: 'closed', paused: this.paused, stopping: true, closed: true, goal: null, executions: 0, context: { ...this.runtime.bridge.context }, position: undefined, inventory: undefined };
+    if (this.closed) return { state: 'closed', paused: this.paused, stopping: true, closed: true, goal: null, executions: 0, context: { ...this.runtime.bridge.context }, observation: { source: 'unknown', freshness: 'unknown', gap: true, reason: 'runtime-closed' }, session: { state: 'closed', recoveryAttempts: 0, recoveryBudget: 0 }, position: undefined, inventory: undefined, ui: undefined };
     const goal = this.runtime.store.listGoals().find(item => item.status === 'active' || item.status === 'paused');
-    const snapshot = this.runtime.bridge.snapshot();
+    const base = {
+      paused: this.paused,
+      stopping: this.stopping,
+      goal,
+      executions: this.runtime.store.listExecutions().length,
+      context: { ...this.runtime.bridge.context },
+      session: { state: this.runtime.session.state, recoveryAttempts: this.runtime.session.recoveryAttempts, recoveryBudget: this.runtime.session.recoveryBudget },
+    };
+    let snapshot: ReturnType<typeof this.runtime.bridge.snapshot> | undefined;
+    let observationError: string | undefined;
+    try { snapshot = this.runtime.bridge.snapshot(); }
+    catch (error) { observationError = error instanceof Error ? error.message : String(error); }
+    if (!snapshot) {
+      // A failed observation is unknown, not an empty world. Never turn a read error into cells={}.
+      return { ...base, state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state, observation: { source: 'unknown', freshness: 'unknown', gap: true, error: redact(observationError) }, position: undefined, inventory: undefined, ui: undefined };
+    }
     // Expose the observed cells so the top-down view reads real state instead of an absent field.
-    return { state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state, paused: this.paused, stopping: this.stopping, goal, executions: this.runtime.store.listExecutions().length, context: { ...this.runtime.bridge.context, cells: snapshot.cells }, position: snapshot.position, inventory: snapshot.inventory };
+    return {
+      ...base,
+      state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state,
+      context: { ...this.runtime.bridge.context, cells: snapshot.cells },
+      position: snapshot.position,
+      inventory: snapshot.inventory,
+      ui: snapshot.ui,
+      observation: {
+        source: snapshot.source,
+        freshness: snapshot.freshness,
+        gap: snapshot.gap,
+        revision: snapshot.revision,
+        unknownCells: Object.values(snapshot.cells).filter(cell => cell === 'unknown').length,
+        fields: snapshot.fields,
+      },
+    };
   }
   capabilities() {
     const bridge = this.runtime.bridge as { capabilities?: unknown };
@@ -88,6 +118,7 @@ export class ControlService {
       provider: this.providerMetadata,
       bridge: redact(bridge.capabilities ?? {}),
       skills: this.runtime.router.availableSkills?.() ?? [],
+      inputsEnabled: this.runtime.inputsEnabled,
       limitations: [
         ...(this.providerMetadata.transport === 'unavailable' ? ['provider-unavailable'] : []),
         ...(this.runtime.bridge.lookAt ? [] : ['look-at-unavailable']),
@@ -101,6 +132,8 @@ export class ControlService {
   effects(executionId?: string) { return this.runtime.store.listEffects(executionId); }
   places() { return this.runtime.store.listPlaces(this.runtime.bridge.context); }
   events(cursor = '0', limit = 100, filter?: string) { return this.runtime.session.events.read(cursor, limit, filter); }
+  /** Current event sequence head; SSE snapshots are labelled with it so snapshot and cursor agree. */
+  eventsHead() { return this.runtime.session.events.head(); }
   provider() { return redact(this.providerMetadata); }
 
   async command(input: unknown): Promise<CommandResult> {
@@ -183,8 +216,25 @@ export class ControlService {
       case 'resume': {
         // A stop/quit that already landed wins: resume must not clear the paused/stopping state.
         if (this.closed || this.stopping || this.quitting) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', result: { paused: true, stopping: true }, payloadHash: '' };
+        // Resume is a fresh admission decision. If the previous session failed, re-verify it
+        // through the session recovery path rather than claiming the runtime is healthy.
+        if (this.runtime.session.state === 'recoverable-failure' || this.runtime.session.state === 'suspended') {
+          try { this.runtime.session.recover(); }
+          catch (error) { return { requestId: request.requestId, command: request.command, state: 'rejected', code: error instanceof Error ? error.message : String(error), result: { paused: true, session: this.runtime.session.state }, payloadHash: '' }; }
+        }
         this.paused = false; this.pausing = false;
-        return { requestId: request.requestId, command: request.command, state: 'terminal', result: { paused: false }, payloadHash: '' };
+        return { requestId: request.requestId, command: request.command, state: 'terminal', result: { paused: false, session: this.runtime.session.state }, payloadHash: '' };
+      }
+      case 'recover': {
+        if (this.closed || this.stopping || this.quitting) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', payloadHash: '' };
+        // Recovery is deliberately explicit: it re-observes the body and reconciles pending
+        // effects through the session's bounded budget. It never fabricates a successful state.
+        try {
+          const result = this.runtime.session.recover();
+          return { requestId: request.requestId, command: request.command, state: 'terminal', result, payloadHash: '' };
+        } catch (error) {
+          return { requestId: request.requestId, command: request.command, state: 'rejected', code: error instanceof Error ? error.message : String(error), result: { session: this.runtime.session.state, attempts: this.runtime.session.recoveryAttempts, budget: this.runtime.session.recoveryBudget }, payloadHash: '' };
+        }
       }
       case 'stop': {
         if (this.stopping) { const canceled = await this.cancelActiveExecutions(); const body = await this.releaseBody(); return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled, body }, payloadHash: '' }; }
