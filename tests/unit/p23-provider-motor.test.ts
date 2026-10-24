@@ -230,5 +230,27 @@ describe('P23 Motor stall and disconnect', () => {
     // The old owner's lease is not revived; a fresh owner can use the body after the release.
     const fresh = await disconnected.adapter.submit(stopPlan(disconnected.clock, 'new-owner'));
     expect(fresh.accepted).toBe(true);
+
+    // Target CAS: an operator revision change during execution revokes the route immediately.
+    const retargeted = makeBody();
+    let revision = 7;
+    let watchCalls = 0;
+    const targetRun = await new MotionController(retargeted.adapter, retargeted.clock, {
+      budget: { maxTicks: 60, maxTicksPerStep: 40, stallTicks: 8, maxReplans: 2, maxWallClockMs: 60_000, observationMaxAgeMs: 500, yawToleranceDegrees: 8 },
+    }).run({
+      target: { x: 4, y: 0, z: 0 },
+      leaseId: 'cas-lease',
+      ownerToken: 'cas-owner',
+      targetRevision: { expected: 7, current: () => revision },
+      watch: () => {
+        watchCalls += 1;
+        if (watchCalls === 6) revision = 8;
+        return undefined;
+      },
+    });
+    expect(targetRun.status).toBe('canceled');
+    expect(targetRun.reason).toBe('target-revision-changed');
+    expect(targetRun.released).toBe(true);
+    expect(retargeted.body.ownerToken).toBeUndefined();
   }, 15_000);
 });
