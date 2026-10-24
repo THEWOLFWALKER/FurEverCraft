@@ -4,13 +4,21 @@ import { createInterface } from 'node:readline';
 export type HelperCommand = 'probe'|'bindWindow'|'getWindowState'|'setHeldInputs'|'moveRelative'|'click'|'typeText'|'captureWindow'|'releaseOwnedInputs'|'heartbeat'|'shutdown';
 export type HelperRequest = { requestId: string; command: HelperCommand; [key: string]: unknown };
 export type HelperResponse = { requestId: string; ok: boolean; result?: unknown; error?: string };
-export interface HelperTransport { send(request: HelperRequest, signal?: AbortSignal): Promise<HelperResponse>; close(): Promise<void> }
+export interface HelperTransport {
+  send(request: HelperRequest, signal?: AbortSignal): Promise<HelperResponse>;
+  close(): Promise<void>;
+  /** Reports transport/process death so orchestration can revoke control before restart. */
+  onExit?(listener: (reason: string) => void): () => void;
+}
 export type WindowState = { exists: boolean; focused: boolean; visible: boolean; pid?: number; hwnd?: string };
 
 export class FakeHelperTransport implements HelperTransport {
   readonly requests: HelperRequest[] = [];
   private readonly seen = new Set<string>();
+  private readonly exitListeners = new Set<(reason: string) => void>();
   constructor(private readonly responder: (request: HelperRequest) => HelperResponse = request => ({ requestId: request.requestId, ok: true, result: { command: request.command, dryRun: true } })) {}
+  onExit(listener: (reason: string) => void): () => void { this.exitListeners.add(listener); return () => this.exitListeners.delete(listener); }
+  emitExit(reason = 'fake-helper-exit'): void { for (const listener of this.exitListeners) listener(reason); }
   async send(request: HelperRequest): Promise<HelperResponse> {
     this.requests.push(request);
     if (this.seen.has(request.requestId) && ['moveRelative','click','typeText'].includes(request.command)) return { requestId: request.requestId, ok: true, result: { duplicate: true } };
@@ -22,16 +30,26 @@ export class FakeHelperTransport implements HelperTransport {
 export class JsonlHelperTransport implements HelperTransport {
   private readonly pending = new Map<string, { resolve: (response: HelperResponse) => void; reject: (error: Error) => void }>();
   private readonly lines;
+  private readonly exitListeners = new Set<(reason: string) => void>();
   private closed = false;
+  private exitNotified = false;
   constructor(private readonly process: ChildProcessWithoutNullStreams) {
     this.lines = createInterface({ input: process.stdout });
     this.lines.on('line', line => {
       try { const response = JSON.parse(line) as HelperResponse; const waiter = this.pending.get(response.requestId); if (waiter) { this.pending.delete(response.requestId); waiter.resolve(response); } }
       catch { /* malformed helper output is ignored; request timeout handles it */ }
     });
-    const fail = () => { for (const waiter of this.pending.values()) waiter.reject(new Error('helper-exited')); this.pending.clear(); };
-    process.once('exit', fail); process.once('error', fail);
+    const fail = (reason: string) => {
+      for (const waiter of this.pending.values()) waiter.reject(new Error('helper-exited'));
+      this.pending.clear();
+      if (this.exitNotified) return;
+      this.exitNotified = true;
+      for (const listener of this.exitListeners) { try { listener(reason); } catch { /* listeners are isolated */ } }
+    };
+    process.once('exit', () => fail('helper-process-exit'));
+    process.once('error', () => fail('helper-process-error'));
   }
+  onExit(listener: (reason: string) => void): () => void { this.exitListeners.add(listener); return () => this.exitListeners.delete(listener); }
   static start(scriptPath: string, dryRun = false): JsonlHelperTransport {
     if (process.platform !== 'win32') throw new Error('windows-helper-requires-windows');
     const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath];
@@ -74,6 +92,11 @@ export class WindowsHelperDriver {
   private readonly heartbeatMs: number;
   private readonly completedCommands = new Set<string>();
   constructor(private readonly transport: HelperTransport, private readonly enabled = false, now: () => number = () => Date.now(), heartbeatMs = 250) { this.now = now; this.heartbeatMs = heartbeatMs; }
+  /** Helper transport/process death. The orchestrator revokes control before any restart. */
+  onExit(listener: (reason: string) => void): () => void {
+    return this.transport.onExit?.(reason => { this.stopWatchdog(); this.bound = false; this.state = undefined; listener(reason); }) ?? (() => undefined);
+  }
+  helperState() { return { enabled: this.enabled, bound: this.bound, window: this.state ?? null }; }
   private commandIdResult(commandId: string) { return this.completedCommands.has(commandId) ? { duplicate: true } : undefined; }
   private markCommand(commandId: string) { this.completedCommands.add(commandId); }
   private async command(command: HelperCommand, fields: Record<string, unknown> = {}) {

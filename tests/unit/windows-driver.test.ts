@@ -54,4 +54,16 @@ describe('Windows helper driver offline contract', () => {
     expect(transport.requests.at(-2)?.command).toBe('releaseOwnedInputs');
     expect(transport.requests.at(-1)?.command).toBe('shutdown');
   });
+
+  it('surfaces helper process death to orchestration and clears the binding', async () => {
+    const transport = new FakeHelperTransport(request => ({ requestId: request.requestId, ok: true, result: request.command === 'bindWindow' ? { bound: true, pid: request.pid, hwnd: request.hwnd } : undefined }));
+    const driver = new WindowsHelperDriver(transport, true);
+    const reasons: string[] = [];
+    driver.onExit(reason => reasons.push(reason));
+    await driver.bindWindow(12, '0xc');
+    expect(driver.helperState()).toMatchObject({ bound: true });
+    transport.emitExit('helper-process-exit');
+    expect(reasons).toEqual(['helper-process-exit']);
+    expect(driver.helperState()).toMatchObject({ bound: false, window: null });
+  });
 });

@@ -43,6 +43,11 @@ export class ProcessSupervisor {
   private readonly ipcTimeoutMs: number;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly helloWaiters = new Set<(epoch: string) => void>();
+  private readonly exitListeners = new Set<(reason: string) => void>();
+  private readonly messageListeners = new Set<(message: unknown) => void>();
+  private readonly expectedExits = new WeakSet<ChildProcessLike>();
+  private readonly notifiedExits = new WeakSet<ChildProcessLike>();
+  private lastExitReasonValue?: string;
 
   constructor(private readonly options: SupervisorOptions) {
     this.now = options.now ?? (() => Date.now());
@@ -57,6 +62,19 @@ export class ProcessSupervisor {
   get state(): SupervisorState { return this.stateValue; }
   get pid(): number | undefined { return this.child?.pid; }
   get heartbeatIntervalMs(): number { return this.heartbeatMs; }
+  get lastExitReason(): string | undefined { return this.lastExitReasonValue; }
+
+  /** Observe child exit/error. Expected exits from stop()/restart() are labelled separately. */
+  onExit(listener: (reason: string) => void): () => void {
+    this.exitListeners.add(listener);
+    return () => this.exitListeners.delete(listener);
+  }
+
+  /** Observe every raw child message (observer events/state from the relay child). */
+  onMessage(listener: (message: unknown) => void): () => void {
+    this.messageListeners.add(listener);
+    return () => this.messageListeners.delete(listener);
+  }
 
   async start(): Promise<void> {
     if (this.stateValue === 'running' || this.stateValue === 'starting') return;
@@ -68,6 +86,9 @@ export class ProcessSupervisor {
     this.child = child;
     child.on('message', message => {
       if (this.child !== child) return;
+      for (const listener of this.messageListeners) {
+        try { listener(message); } catch { /* listeners are isolated */ }
+      }
       if (isHello(message)) {
         // Adopt the first hello as the child's session identity; an in-flight identity
         // change means ownership was taken over and must not be adopted silently.
@@ -87,8 +108,14 @@ export class ProcessSupervisor {
       }
       this.lastHeartbeat = this.now();
     });
-    child.on('exit', () => { if (this.child === child) { this.child = undefined; if (this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; } });
-    child.on('error', () => { if (this.child === child && this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; });
+    child.on('exit', () => {
+      if (this.child === child) { this.child = undefined; if (this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; }
+      this.notifyExit(child);
+    });
+    child.on('error', () => {
+      if (this.child === child && this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed';
+      this.notifyExit(child);
+    });
     const hello: IpcMessage = { type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch: this.ownerEpoch, bootEpoch: randomUUID(), capabilities: ['control', 'observe'] };
     if (!child.send(hello)) { this.stateValue = 'failed'; throw new Error('supervisor-hello-backpressure'); }
     // Do not claim running until the child confirms its session with a hello.
@@ -165,8 +192,19 @@ export class ProcessSupervisor {
     this.stateValue = 'stopped';
   }
 
+  private notifyExit(child: ChildProcessLike): void {
+    if (this.notifiedExits.has(child)) return;
+    this.notifiedExits.add(child);
+    const reason = this.expectedExits.has(child) ? 'expected-exit' : 'unexpected-exit';
+    this.lastExitReasonValue = reason;
+    for (const listener of this.exitListeners) {
+      try { listener(reason); } catch { /* listeners are isolated */ }
+    }
+  }
+
   private async stopChild(reason: string): Promise<void> {
     const child = this.child;
+    if (child) this.expectedExits.add(child);
     const epoch = this.childEpoch;
     this.child = undefined;
     this.childEpoch = undefined;
