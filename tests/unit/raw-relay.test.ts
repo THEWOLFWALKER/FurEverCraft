@@ -219,6 +219,34 @@ describe('raw TCP relay fixture',()=>{
   expect(received.toString()).toContain('127.0.0.1');
   client.destroy();await relay.stop();await new Promise<void>(r=>upstream.close(()=>r()));
  });
+
+ it('Round 3 bounds only the handshake frame and forwards a large coalesced tail',async()=>{
+  // A valid small handshake arrived in the same write as a >9 KiB tail. The old limit
+  // compared the whole buffered write against handshakeLimitBytes and killed the session.
+  let received=Buffer.alloc(0);
+  const sockets=new Set<net.Socket>();
+  const upstream=net.createServer({allowHalfOpen:true},s=>{sockets.add(s);s.on('close',()=>sockets.delete(s));s.on('data',c=>{received=Buffer.concat([received,Buffer.from(c)]);});});
+  await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',()=>r()));
+  const relay=createRawTcpRelay({listenPort:0,targetHost:'127.0.0.1',targetPort:(upstream.address() as net.AddressInfo).port,allowMinecraftUpstream:true,rewriteHandshake:true,handshakeLimitBytes:8192});
+  let session:import('../../src/bridge/relay/raw.js').RelaySession|undefined;relay.onSession(s=>{session=s;});
+  await relay.start();
+  const client=await peer(relay.address.port);
+  const handshakeBody=Buffer.concat([Buffer.from([0]),Buffer.from([0x09]),Buffer.from([6]),Buffer.from('origin'),Buffer.from([0x63,0xdd]),Buffer.from([2])]);
+  const handshakeFrame=Buffer.concat([encodeVarIntForTest(handshakeBody.length),handshakeBody]);
+  const tail=Buffer.from(Array.from({length:9300},(_,i)=>(i*29+5)&255));
+  const followUp=Buffer.from('after-handshake-tail');
+  client.write(Buffer.concat([handshakeFrame,tail]));
+  for(let i=0;i<100&&!received.subarray(-tail.length).equals(tail);i++)await new Promise(r=>setTimeout(r,10));
+  expect(received.subarray(-tail.length)).toEqual(tail);
+  expect(received.toString('utf8',0,received.length-tail.length)).toContain('127.0.0.1');
+  expect(received.length).toBeGreaterThan(tail.length);
+  expect(session?.state).toBe('forwarding');
+  client.write(followUp);
+  for(let i=0;i<100&&!received.subarray(-followUp.length).equals(followUp);i++)await new Promise(r=>setTimeout(r,10));
+  expect(received.subarray(-followUp.length)).toEqual(followUp);
+  expect(session?.metrics().forwardedBytes['client-to-server']).toBe(received.length);
+  client.destroy();await relay.stop();for(const s of sockets)s.destroy();await new Promise<void>(r=>upstream.close(()=>r()));
+ });
 });
 
 function encodeVarIntForTest(value:number):Buffer{const out:number[]=[];let current=value;do{let next=current&0x7f;current=Math.floor(current/128);if(current)next|=0x80;out.push(next);}while(current);return Buffer.from(out);}

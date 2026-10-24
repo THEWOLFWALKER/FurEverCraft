@@ -15,6 +15,13 @@ export type WorkerInbound =
   | { type: 'set-compression'; direction: ObserverDirection; enabled: boolean; threshold?: number }
   | { type: 'set-phase'; direction: ObserverDirection; phase: string };
 
+/** Bounded accounting ack: the host may release the chunk's unacknowledged budget. */
+export type WorkerAck = { type: 'ack'; direction: ObserverDirection; bytes: number; frames?: number };
+export type WorkerOutbound =
+  | { type: 'event'; event: unknown }
+  | { type: 'state'; direction: ObserverDirection; state: unknown }
+  | WorkerAck;
+
 if (parentPort) {
   const observer = new BoundedObserver({
     maxQueuedFrames: 64,
@@ -31,6 +38,7 @@ if (parentPort) {
   parentPort.on('message', (message: WorkerInbound) => {
     if (message.type === 'chunk') {
       observer.attach(message.direction, message.bytes);
+      parentPort!.postMessage({ type: 'ack', direction: message.direction, bytes: message.bytes.byteLength, frames: 1 } satisfies WorkerAck);
       postState(message.direction);
     } else if (message.type === 'reset') {
       observer.reset(message.direction);

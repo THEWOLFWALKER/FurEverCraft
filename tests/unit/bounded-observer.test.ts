@@ -69,16 +69,20 @@ describe('bounded observer', () => {
     expect(events.filter(e => e.kind === 'observation')).toHaveLength(1);
   });
 
-  it('starts with an unknown phase and independent disabled compression per direction', () => {
+  it('starts with unknown phase and unknown compression per direction under an explicit assumption', () => {
     const observer = createBoundedObserver();
     const state = observer.state();
     for (const direction of ['upstream', 'downstream'] as const) {
-      expect(state[direction]).toMatchObject({ phase: 'UNKNOWN', compression: 'disabled', payloadKind: 'frame-metadata', availability: 'degraded' });
+      expect(state[direction]).toMatchObject({
+        phase: 'UNKNOWN', compression: 'unknown', assumedCompression: 'uncompressed',
+        payloadKind: 'frame-metadata', availability: 'degraded',
+      });
     }
     // A compression event on one direction must not change the other.
     observer.setCompression('server-to-client', true, 64);
     expect(observer.state().upstream).toMatchObject({ compression: 'enabled' });
-    expect(observer.state().downstream).toMatchObject({ compression: 'disabled' });
+    expect(observer.state().upstream).not.toHaveProperty('assumedCompression');
+    expect(observer.state().downstream).toMatchObject({ compression: 'unknown', assumedCompression: 'uncompressed' });
     // Framing loss is the only known unknown; it is not silently rewritten as a phase.
     observer.markUnknown('framing-loss', 'client-to-server');
     expect(observer.state().downstream).toMatchObject({ phase: 'UNKNOWN', availability: 'unknown' });
@@ -112,7 +116,7 @@ describe('bounded observer', () => {
     expect(observer.state().upstream.phase).not.toBe('PLAY');
   });
 
-  it('decodes compressed server frames while client frames stay uncompressed', async () => {
+  it('decodes compressed server frames while the assumed-uncompressed client direction stays truthful', async () => {
     const observer = createBoundedObserver();
     const observed: any[] = [];
     observer.subscribe(e => { if (e.kind === 'observation') observed.push(e); });
@@ -123,9 +127,11 @@ describe('bounded observer', () => {
     await tick();
     expect(observed).toHaveLength(2);
     expect(observed[0]).toMatchObject({ direction: 'server-to-client', compression: 'enabled', payload: { compressed: true, payloadBytes: body.length } });
-    expect(observed[1]).toMatchObject({ direction: 'client-to-server', compression: 'disabled', payload: { compressed: false, payloadBytes: 2 } });
+    expect(observed[0]).not.toHaveProperty('compressionAssumed');
+    expect(observed[1]).toMatchObject({ direction: 'client-to-server', compression: 'unknown', compressionAssumed: 'uncompressed', payload: { compressed: false, payloadBytes: 2 } });
     expect(observer.state().upstream.compression).toBe('enabled');
-    expect(observer.state().downstream.compression).toBe('disabled');
+    // The unobserved direction is not presented as a confirmed `disabled` state.
+    expect(observer.state().downstream).toMatchObject({ compression: 'unknown', assumedCompression: 'uncompressed' });
   });
 
   it('resets frame sequence and offsets for one direction without touching the other', async () => {

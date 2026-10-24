@@ -143,9 +143,11 @@ describe('bounded directional framing', () => {
     downstream.setPhase('PLAY');
     const body = Buffer.from([0x10, 0x20, 0x30]);
     expect(downstream.attach(compressedFrame(body)).frames[0]).toMatchObject({ compression: 'enabled', phase: 'PLAY', body });
-    expect(upstream.compression).toBe('disabled');
+    // Without a recognised control event the other direction stays truthfully unknown,
+    // parsing only under the reported assumed-uncompressed framing.
+    expect(upstream.compression).toBe('unknown');
     expect(upstream.phase).toBe('UNKNOWN');
-    expect(upstream.attach(plainFrame(body)).frames[0]).toMatchObject({ compression: 'disabled', phase: 'UNKNOWN' });
+    expect(upstream.attach(plainFrame(body)).frames[0]).toMatchObject({ compression: 'unknown', compressionAssumed: 'uncompressed', phase: 'UNKNOWN' });
   });
 
   it('applies a recognised control event at the exact frame boundary', () => {
@@ -194,7 +196,8 @@ describe('bounded directional framing', () => {
     expect(decoder.stopped).toBe(false);
     expect(decoder.byteOffset).toBe('0');
     expect(decoder.frameSequence).toBe('0');
-    expect(decoder.compression).toBe('disabled');
+    expect(decoder.compression).toBe('unknown');
+    expect(decoder.compressionAssumed).toBe('uncompressed');
     expect(decoder.phase).toBe('UNKNOWN');
     const result = decoder.attach(plainFrame(Buffer.from([1])));
     expect(result.frames).toHaveLength(1);

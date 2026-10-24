@@ -50,10 +50,16 @@ export class JsonlHelperTransport implements HelperTransport {
     process.once('error', () => fail('helper-process-error'));
   }
   onExit(listener: (reason: string) => void): () => void { this.exitListeners.add(listener); return () => this.exitListeners.delete(listener); }
-  static start(scriptPath: string, dryRun = false): JsonlHelperTransport {
+  /**
+   * Launch the helper. Dry-run is the default: real input requires an explicit
+   * `{ dryRun: false }` call site, and screen capture additionally requires
+   * `{ enableCapture: true }`, which the helper enforces independently.
+   */
+  static start(scriptPath: string, dryRun = true, enableCapture = false): JsonlHelperTransport {
     if (process.platform !== 'win32') throw new Error('windows-helper-requires-windows');
     const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath];
     if (dryRun) args.push('-DryRun');
+    if (enableCapture) args.push('-EnableCapture');
     return new JsonlHelperTransport(spawn('powershell.exe', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }));
   }
   send(request: HelperRequest, signal?: AbortSignal): Promise<HelperResponse> {
@@ -91,12 +97,12 @@ export class WindowsHelperDriver {
   private readonly now: () => number;
   private readonly heartbeatMs: number;
   private readonly completedCommands = new Set<string>();
-  constructor(private readonly transport: HelperTransport, private readonly enabled = false, now: () => number = () => Date.now(), heartbeatMs = 250) { this.now = now; this.heartbeatMs = heartbeatMs; }
+  constructor(private readonly transport: HelperTransport, private readonly enabled = false, now: () => number = () => Date.now(), heartbeatMs = 250, private readonly captureEnabled = false) { this.now = now; this.heartbeatMs = heartbeatMs; }
   /** Helper transport/process death. The orchestrator revokes control before any restart. */
   onExit(listener: (reason: string) => void): () => void {
     return this.transport.onExit?.(reason => { this.stopWatchdog(); this.bound = false; this.state = undefined; listener(reason); }) ?? (() => undefined);
   }
-  helperState() { return { enabled: this.enabled, bound: this.bound, window: this.state ?? null }; }
+  helperState() { return { enabled: this.enabled, captureEnabled: this.captureEnabled, bound: this.bound, window: this.state ?? null }; }
   private commandIdResult(commandId: string) { return this.completedCommands.has(commandId) ? { duplicate: true } : undefined; }
   private markCommand(commandId: string) { this.completedCommands.add(commandId); }
   private async command(command: HelperCommand, fields: Record<string, unknown> = {}) {
@@ -162,7 +168,13 @@ export class WindowsHelperDriver {
   }
   private assertCommandId(commandId: string) { if (!commandId || commandId.length > 256) throw new Error('command-id-required'); }
   private assertFinite(...values: number[]) { if (values.some(value => !Number.isFinite(value))) throw new Error('invalid-input'); }
-  captureWindow() { if (!this.enabled) throw new Error('os-input-disabled'); if (!this.bound) throw new Error('window-not-bound'); return this.command('captureWindow'); }
+  captureWindow() {
+    if (!this.enabled) throw new Error('os-input-disabled');
+    // Capture is an independent gate: enabling OS input must not silently enable screenshots.
+    if (!this.captureEnabled) throw new Error('screen-capture-disabled');
+    if (!this.bound) throw new Error('window-not-bound');
+    return this.command('captureWindow');
+  }
   releaseOwnedInputs() { return this.command('releaseOwnedInputs'); }
   async heartbeat() { const result = await this.command('heartbeat'); this.lastHeartbeatAt = this.now(); this.releasedForStaleHeartbeat = false; return result; }
   async shutdown() { this.stopWatchdog(); let releaseError: unknown; try { if (this.enabled && this.bound) await this.releaseOwnedInputs(); } catch (error) { releaseError = error; } finally { this.bound = false; this.boundIdentity = undefined; this.state = undefined; } try { await this.command('shutdown'); } finally { await this.transport.close(); } if (releaseError) throw releaseError; }

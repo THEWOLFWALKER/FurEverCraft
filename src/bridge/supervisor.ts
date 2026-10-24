@@ -144,7 +144,7 @@ export class ProcessSupervisor {
   }
 
   /** Send a control request to the child and await its correlated response. */
-  async request<T = unknown>(command: 'status' | 'shutdown' | 'capabilities' | 'observe' | 'start-observer' | 'stop-observer', payload: unknown = {}): Promise<T> {
+  async request<T = unknown>(command: 'status' | 'shutdown' | 'capabilities' | 'observe' | 'arm' | 'start-observer' | 'stop-observer', payload: unknown = {}): Promise<T> {
     const child = this.child;
     if (!child) return Promise.reject(new Error('supervisor-no-child'));
     // Owner loss revokes control: a paused/failed supervisor must not keep driving the child.

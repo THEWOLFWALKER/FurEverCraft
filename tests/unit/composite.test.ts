@@ -49,4 +49,28 @@ describe('CompositeClientBridge', () => {
     expect(transport.requests.map(request => request.command)).toEqual(['releaseOwnedInputs', 'shutdown']);
     await bridge.shutdown();
   });
+
+  it('never grants real client actions to simulated or unsupported profiles', async () => {
+    const transport = new FakeHelperTransport();
+    const protocol = new ProtocolSession('fixture-session');
+    const simulated = new CompositeClientBridge({
+      protocol,
+      windows: new WindowsHelperDriver(transport, true),
+      authExecutor: vi.fn(async () => undefined),
+      credentials: () => ({ username: 'u', secret: 's' }),
+      profile: { profile: 'simulated', allowMinecraftUpstream: true, allowOsInput: true, allowScreenCapture: true, allowAuth: true },
+    });
+    expect(simulated.capabilities).toMatchObject({
+      profile: 'simulated', protocolObservation: true, nativeInput: false, screenCapture: false, authentication: false, protocolForwarding: false,
+    });
+    expect(simulated.capabilities.limitations).toContain('offline-profile-required-for-real-client-actions');
+    protocol.observe('position', 'upstream', { x: 1 });
+    expect(simulated.observe()).toHaveLength(1);
+    expect(simulated.drainObservations().observations).toHaveLength(1);
+    await expect(simulated.moveRelative(1, 0, 'm', Date.now() + 1000)).rejects.toThrow('nativeInput-disabled');
+    await expect(simulated.captureWindow()).rejects.toThrow('screenCapture-disabled');
+    await expect(simulated.authenticate('login')).resolves.toBe('AUTH_AMBIGUOUS');
+
+    expect(() => new CompositeClientBridge({ profile: { profile: 'unsupported' } })).toThrow('unsupported-profile');
+  });
 });

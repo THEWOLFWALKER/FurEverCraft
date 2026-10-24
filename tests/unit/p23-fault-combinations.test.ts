@@ -302,7 +302,7 @@ describe('P23 goal race and lease revival', () => {
     const helper = new FakeHelper();
     const fatals: string[] = [];
     const events: string[] = [];
-    let accept = false;
+    let accept = true;
     const service = new BridgeService({
       relay, observer, helper,
       ipc: { send: () => accept },
@@ -319,10 +319,14 @@ describe('P23 goal race and lease revival', () => {
       await service.start();
       service.armControl('fresh-observation');
       expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
+      // Start with a drained channel, then stop accepting so the queue really saturates.
+      accept = false;
 
       // Saturate the parent queue while the observer is slow/failing and the relay dies.
       for (let index = 0; index < 40; index += 1) service.publishObserver({ kind: 'observation', frameSequence: String(index) });
       observer.fail('observer-slow-consumer');
+      // Round 3: observer failure alone closes admission synchronously, before any await.
+      expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
       relay.emitExit('unexpected-exit');
       for (let index = 0; index < 20; index += 1) await new Promise(resolve => setImmediate(resolve));
 

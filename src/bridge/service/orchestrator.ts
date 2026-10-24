@@ -92,6 +92,8 @@ export class BridgeService {
   private restarting?: Promise<boolean>;
   private forcedShutdown = false;
   private globalUnknown = false;
+  /** True once the current observation-overflow episode has notified its listeners. */
+  private overflowEpisodeNotified = false;
   private readonly outbox: BoundedIpcOutbox;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -151,18 +153,21 @@ export class BridgeService {
 
   /** Revoke held input and close admission without stopping forwarding. */
   async revokeControl(reason: string): Promise<void> {
-    this.controlRevokedValue = true;
-    this.admissionOpenValue = false;
-    try { await this.options.helper?.releaseOwnedInputs?.(); } catch { /* best effort */ }
-    this.emit({ type: 'control-revoked', reason });
-    this.log('warn', 'control-revoked', { reason });
+    this.closeAdmission();
+    const released = this.releaseInputsBestEffort();
+    this.announceRevoked(reason);
+    await released;
   }
 
   onObserverFailure(reason: string): void {
     this.emit({ type: 'observer-failure', reason });
     this.log('warn', 'observer-worker-failure', { reason });
-    if (this.stateValue === 'running') this.stateValue = 'degraded';
-    this.emitState();
+    // Observer loss means the controlling runtime can no longer prove body state. Admission
+    // must close synchronously; releasing held input is best-effort and never blocks it.
+    this.closeAdmission();
+    void this.releaseInputsBestEffort();
+    this.announceRevoked(`observer-failure:${reason}`);
+    this.degradeIfRunning();
   }
 
   /**
@@ -180,7 +185,18 @@ export class BridgeService {
   }
 
   publishObserver(event: unknown): void {
+    // Relay forwarding is independent of this consumer; the event is still reported even
+    // when it also revokes control.
     this.emit({ type: 'observer-event', event });
+    const gapReason = globalObserverGapReason(event);
+    if (gapReason === undefined) return;
+    // A global observer gap (or an explicit unknown-availability report) invalidates the
+    // observation the runtime was admitted on. Close admission synchronously and require
+    // an explicit armControl after fresh, trusted observation.
+    this.closeAdmission();
+    void this.releaseInputsBestEffort();
+    this.announceRevoked(`observer-gap:${gapReason}`);
+    this.degradeIfRunning();
   }
 
   async stop(reason = 'quit'): Promise<void> {
@@ -231,26 +247,43 @@ export class BridgeService {
 
   /** Queue a message for the parent. Control loss is surfaced as global uncertainty. */
   emit(event: BridgeServiceEvent | IpcMessageLike, control?: boolean): void {
-    const before = this.outbox.queued().dropped;
+    const before = this.outbox.queued();
     this.outbox.push(event, control);
     const after = this.outbox.queued();
-    if (after.dropped > before) {
-      this.globalUnknown = this.globalUnknown || after.controlLost;
-      this.log('warn', 'ipc-queue-overflow', { dropped: after.dropped - before, controlLost: after.controlLost });
+    const droppedNow = after.dropped - before.dropped;
+    if (droppedNow > 0) {
+      this.globalUnknown = true;
+      const controlLostNow = !before.controlLost && after.controlLost;
+      this.log('warn', 'ipc-queue-overflow', { dropped: droppedNow, controlLost: after.controlLost });
+      if (!this.overflowEpisodeNotified || controlLostNow) {
+        this.overflowEpisodeNotified = true;
+        // The outbox can no longer be trusted to carry control. Close admission and notify
+        // runtime listeners directly: re-enqueueing this notification would recurse into the
+        // same full queue, and each overflow episode must notify exactly once.
+        this.closeAdmission();
+        void this.releaseInputsBestEffort();
+        this.dispatch({
+          type: 'observer-event',
+          event: {
+            kind: 'observer_gap', source: 'client', sessionEpoch: 'ipc-outbox',
+            gap: { scope: 'global', reason: 'ipc-queue-overflow', dropped: droppedNow },
+          },
+        } as BridgeServiceEvent);
+        this.dispatch({ type: 'ipc-overflow', dropped: droppedNow, controlLost: after.controlLost, globalUnknown: true });
+      }
     }
     this.flush();
-    try { this.options.onEvent?.(event as BridgeServiceEvent); } catch { /* listeners isolated */ }
-    for (const listener of this.eventListeners) {
-      try { listener(event as BridgeServiceEvent); } catch { /* listeners isolated */ }
-    }
+    this.dispatch(event as BridgeServiceEvent);
   }
 
   /** Attempt to drain queued IPC without blocking. */
   flush(): void {
     if (!this.options.ipc) return;
-    this.outbox.flush(message => {
+    const result = this.outbox.flush(message => {
       try { return this.options.ipc!.send(message); } catch { return false; }
     });
+    // A fully drained queue ends the overflow episode; a later overflow is a new episode.
+    if (result.queued === 0) this.overflowEpisodeNotified = false;
   }
 
   private async onRelayExit(reason: string): Promise<void> {
@@ -314,6 +347,37 @@ export class BridgeService {
 
   private isStopping(): boolean { return this.stateValue === 'stopping' || this.stateValue === 'stopped'; }
 
+  private closeAdmission(): void {
+    this.controlRevokedValue = true;
+    this.admissionOpenValue = false;
+  }
+
+  private releaseInputsBestEffort(): Promise<void> {
+    try {
+      return Promise.resolve(this.options.helper?.releaseOwnedInputs?.()).then(() => undefined, () => undefined);
+    } catch {
+      return Promise.resolve();
+    }
+  }
+
+  private announceRevoked(reason: string): void {
+    this.emit({ type: 'control-revoked', reason });
+    this.log('warn', 'control-revoked', { reason });
+  }
+
+  private degradeIfRunning(): void {
+    if (this.stateValue !== 'running') return;
+    this.stateValue = 'degraded';
+    this.emitState();
+  }
+
+  private dispatch(event: BridgeServiceEvent | IpcMessageLike): void {
+    try { this.options.onEvent?.(event as BridgeServiceEvent); } catch { /* listeners isolated */ }
+    for (const listener of this.eventListeners) {
+      try { listener(event as BridgeServiceEvent); } catch { /* listeners isolated */ }
+    }
+  }
+
   private emitState(): void {
     this.emit({ type: 'state', state: this.stateValue });
   }
@@ -336,4 +400,19 @@ async function withDeadline(work: Promise<unknown>, ms: number): Promise<boolean
 
 function errorText(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error)) as string;
+}
+
+/**
+ * Returns the reason when an observer event invalidates control: a global gap, a domain
+ * gap that also reports unknown availability, or any observation marked unavailable.
+ * A scoped domain gap with known availability does not revoke on its own.
+ */
+function globalObserverGapReason(event: unknown): string | undefined {
+  if (!event || typeof event !== 'object') return undefined;
+  const value = event as { kind?: unknown; availability?: unknown; gap?: { scope?: unknown; reason?: unknown } };
+  const reason = typeof value.gap?.reason === 'string' ? value.gap.reason : undefined;
+  if (value.availability === 'unknown') return reason ?? 'availability-unknown';
+  if (value.kind !== 'observer_gap') return undefined;
+  if (value.gap?.scope === 'domain') return undefined;
+  return reason ?? 'observer-gap';
 }

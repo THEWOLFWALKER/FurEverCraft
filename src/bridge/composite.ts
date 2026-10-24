@@ -41,19 +41,24 @@ export class CompositeClientBridge {
 
   constructor(private readonly options: CompositeClientBridgeOptions) {
     this.profile = ClientBridgeProfileSchema.parse(options.profile);
+    // The composite only performs real client actions under the explicit client profile.
+    // A simulated/unsupported profile may still carry fixture observations, but never gains
+    // native input, capture, forwarding or authentication capability from a boolean gate.
+    if (this.profile.profile === 'unsupported') throw new Error('unsupported-profile');
+    const clientProfile = this.profile.profile === 'client-offline';
     const source = this.profile.profile === 'simulated' ? 'simulated' : options.protocol?.source ?? 'fixture';
     const limitations: string[] = [];
     if (!options.protocol) limitations.push('protocol-observer-unavailable');
-    if (!this.profile.allowOsInput || !options.windows) limitations.push('native-input-disabled');
-    if (!this.profile.allowScreenCapture || !options.windows) limitations.push('screen-capture-disabled');
-    if (!this.profile.allowAuth || !options.authExecutor || !options.credentials) limitations.push('authentication-disabled');
-    if (this.profile.profile !== 'client-offline') limitations.push('offline-profile-required-for-real-client-actions');
+    if (!clientProfile || !this.profile.allowOsInput || !options.windows) limitations.push('native-input-disabled');
+    if (!clientProfile || !this.profile.allowScreenCapture || !options.windows) limitations.push('screen-capture-disabled');
+    if (!clientProfile || !this.profile.allowAuth || !options.authExecutor || !options.credentials) limitations.push('authentication-disabled');
+    if (!clientProfile) limitations.push('offline-profile-required-for-real-client-actions');
     this.capabilities = {
       profile: this.profile.profile, protocolObservation: Boolean(options.protocol),
-      protocolForwarding: Boolean(options.protocol && this.profile.allowMinecraftUpstream),
-      nativeInput: Boolean(options.windows && this.profile.allowOsInput), windowHealth: Boolean(options.windows),
-      screenCapture: Boolean(options.windows && this.profile.allowScreenCapture),
-      authentication: Boolean(this.profile.allowAuth && options.authExecutor && options.credentials),
+      protocolForwarding: Boolean(clientProfile && options.protocol && this.profile.allowMinecraftUpstream),
+      nativeInput: Boolean(clientProfile && options.windows && this.profile.allowOsInput), windowHealth: Boolean(options.windows),
+      screenCapture: Boolean(clientProfile && options.windows && this.profile.allowScreenCapture),
+      authentication: Boolean(clientProfile && this.profile.allowAuth && options.authExecutor && options.credentials),
       stableNavigation: false, source, limitations,
     };
     this.identity = { connectionEpoch: options.protocol?.sessionEpoch ?? nextId('connection') };

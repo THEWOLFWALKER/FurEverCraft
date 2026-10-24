@@ -109,7 +109,13 @@ export type RuntimeAssembly = {
   /** Explicit dependency container the runtime was assembled from. */
   dependencies: RuntimeDependencies;
   ownerId: string;
+  /** Raw configured input gate; does not by itself prove input can be dispatched. */
   inputsEnabled: boolean;
+  /**
+   * Effective control state from the attached bridge service. Without an attached service
+   * the runtime's own input setting is authoritative and this is always open.
+   */
+  controlOpen(): boolean;
   ownership?: RuntimeOwnershipLock;
   startBridgeService?(): Promise<void>;
   close(): void;
@@ -306,7 +312,7 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
       memory, memoryScope, knowledge, lifecycle, ...(bodyAdapter ? { bodyAdapter } : {}),
       providerSession: loop.providerSession, canonicalProviderPath: loop.canonicalPath,
       ...(bridgeService ? { bridgeService, startBridgeService } : {}),
-      dependencies, ownerId: session.ownerId, inputsEnabled, ownership,
+      dependencies, ownerId: session.ownerId, inputsEnabled, controlOpen, ownership,
       close() {
         if (closed) return;
         closed = true;

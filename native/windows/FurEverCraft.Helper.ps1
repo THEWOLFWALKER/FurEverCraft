@@ -1,4 +1,4 @@
-param([switch]$DryRun)
+param([switch]$DryRun,[switch]$EnableCapture)
 $ErrorActionPreference = 'Stop'
 $source = @'
 using System;
@@ -59,7 +59,7 @@ while ($line = [Console]::In.ReadLine()) {
     if (@('moveRelative','click','typeText') -contains [string]$request.command -and ($request.PSObject.Properties.Name -notcontains 'commandId' -or [string]::IsNullOrWhiteSpace([string]$request.commandId))) { throw 'commandId-required' }
     if (@('setHeldInputs','moveRelative','click','typeText') -contains [string]$request.command -and $request.PSObject.Properties.Name -notcontains 'leaseUntil') { throw 'leaseUntil-required' }
     $result = switch ($request.command) {
-      'probe' { @{ supported=$true; dryRun=$DryRun; platform='windows'; inputBackend='SendInput'; captureBackend='OS-window-capture' } }
+      'probe' { @{ supported=$true; dryRun=[bool]$DryRun; captureEnabled=[bool]$EnableCapture; platform='windows'; inputBackend='SendInput'; captureBackend='OS-window-capture' } }
       'bindWindow' {
         $candidate = [IntPtr]([long]$request.hwnd)
         if (-not [FurEverCraftNative]::IsWindow($candidate)) { throw 'window-not-found' }
@@ -96,6 +96,7 @@ while ($line = [Console]::In.ReadLine()) {
         if(-not $DryRun){foreach($char in [string]$request.text){[FurEverCraftNative]::Unicode($char,$true);[FurEverCraftNative]::Unicode($char,$false)}}; [void]$seen.Add([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
       }
       'captureWindow' {
+        if(-not $EnableCapture){throw 'screen-capture-disabled'}
         if($boundHwnd -eq [IntPtr]::Zero -or -not [FurEverCraftNative]::IsWindow($boundHwnd)){throw 'window-not-found'}
         if(-not [FurEverCraftNative]::IsWindowVisible($boundHwnd)){throw 'capture-limited-window-not-visible'}
         [uint32]$pid=0;[void][FurEverCraftNative]::GetWindowThreadProcessId($boundHwnd,[ref]$pid);if($pid -ne $boundPid){throw 'window-pid-mismatch'}

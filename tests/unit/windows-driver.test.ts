@@ -66,4 +66,32 @@ describe('Windows helper driver offline contract', () => {
     expect(reasons).toEqual(['helper-process-exit']);
     expect(driver.helperState()).toMatchObject({ bound: false, window: null });
   });
+
+  it('treats screen capture as an independent gate from OS input', async () => {
+    const responder = (request: { requestId: string; command: string }) => ({
+      requestId: request.requestId,
+      ok: true,
+      result: request.command === 'bindWindow'
+        ? { bound: true, pid: 12, hwnd: '0xc' }
+        : request.command === 'getWindowState'
+          ? { exists: true, focused: true, visible: true, pid: 12, hwnd: '0xc' }
+          : { accepted: true, source: 'fixture' },
+    });
+    const inputOnly = new WindowsHelperDriver(new FakeHelperTransport(responder), true);
+    await inputOnly.bindWindow(12, '0xc');
+    expect(() => inputOnly.captureWindow()).toThrow('screen-capture-disabled');
+    expect(inputOnly.helperState()).toMatchObject({ enabled: true, captureEnabled: false });
+
+    const captureOnly = new WindowsHelperDriver(new FakeHelperTransport(responder), false, () => 100, 250, true);
+    expect(() => captureOnly.captureWindow()).toThrow('os-input-disabled');
+    expect(captureOnly.helperState()).toMatchObject({ enabled: false, captureEnabled: true });
+
+    const withCapture = new WindowsHelperDriver(new FakeHelperTransport(responder), true, () => 100, 250, true);
+    await withCapture.bindWindow(12, '0xc');
+    expect(await withCapture.captureWindow()).toMatchObject({ accepted: true });
+    expect(withCapture.helperState()).toMatchObject({ enabled: true, captureEnabled: true });
+
+    await inputOnly.shutdown();
+    await withCapture.shutdown();
+  });
 });

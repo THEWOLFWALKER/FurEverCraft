@@ -10,26 +10,35 @@ import {
   generateAdapterManifest,
   loadAdapterManifest,
   serializeAdapterManifest,
+  sha256File,
   verifyAdapterManifest,
   type AdapterManifest,
 } from '../../src/bridge/adapter/manifest.js';
 
 const sha = 'a'.repeat(64);
+const protocolVersionsPath = 'node_modules/minecraft-data/minecraft-data/data/pc/common/protocolVersions.json';
+const expectedFixture = { release: '1.20.4', protocolVersion: 765, dataVersion: 3700 };
 
 function fixtureRoot(): { root: string; artifact: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), 'furevercraft-adapter-'));
   mkdirSync(join(root, 'node_modules', 'minecraft-data', 'minecraft-data', 'data', 'pc', '1.20.4'), { recursive: true });
+  mkdirSync(join(root, 'node_modules', 'minecraft-data', 'minecraft-data', 'data', 'pc', 'common'), { recursive: true });
   mkdirSync(join(root, 'node_modules', 'minecraft-protocol'), { recursive: true });
   writeFileSync(join(root, 'node_modules', 'minecraft-data', 'package.json'), JSON.stringify({ name: 'minecraft-data', version: '3.87.0' }));
   writeFileSync(join(root, 'node_modules', 'minecraft-protocol', 'package.json'), JSON.stringify({ name: 'minecraft-protocol', version: '1.57.0' }));
   writeFileSync(join(root, 'node_modules', 'minecraft-data', 'minecraft-data', 'data', 'pc', '1.20.4', 'version.json'), JSON.stringify({ version: 765 }));
+  writeFileSync(join(root, protocolVersionsPath), JSON.stringify([{ minecraftVersion: '1.20.4', version: 765, dataVersion: 3700 }]));
   mkdirSync(join(root, 'adapter'), { recursive: true });
   const artifact = join(root, 'adapter', 'schema.json');
   writeFileSync(artifact, '{"packets":{}}');
+  writeFileSync(join(root, 'adapter', 'native.bin'), 'native-fixture');
   return { root, artifact, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 function validManifest(root: string): AdapterManifest {
+  const schemaHash = sha256File(join(root, 'adapter', 'schema.json'));
+  const dataHash = sha256File(join(root, protocolVersionsPath));
+  const nativeHash = sha256File(join(root, 'adapter', 'native.bin'));
   return generateAdapterManifest({
     rootDir: root,
     release: '1.20.4',
@@ -41,11 +50,15 @@ function validManifest(root: string): AdapterManifest {
     status: 'verified-fixture',
     dependencies: [{ name: 'minecraft-data', version: '3.87.0', installed: true }, { name: 'minecraft-protocol', version: '1.57.0', installed: true }],
     provenance: {
-      schema: { kind: 'schema', source: 'adapter/schema.json', version: '1', verified: false, notes: [] },
-      data: { kind: 'data', source: 'node_modules/minecraft-data/minecraft-data/data/pc/1.20.4/version.json', version: '1.20.4', verified: false, notes: [] },
-      native: { kind: 'native', source: 'none', version: 'unverified', verified: false, notes: [] },
+      schema: { kind: 'schema', source: 'adapter/schema.json', version: '1', sha256: schemaHash.sha256, verified: true, notes: [] },
+      data: { kind: 'data', source: protocolVersionsPath, version: '1.20.4', sha256: dataHash.sha256, verified: true, notes: [] },
+      native: { kind: 'native', source: 'adapter/native.bin', version: 'fixture', sha256: nativeHash.sha256, verified: true, notes: [] },
     },
-    artifacts: [{ path: 'adapter/schema.json', role: 'schema' }],
+    artifacts: [
+      { path: 'adapter/schema.json', role: 'schema' },
+      { path: protocolVersionsPath, role: 'data' },
+      { path: 'adapter/native.bin', role: 'native' },
+    ],
     capabilities: [
       { domain: 'framing', status: 'verified-fixture', evidence: 'fixture', limitations: [] },
       { domain: 'blocks', status: 'unsupported', evidence: 'none', limitations: ['no-schema'] },
@@ -64,7 +77,7 @@ describe('P07 adapter manifest', () => {
       const verification = verifyAdapterManifest(first, { rootDir: root, expected: { release: '1.20.4', protocolVersion: 765, dataVersion: 3700 } });
       expect(verification.ok).toBe(true);
       expect(verification.available).toBe(true);
-      expect(verification.checked).toEqual({ artifacts: 1, dependencies: 2, capabilities: 2 });
+      expect(verification.checked).toEqual({ artifacts: 3, dependencies: 2, capabilities: 2 });
       expect(verification.issues).toEqual([]);
     } finally { cleanup(); }
   });
@@ -83,12 +96,12 @@ describe('P07 adapter manifest', () => {
     try {
       const manifest = validManifest(root) as AdapterManifest & { supported?: boolean };
       const withExtra = { ...manifest, supported: true };
-      const extraResult = verifyAdapterManifest(withExtra, { rootDir: root });
+      const extraResult = verifyAdapterManifest(withExtra, { rootDir: root, expected: expectedFixture });
       expect(extraResult.ok).toBe(false);
       expect(extraResult.issues[0]).toMatchObject({ code: 'invalid-schema' });
 
       const wrongVersion = { ...manifest, manifestVersion: 2 };
-      const versionResult = verifyAdapterManifest(wrongVersion, { rootDir: root });
+      const versionResult = verifyAdapterManifest(wrongVersion, { rootDir: root, expected: expectedFixture });
       expect(versionResult.ok).toBe(false);
       expect(versionResult.issues[0]?.code).toBe('invalid-schema');
       expect(versionResult.available).toBe(false);
@@ -100,7 +113,7 @@ describe('P07 adapter manifest', () => {
     try {
       const manifest = validManifest(root);
       writeFileSync(artifact, '{"packets":{"changed":true}}');
-      const verification = verifyAdapterManifest(manifest, { rootDir: root });
+      const verification = verifyAdapterManifest(manifest, { rootDir: root, expected: expectedFixture });
       expect(verification.ok).toBe(false);
       expect(verification.issues.some(issue => issue.code === 'artifact-hash-mismatch')).toBe(true);
       expect(verification.available).toBe(false);
@@ -112,7 +125,8 @@ describe('P07 adapter manifest', () => {
     try {
       const manifest = validManifest(root);
       manifest.provenance.native = { kind: 'native', source: 'native/helper.exe', version: '1', sha256: sha, verified: true, notes: [] };
-      const verification = verifyAdapterManifest(manifest, { rootDir: root });
+      manifest.artifacts = manifest.artifacts.filter(artifact => artifact.role !== 'native');
+      const verification = verifyAdapterManifest(manifest, { rootDir: root, expected: expectedFixture });
       expect(verification.ok).toBe(false);
       expect(verification.issues.some(issue => issue.code === 'native-missing')).toBe(true);
     } finally { cleanup(); }
@@ -122,7 +136,7 @@ describe('P07 adapter manifest', () => {
     const { root, cleanup } = fixtureRoot();
     try {
       writeFileSync(join(root, 'node_modules', 'minecraft-data', 'package.json'), JSON.stringify({ name: 'minecraft-data', version: '3.86.0' }));
-      const verification = verifyAdapterManifest(validManifest(root), { rootDir: root });
+      const verification = verifyAdapterManifest(validManifest(root), { rootDir: root, expected: expectedFixture });
       expect(verification.ok).toBe(false);
       expect(verification.issues.some(issue => issue.code === 'dependency-version-mismatch')).toBe(true);
     } finally { cleanup(); }
@@ -136,7 +150,7 @@ describe('P07 adapter manifest', () => {
     expect(verification.status).toBe('unsupported');
     expect(verification.issues).toContainEqual(expect.objectContaining({ code: 'adapter-data-absent', path: 'node_modules/minecraft-data/minecraft-data/data/pc/26.3/version.json' }));
     expect(verification.issues.some(issue => issue.code === 'native-provenance-unverified')).toBe(true);
-    const matrix = capabilityMatrix(candidate);
+    const matrix = capabilityMatrix(candidate, verification);
     expect(matrix.available).toBe(false);
     expect(matrix.counts).toEqual({ 'verified-fixture': 0, experimental: 0, unsupported: 9 });
     expect(matrix.domains.every(domain => domain.status === 'unsupported' && domain.evidence === 'none')).toBe(true);
@@ -156,7 +170,7 @@ describe('P07 adapter manifest', () => {
     expect(verification.ok).toBe(true);
     expect(manifest.release).toBe('1.20.4');
     expect(manifest.adapterVersion).toBe('legacy-codec-fixture');
-    const matrix = capabilityMatrix(manifest);
+    const matrix = capabilityMatrix(manifest, verification);
     expect(matrix).not.toHaveProperty('supported');
     expect(matrix.counts['verified-fixture']).toBeGreaterThan(0);
     expect(matrix.counts.experimental).toBeGreaterThan(0);

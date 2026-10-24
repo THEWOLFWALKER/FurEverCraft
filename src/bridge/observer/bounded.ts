@@ -37,6 +37,8 @@ export type ObserverDirectionState = {
   frameSequence: string;
   phase: ObserverPhaseState;
   compression: ObserverCompressionState;
+  /** Present while the direction is parsed under an explicit assumed-uncompressed framing. */
+  assumedCompression?: 'uncompressed';
   payloadKind: ObserverPayloadKind;
   availability: 'degraded' | 'unknown';
   stoppedReason?: string;
@@ -51,6 +53,7 @@ export type ObserverEvent =
       frameSequence: string;
       phase: ObserverPhaseState;
       compression: ObserverCompressionState;
+      compressionAssumed?: 'uncompressed';
       availability: 'degraded';
       payload: {
         kind: ObserverPayloadKind;
@@ -65,7 +68,7 @@ export type ObserverEvent =
       kind: 'observer_gap';
       source: 'client';
       sessionEpoch: string;
-      gap: { scope: 'global' | 'domain'; reason: string; direction?: ObserverDirection; fromFrame?: string; toFrame?: string };
+      gap: { scope: 'global' | 'domain'; reason: string; direction?: ObserverDirection; fromFrame?: string; toFrame?: string; dropped?: number };
     };
 export type ObserverListener = (event: ObserverEvent) => unknown;
 type PendingFrame = DecodedFrame;
@@ -103,6 +106,12 @@ export class BoundedObserver {
   private stopped = false;
   private draining = false;
   private inflight = 0;
+  /**
+   * A global gap parks both directions. Attach processing and draining stop until an
+   * explicit reset/resync clears the latch, so no post-gap observation is emitted as if
+   * continuity had been preserved.
+   */
+  private globalParked = false;
   private readonly limits: ObserverLimits;
   private readonly now: () => number;
 
@@ -124,11 +133,15 @@ export class BoundedObserver {
   queued(): { frames: number; bytes: number } { return { frames: this.pending.length, bytes: this.queuedBytes }; }
 
   attach(direction: ObserverDirection, chunk: Uint8Array): void {
-    if (this.stopped) return;
+    if (this.stopped || this.globalParked) return;
     const decoder = this.decoders[direction];
     if (decoder.stopped) return;
     const result = decoder.attach(chunk);
-    for (const frame of result.frames) this.enqueue(frame);
+    for (const frame of result.frames) {
+      // Once the queue overflows, the remainder of this chunk is not processed and no
+      // drain starts: later frames from the same chunk must not be presented as observed.
+      if (!this.enqueue(frame)) return;
+    }
     if (result.failure) {
       this.markUnknownFromDecoder(direction, result.failure.reason);
       return;
@@ -167,23 +180,25 @@ export class BoundedObserver {
 
   markUnknown(reason = 'framing-loss', direction?: ObserverDirection): void {
     this.healthValue = 'unknown';
+    this.globalParked = true;
     if (direction) {
       this.decoders[direction].markUnknown(reason);
-      this.dropPending(direction);
     } else {
-      for (const key of Object.keys(this.decoders) as ObserverDirection[]) {
-        this.decoders[key].markUnknown(reason);
-        this.dropPending(key);
-      }
+      for (const key of Object.keys(this.decoders) as ObserverDirection[]) this.decoders[key].markUnknown(reason);
     }
+    // A global gap invalidates pending continuity for both directions, not just the one
+    // whose decoder reported the failure.
+    this.dropPending();
     this.gap('global', reason, direction);
   }
 
   reset(direction: ObserverDirection): void {
     // A reset starts a new session/sequence for one direction only. It clears framing
-    // and control state for that direction; the other direction is untouched.
+    // and control state for that direction and lifts the global parking latch; the other
+    // direction's decoder state is untouched.
     this.decoders[direction].reset();
     this.dropPending(direction);
+    this.globalParked = false;
     const directions = this.directionStates();
     if (directions.some(state => state.availability === 'unknown')) this.healthValue = 'unknown';
     else if (directions.some(state => state.phase === 'UNKNOWN')) this.healthValue = 'degraded';
@@ -199,8 +214,9 @@ export class BoundedObserver {
         frameSequence: decoder.frameSequence,
         phase: decoder.phase,
         compression: decoder.compression,
+        ...(decoder.compressionAssumed === undefined ? {} : { assumedCompression: decoder.compressionAssumed }),
         payloadKind: PAYLOAD_KIND,
-        availability: decoder.stopped ? 'unknown' : 'degraded',
+        availability: decoder.stopped || this.globalParked ? 'unknown' : 'degraded',
         ...(decoder.stopReason === undefined ? {} : { stoppedReason: decoder.stopReason }),
       };
     });
@@ -208,24 +224,26 @@ export class BoundedObserver {
 
   private markUnknownFromDecoder(direction: ObserverDirection, reason: string): void {
     this.healthValue = 'unknown';
-    this.dropPending(direction);
+    this.globalParked = true;
+    this.dropPending();
     this.gap('global', reason, direction);
   }
 
-  private enqueue(frame: DecodedFrame): void {
+  private enqueue(frame: DecodedFrame): boolean {
     if (this.pending.length >= this.limits.maxQueuedFrames || this.queuedBytes + frame.payloadBytes > this.limits.maxQueuedBytes) {
       // Without a decoded packet class we cannot prove the dropped frame was not a
       // control packet, so continuity is lost globally; stop interpreting rather than
       // skipping frames and pretending later state is authoritative.
-      const decoder = this.decoders[frame.direction];
-      decoder.markUnknown('queue-overflow');
-      this.dropPending(frame.direction);
+      this.decoders[frame.direction].markUnknown('queue-overflow');
+      this.globalParked = true;
+      this.dropPending();
       this.healthValue = 'unknown';
       this.gap('global', 'queue-overflow', frame.direction, frame.frameSequence);
-      return;
+      return false;
     }
     this.pending.push(frame);
     this.queuedBytes += frame.payloadBytes;
+    return true;
   }
 
   private dropPending(direction?: ObserverDirection): void {
@@ -252,6 +270,9 @@ export class BoundedObserver {
   }
 
   private async dispatch(item: PendingFrame): Promise<void> {
+    // A global gap that landed while this frame was inflight invalidates it; do not
+    // present an observation after continuity was declared lost.
+    if (this.globalParked) return;
     // Frame metadata only: the outer length is framing, not a decoded packet ID; no
     // packet fields are parsed or exposed.
     const event: ObserverEvent = {
@@ -262,6 +283,7 @@ export class BoundedObserver {
       frameSequence: item.frameSequence,
       phase: item.phase,
       compression: item.compression,
+      ...(item.compressionAssumed === undefined ? {} : { compressionAssumed: item.compressionAssumed }),
       availability: 'degraded',
       payload: {
         kind: PAYLOAD_KIND,
@@ -323,6 +345,8 @@ export class BoundedObserver {
   }
 }
 
-export function createBoundedObserver(limits: Partial<ObserverLimits> = {}): BoundedObserver {
-  return new BoundedObserver(limits);
+export function createBoundedObserver(
+  options: Partial<ObserverLimits> & Partial<Pick<BoundedObserverOptions, 'recogniseControl' | 'inflate' | 'now'>> = {},
+): BoundedObserver {
+  return new BoundedObserver(options);
 }

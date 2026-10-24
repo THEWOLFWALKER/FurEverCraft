@@ -4,7 +4,9 @@ import { WorldSnapshotSchema } from '../contracts/index.js';
 type Cell = 'free'|'blocked'|'unknown';
 export type Observation = WorldSnapshot & { observedAt:number; sequence:string; sourceEpoch?:string; ttl?:number; baseline?:'full'|'delta' };
 const clone=<T>(v:T):T=>structuredClone(v);
-const sameStableContext = (a: BodyContext, b: BodyContext) => a.serverProfileId === b.serverProfileId && a.worldGenerationId === b.worldGenerationId && a.dimension === b.dimension;
+const knownAccount = (context: BodyContext): string | undefined => (typeof context.accountId === 'string' && context.accountId.length > 0 ? context.accountId : undefined);
+/** A known account never merges with a different or unknown account; both unknown is allowed. */
+const sameStableContext = (a: BodyContext, b: BodyContext) => a.serverProfileId === b.serverProfileId && a.worldGenerationId === b.worldGenerationId && a.dimension === b.dimension && knownAccount(a) === knownAccount(b);
 /** Sequences are non-negative decimal strings; anything else is a contract error, not a BigInt SyntaxError. */
 const parseSequence = (value: unknown) => {
   if (typeof value !== 'string' || !/^\d+$/.test(value)) throw new Error('invalid-observation-sequence');
@@ -13,6 +15,7 @@ const parseSequence = (value: unknown) => {
 
 export class WorldState {
   private current?:Observation; private revision=0n; private lastSequence=0n; private epoch?:string; private gap=false;
+  private readonly seenEpochs=new Set<string>();
   private readonly listeners=new Set<(s:WorldSnapshot)=>void>();
   constructor(private readonly context:BodyContext, private readonly now:()=>number=()=>Date.now()){}
 
@@ -23,23 +26,44 @@ export class WorldState {
     if(!sameStableContext(c,this.context)) throw new Error('world-context-mismatch');
     const seq=parseSequence(o.sequence);
     const epoch=o.sourceEpoch??c.connectionEpoch;
+    // A superseded epoch is never re-adopted, even by an explicit full snapshot. Epochs are
+    // only ordered by the fact that they were once current; unseen epochs are accepted via a
+    // full baseline without inventing an ordering between them.
+    if(this.epoch!==undefined && epoch!==this.epoch && this.seenEpochs.has(epoch)) throw new Error('stale-source-epoch');
     const newEpoch=this.epoch!==epoch;
     const isFull=o.baseline==='full';
-    const hasBaseline=Boolean(this.current)&&!this.gap;
-    if(newEpoch && !isFull) { this.epoch=epoch; this.lastSequence=seq; return this.invalidate('source-epoch-needs-baseline','all'); }
-    if(!newEpoch && !isFull && seq<=this.lastSequence) return this.snapshot();
-    if(!hasBaseline && !isFull) { this.epoch=epoch; this.lastSequence=seq; return this.invalidate('missing-baseline','all'); }
-    const missing=!newEpoch&&!isFull&&seq>this.lastSequence+1n;
-    // A gap is sticky: only an explicit full baseline clears it. Until then new deltas are not trusted.
-    const mustGap=isFull ? false : (this.gap || missing || o.gap);
-    // Deltas merge with the previous baseline; a full snapshot replaces it wholesale.
+    // Same-epoch observations must advance the sequence, including full snapshots. A stale full
+    // snapshot is not a new baseline and must not roll world state backwards.
+    if(!newEpoch && seq<=this.lastSequence) return this.snapshot();
+    if(newEpoch) this.seenEpochs.add(epoch);
+    if(newEpoch && !isFull) {
+      this.epoch=epoch; this.lastSequence=seq;
+      return this.invalidate('source-epoch-needs-baseline','all');
+    }
+    if(!newEpoch && !isFull) {
+      const current=this.current;
+      if(!current || this.gap) { this.epoch=epoch; this.lastSequence=seq; return this.invalidate('missing-baseline','all'); }
+      const missing=seq>this.lastSequence+1n;
+      // A gap is sticky: only an explicit full baseline without gap clears it.
+      const mustGap=this.gap||missing||o.gap;
+      const cells:Record<string,Cell> = mustGap
+        ? { ...Object.fromEntries(Object.keys(current.cells).map(k=>[k,'unknown' as Cell])), ...Object.fromEntries(Object.keys(o.cells).map(k=>[k,'unknown' as Cell])) }
+        : { ...current.cells, ...o.cells };
+      this.epoch=epoch; this.lastSequence=seq; this.revision++;
+      this.gap=mustGap;
+      this.current={...o,...parsed,revision:this.revision.toString(),gap:this.gap,cells,fields:this.fieldsFor(o,mustGap)};
+      const out=this.snapshot();
+      for(const listener of this.listeners){try{listener(clone(out))}catch{ /* listener isolation */ }}
+      return out;
+    }
+    // Full baseline. It clears uncertainty only when the snapshot itself is not gapped.
+    const mustGap=o.gap===true;
     const cells:Record<string,Cell> = mustGap
       ? { ...Object.fromEntries(Object.keys(this.current?.cells ?? {}).map(k=>[k,'unknown' as Cell])), ...Object.fromEntries(Object.keys(o.cells).map(k=>[k,'unknown' as Cell])) }
-      : isFull || !this.current ? o.cells : { ...this.current.cells, ...o.cells };
+      : o.cells;
     this.epoch=epoch; this.lastSequence=seq; this.revision++;
     this.gap=mustGap;
-    if(!isFull && this.gap && !missing && !o.gap) { /* keep existing invalidated baseline */ }
-    this.current={...o,...parsed,revision:this.revision.toString(),gap:this.gap,cells,fields:this.normalizeFields(o)};
+    this.current={...o,...parsed,revision:this.revision.toString(),gap:this.gap,cells,fields:this.fieldsFor(o,mustGap)};
     const out=this.snapshot();
     for(const listener of this.listeners){try{listener(clone(out))}catch{ /* listener isolation */ }}
     return out;
@@ -65,6 +89,13 @@ export class WorldState {
       const expired=(source.ttl!==undefined&&now-source.observedAt>source.ttl)||(f.expiresAt!==undefined&&now>f.expiresAt);
       return [k,{...f,freshness:expired?'stale':f.freshness,available:expired?false:f.available}];
     }));
+  }
+
+  /** A gapped observation keeps field evidence unknown and unavailable, matching invalidate(). */
+  private fieldsFor(source:Observation,gapped:boolean):WorldSnapshot['fields']{
+    const fields=this.normalizeFields(source);
+    if(!gapped) return fields;
+    return Object.fromEntries(Object.entries(fields).map(([k,f])=>[k,{...f,freshness:'unknown' as const,available:false}]));
   }
 
   snapshot(gap=this.gap):WorldSnapshot {

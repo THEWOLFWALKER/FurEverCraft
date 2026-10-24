@@ -15,6 +15,13 @@ import {
  * non-control domain may degrade without invalidating unrelated domains.
  */
 export type PipelineReason = 'epoch-required' | 'stale-epoch' | 'stale-sequence' | 'sequence-gap' | 'sticky-unknown' | 'rejected-packet';
+type PipelineDirection = 'downstream' | 'upstream';
+type GlobalUncertainty = {
+  reason: string;
+  /** Directions whose anchoring is required before this global cause can be cleared. */
+  directions: Set<PipelineDirection>;
+  anchored: Set<PipelineDirection>;
+};
 export type ProjectInput = {
   epoch: string;
   direction: 'downstream' | 'upstream';
@@ -45,8 +52,9 @@ export class DomainProjectionPipeline {
   private readonly controlFamilies: ReadonlySet<DomainFamily>;
   private readonly controlPackets: ReadonlySet<string>;
   private epochValue?: string;
-  private readonly lastSequences: Record<'downstream' | 'upstream', bigint | undefined> = { downstream: undefined, upstream: undefined };
-  private stickyUnknownValue?: string;
+  private readonly lastSequences: Record<PipelineDirection, bigint | undefined> = { downstream: undefined, upstream: undefined };
+  private globalUncertainty?: GlobalUncertainty;
+  private readonly directionUncertainty: Record<PipelineDirection, string | undefined> = { downstream: undefined, upstream: undefined };
   private readonly degraded = new Set<string>();
 
   constructor(options: PipelineOptions = {}) {
@@ -56,27 +64,58 @@ export class DomainProjectionPipeline {
   }
 
   get epoch(): string | undefined { return this.epochValue; }
-  get stickyUnknown(): string | undefined { return this.stickyUnknownValue; }
+  /** Effective uncertainty: the global cause first, otherwise a direction-local cause. */
+  get stickyUnknown(): string | undefined {
+    return this.globalUncertainty?.reason ?? this.directionUncertainty.downstream ?? this.directionUncertainty.upstream;
+  }
+  /** Backwards-compatible alias: a global cause is not cleared by a one-direction resync. */
+  get globalCause(): string | undefined { return this.globalUncertainty?.reason; }
   get degradedDomains(): string[] { return [...this.degraded].sort(); }
 
-  /** Bind the first trusted epoch and optional starting sequences. */
-  start(epoch: string, sequences: Partial<Record<'downstream' | 'upstream', string>> = {}): void {
+  /** Bind the first trusted epoch and optional starting sequences. This is an explicit new session. */
+  start(epoch: string, sequences: Partial<Record<PipelineDirection, string>> = {}): void {
     if (!epoch) throw new Error('epoch-required');
     this.epochValue = epoch;
-    this.stickyUnknownValue = undefined;
+    this.globalUncertainty = undefined;
+    this.directionUncertainty.downstream = undefined;
+    this.directionUncertainty.upstream = undefined;
     this.degraded.clear();
     this.lastSequences.downstream = sequences.downstream === undefined ? undefined : BigInt(sequences.downstream);
     this.lastSequences.upstream = sequences.upstream === undefined ? undefined : BigInt(sequences.upstream);
   }
 
-  /** Explicit recovery after a verified resynchronisation anchor. */
-  resync(epoch: string, sequence: string, direction: 'downstream' | 'upstream' = 'downstream'): void {
-    if (!epoch) throw new Error('epoch-required');
-    this.epochValue = epoch;
+  /**
+   * Explicit recovery after a verified resynchronisation anchor for one direction.
+   * Only that direction's gap is cleared; a global cause (control loss or an upstream
+   * gap) remains until every affected direction has been anchored. A changed epoch is
+   * rejected: a new session must go through start().
+   */
+  resync(epoch: string, sequence: string, direction: PipelineDirection = 'downstream'): void {
+    this.assertResyncEpoch(epoch);
     this.lastSequences[direction] = BigInt(sequence);
-    // Resync proves continuity for the new anchor; unrelated domains start clean.
-    this.stickyUnknownValue = undefined;
+    this.directionUncertainty[direction] = undefined;
+    const global = this.globalUncertainty;
+    if (global) {
+      if (global.directions.has(direction)) global.anchored.add(direction);
+      if ([...global.directions].every(candidate => global.anchored.has(candidate))) this.globalUncertainty = undefined;
+    }
+  }
+
+  /** Explicit full resynchronisation: clears global/direction uncertainty and domain degradation. */
+  resyncAll(epoch: string, sequences: Partial<Record<PipelineDirection, string>> = {}): void {
+    this.assertResyncEpoch(epoch);
+    if (sequences.downstream !== undefined) this.lastSequences.downstream = BigInt(sequences.downstream);
+    if (sequences.upstream !== undefined) this.lastSequences.upstream = BigInt(sequences.upstream);
+    this.globalUncertainty = undefined;
+    this.directionUncertainty.downstream = undefined;
+    this.directionUncertainty.upstream = undefined;
     this.degraded.clear();
+  }
+
+  private assertResyncEpoch(epoch: string): void {
+    if (!epoch) throw new Error('epoch-required');
+    if (!this.epochValue) throw new Error('epoch-required');
+    if (epoch !== this.epochValue) throw new Error(`stale-epoch: resync epoch ${epoch} != active ${this.epochValue}`);
   }
 
   project(input: ProjectInput): PipelineProjection {
@@ -84,16 +123,22 @@ export class DomainProjectionPipeline {
     if (input.epoch !== this.epochValue) {
       return this.reject('stale-epoch', `observation epoch ${input.epoch} != active ${this.epochValue}`);
     }
-    if (this.stickyUnknownValue) return this.reject('sticky-unknown', `global uncertainty: ${this.stickyUnknownValue}`);
+    if (this.globalUncertainty) return this.reject('sticky-unknown', `global uncertainty: ${this.globalUncertainty.reason}`);
+    const directionCause = this.directionUncertainty[input.direction];
+    if (directionCause) return this.reject('sticky-unknown', `${input.direction} uncertainty: ${directionCause}`);
     let sequence: bigint;
     try { sequence = BigInt(input.sequence); } catch { return this.reject('stale-sequence', `invalid sequence ${input.sequence}`); }
     const last = this.lastSequences[input.direction];
     if (last !== undefined) {
       if (sequence <= last) return this.reject('stale-sequence', `sequence ${sequence} is not newer than ${last}`);
       if (sequence !== last + 1n) {
-        this.stickyUnknownValue = `sequence-gap:${input.direction}:${last}->${sequence}`;
+        const cause = `sequence-gap:${input.direction}:${last}->${sequence}`;
         this.lastSequences[input.direction] = sequence;
-        return this.reject('sequence-gap', `sequence gap on ${input.direction}: ${last} -> ${sequence}`);
+        this.directionUncertainty[input.direction] = cause;
+        // Losing upstream information is control-relevant: it taints both directions until
+        // upstream itself is re-anchored. A downstream gap only fences downstream.
+        if (input.direction === 'upstream') this.raiseGlobalUncertainty(cause, ['upstream']);
+        return { accepted: false, reason: 'sequence-gap', detail: `sequence gap on ${input.direction}: ${last} -> ${sequence}`, degradedDomains: this.degradedDomains, ...(this.stickyUnknown === undefined ? {} : { stickyUnknown: this.stickyUnknown }) };
       }
     }
     this.lastSequences[input.direction] = sequence;
@@ -104,8 +149,8 @@ export class DomainProjectionPipeline {
     }
     const control = this.isControl(input.packet.name, projector?.family);
     if (control) {
-      this.stickyUnknownValue = `control-unknown:${input.packet.name}:${result.rejection.code}`;
-      return { accepted: false, reason: 'rejected-packet', detail: result.rejection.reason, rejection: result.rejection, degradedDomains: this.degradedDomains, stickyUnknown: this.stickyUnknownValue };
+      this.raiseGlobalUncertainty(`control-unknown:${input.packet.name}:${result.rejection.code}`, ['downstream', 'upstream']);
+      return { accepted: false, reason: 'rejected-packet', detail: result.rejection.reason, rejection: result.rejection, degradedDomains: this.degradedDomains, stickyUnknown: this.stickyUnknown };
     }
     const domain = projector?.family ?? input.packet.name;
     this.degraded.add(domain);
@@ -115,7 +160,7 @@ export class DomainProjectionPipeline {
   /** A bounded observation queue dropped an item. Control loss is global, domain loss is local. */
   noteObservationDrop(drop: { control: boolean; domain?: string; reason?: string }): void {
     if (drop.control) {
-      this.stickyUnknownValue = `observation-control-loss:${drop.reason ?? 'queue-overflow'}`;
+      this.raiseGlobalUncertainty(`observation-control-loss:${drop.reason ?? 'queue-overflow'}`, ['downstream', 'upstream']);
       return;
     }
     if (drop.domain) this.degraded.add(drop.domain);
@@ -124,14 +169,32 @@ export class DomainProjectionPipeline {
   state() {
     return {
       epoch: this.epochValue ?? null,
-      status: this.stickyUnknownValue ? 'unknown' as const : this.degraded.size > 0 ? 'degraded' as const : 'healthy' as const,
-      stickyUnknown: this.stickyUnknownValue ?? null,
+      status: this.stickyUnknown !== undefined ? 'unknown' as const : this.degraded.size > 0 ? 'degraded' as const : 'healthy' as const,
+      stickyUnknown: this.stickyUnknown ?? null,
+      globalCause: this.globalUncertainty?.reason ?? null,
+      directionCauses: {
+        downstream: this.directionUncertainty.downstream ?? null,
+        upstream: this.directionUncertainty.upstream ?? null,
+      },
       degradedDomains: this.degradedDomains,
       lastSequences: {
         downstream: this.lastSequences.downstream?.toString() ?? null,
         upstream: this.lastSequences.upstream?.toString() ?? null,
       },
     };
+  }
+
+  private raiseGlobalUncertainty(reason: string, directions: readonly PipelineDirection[]): void {
+    if (!this.globalUncertainty) {
+      this.globalUncertainty = { reason, directions: new Set(directions), anchored: new Set() };
+      return;
+    }
+    if (!this.globalUncertainty.reason.includes(reason)) this.globalUncertainty.reason = `${this.globalUncertainty.reason};${reason}`;
+    for (const direction of directions) {
+      this.globalUncertainty.directions.add(direction);
+      // A newly affected direction has not been anchored against this cause yet.
+      this.globalUncertainty.anchored.delete(direction);
+    }
   }
 
   private isControl(packetName: string, family?: DomainFamily): boolean {
@@ -141,7 +204,7 @@ export class DomainProjectionPipeline {
   }
 
   private reject(reason: PipelineReason, detail: string): PipelineProjection {
-    return { accepted: false, reason, detail, degradedDomains: this.degradedDomains, ...(this.stickyUnknownValue === undefined ? {} : { stickyUnknown: this.stickyUnknownValue }) };
+    return { accepted: false, reason, detail, degradedDomains: this.degradedDomains, ...(this.stickyUnknown === undefined ? {} : { stickyUnknown: this.stickyUnknown }) };
   }
 }
 

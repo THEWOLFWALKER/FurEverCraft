@@ -55,8 +55,8 @@
     {
       "role": "native",
       "path": "native/windows/FurEverCraft.Helper.ps1",
-      "sha256": "1b45e6546a427cd8aa1fec27292a9d71875eac59b120650401ea66ca5f64fd10",
-      "bytes": 10266
+      "sha256": "67f9731148fa42e1653f465ee13819178c0548b59a0541c3ffe4999fdb2e7014",
+      "bytes": 10397
     },
     {
       "role": "fixture",

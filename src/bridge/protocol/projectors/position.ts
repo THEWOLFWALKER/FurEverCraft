@@ -9,6 +9,7 @@ export const POSITION_SCHEMA: ProjectorSchema = {
     position: {
       fields: { x: 'number', y: 'number', z: 'number', yawDeg: 'number', pitchDeg: 'number', dimension: 'string', velocity: 'vec3' },
       required: ['x', 'y', 'z'],
+      nestedShapes: { velocity: { x: 'number', y: 'number', z: 'number' } },
     },
     position_correction: {
       fields: { x: 'number', y: 'number', z: 'number', yawDeg: 'number', pitchDeg: 'number' },

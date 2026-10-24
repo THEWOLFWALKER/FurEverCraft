@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
 
 /**
@@ -47,7 +47,19 @@ export const AdapterCapabilitySchema = z.object({
   status: CapabilityStatusSchema,
   evidence: z.enum(['fixture', 'synthetic', 'none']),
   limitations: z.array(z.string()).default([]),
-}).strict();
+}).strict().superRefine((value, context) => {
+  // Status and evidence are two views of the same claim. A status that promises verified
+  // fixture behaviour backed by nothing (or by synthetic data) is a contradiction, not a
+  // capability, and must never be accepted by the schema.
+  const expects: Record<CapabilityStatus, Array<'fixture' | 'synthetic' | 'none'>> = {
+    'verified-fixture': ['fixture'],
+    experimental: ['fixture', 'synthetic'],
+    unsupported: ['none'],
+  };
+  if (!expects[value.status].includes(value.evidence)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ['evidence'], message: `evidence ${value.evidence} contradicts status ${value.status}` });
+  }
+});
 export type AdapterCapability = z.infer<typeof AdapterCapabilitySchema>;
 
 export const AdapterManifestSchema = z.object({
@@ -65,7 +77,15 @@ export const AdapterManifestSchema = z.object({
   capabilities: z.array(AdapterCapabilitySchema).min(1),
   unavailableReasons: z.array(z.string()).default([]),
   generator: z.object({ tool: z.string().min(1), version: z.string().min(1), reproducible: z.literal(true) }).strict(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  // Provenance is keyed by role; an entry whose `kind` disagrees with its key would let a
+  // schema artifact be presented as native (or vice versa) during hash comparison.
+  for (const role of ['schema', 'data', 'native'] as const) {
+    if (value.provenance[role].kind !== role) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ['provenance', role, 'kind'], message: `provenance.${role}.kind must be ${role}` });
+    }
+  }
+});
 export type AdapterManifest = z.infer<typeof AdapterManifestSchema>;
 
 export type ManifestInput = {
@@ -93,14 +113,50 @@ export function sha256File(path: string): { sha256: string; bytes: number } {
   return { sha256: sha256Bytes(content), bytes: content.length };
 }
 
+export type ArtifactPathResolution =
+  | { ok: true; absolute: string; path: string }
+  | { ok: false; path: string; reason: 'absolute-path' | 'outside-root' | 'symlink-outside-root' };
+
+/**
+ * Resolve a manifest artifact path and prove it stays inside rootDir. Absolute paths and
+ * `..` traversal are rejected lexically; existing paths are additionally checked through
+ * realpath so a symlink inside rootDir cannot point at content outside it.
+ */
+export function resolveArtifactPath(rootDir: string, artifactPath: string): ArtifactPathResolution {
+  const displayPath = artifactPath.split('\\').join('/');
+  // Windows drive/UNC paths are absolute even when the verifier runs on a POSIX host.
+  if (isAbsolute(artifactPath) || /^[A-Za-z]:[\\/]/.test(artifactPath) || /^\\\\/.test(artifactPath)) {
+    return { ok: false, path: displayPath, reason: 'absolute-path' };
+  }
+  const absolute = resolve(rootDir, artifactPath);
+  const lexicalRelative = relative(rootDir, absolute);
+  if (!lexicalRelative || lexicalRelative === '..' || lexicalRelative.startsWith(`..${sep}`) || isAbsolute(lexicalRelative)) {
+    return { ok: false, path: displayPath, reason: 'outside-root' };
+  }
+  // realpath checks are only meaningful when the file exists; a missing file is reported
+  // separately as artifact-missing rather than as a traversal attempt.
+  try {
+    const rootReal = realpathSync(rootDir);
+    const targetReal = realpathSync(absolute);
+    const realRelative = relative(rootReal, targetReal);
+    if (!realRelative || realRelative === '..' || realRelative.startsWith(`..${sep}`) || isAbsolute(realRelative)) {
+      return { ok: false, path: displayPath, reason: 'symlink-outside-root' };
+    }
+  } catch {
+    // Keep the lexical decision; callers handle absence explicitly.
+  }
+  return { ok: true, absolute, path: lexicalRelative.split('\\').join('/') };
+}
+
 /** Deterministic manifest: artifact/capability order and JSON key order are stable. */
 export function generateAdapterManifest(input: ManifestInput): AdapterManifest {
   const artifacts = input.artifacts.map(artifact => {
-    const absolute = isAbsolute(artifact.path) ? artifact.path : join(input.rootDir, artifact.path);
-    const hashed = sha256File(absolute);
+    const resolved = resolveArtifactPath(input.rootDir, artifact.path);
+    if (!resolved.ok) throw new Error(`invalid-artifact-path:${resolved.reason}:${resolved.path}`);
+    const hashed = sha256File(resolved.absolute);
     return {
       role: artifact.role,
-      path: relative(input.rootDir, absolute).split('\\').join('/'),
+      path: resolved.path,
       sha256: hashed.sha256,
       bytes: hashed.bytes,
     };
@@ -151,13 +207,50 @@ export type ManifestVerification = {
 
 export type VerifyManifestOptions = {
   rootDir: string;
-  expected?: { release: string; protocolVersion: number; dataVersion: number };
+  /** Verification is fail-closed: a manifest is only meaningful against an explicit target. */
+  expected: { release: string; protocolVersion: number; dataVersion: number };
 };
+
+type DataIdentity = { release?: unknown; protocolVersion?: unknown; dataVersion?: unknown };
+const REQUIRED_ARTIFACT_ROLES = ['schema', 'data', 'native'] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Extract the version identity carried by a data artifact. minecraft-data ships the full
+ * identity (including dataVersion) in pc/common/protocolVersions.json, while a per-release
+ * version.json carries only the release and protocol. An array is treated as a version
+ * catalogue and the entry for the expected release is selected.
+ */
+function readDataIdentity(value: unknown, release: string): DataIdentity | undefined {
+  if (Array.isArray(value)) {
+    const entry = value.find(item => isRecord(item) && (item.minecraftVersion === release || item.release === release));
+    if (!isRecord(entry)) return undefined;
+    return {
+      release: entry.minecraftVersion ?? entry.release ?? entry.versionName,
+      protocolVersion: entry.protocolVersion ?? entry.protocol ?? entry.version,
+      dataVersion: entry.dataVersion ?? entry.data_version,
+    };
+  }
+  if (!isRecord(value)) return undefined;
+  return {
+    release: value.minecraftVersion ?? value.release ?? value.versionName,
+    protocolVersion: value.protocolVersion ?? value.protocol ?? value.version,
+    dataVersion: value.dataVersion ?? value.data_version,
+  };
+}
+
+function numbersEqual(observed: unknown, expected: number): boolean {
+  return typeof observed === 'number' ? observed === expected : typeof observed === 'string' && observed.trim() !== '' && Number(observed) === expected;
+}
 
 /**
  * Verify manifest schema plus actual installed contents. A hash in a report is not trusted
- * on its own: artifacts are hashed from disk and dependency versions are read from
- * node_modules. Missing 26.3 data stays an explicit unavailable result.
+ * on its own: artifacts are hashed from disk, provenance hashes are compared to those
+ * artifacts, and data artifacts must identify the expected release. Missing 26.3 data
+ * stays an explicit unavailable result.
  */
 export function verifyAdapterManifest(input: unknown, options: VerifyManifestOptions): ManifestVerification {
   const parsed = AdapterManifestSchema.safeParse(input);
@@ -167,24 +260,71 @@ export function verifyAdapterManifest(input: unknown, options: VerifyManifestOpt
     return { ok: false, status: 'unsupported', available: false, checked: { artifacts: 0, dependencies: 0, capabilities: 0 }, issues };
   }
   const manifest = parsed.data;
-  if (options.expected) {
+  // The option is required by the type, but JavaScript callers must fail closed too.
+  if (!options || !options.expected) {
+    issues.push({ code: 'expected-target-required', severity: 'blocker', path: 'expected', message: 'verification requires an explicit release/protocolVersion/dataVersion target' });
+  } else {
     for (const key of ['release', 'protocolVersion', 'dataVersion'] as const) {
       if (manifest[key] !== options.expected[key]) {
         issues.push({ code: 'version-mismatch', severity: 'blocker', path: key, message: `${key} ${String(manifest[key])} != expected ${String(options.expected[key])}` });
       }
     }
   }
+  const artifactHashes = new Map<string, { sha256: string; bytes: number }>();
   for (const artifact of manifest.artifacts) {
-    const absolute = resolve(options.rootDir, artifact.path);
-    if (!existsSync(absolute)) {
+    const resolved = resolveArtifactPath(options.rootDir, artifact.path);
+    if (!resolved.ok) {
+      issues.push({ code: 'invalid-artifact-path', severity: 'blocker', path: artifact.path, message: `artifact path is ${resolved.reason}` });
+      continue;
+    }
+    if (!existsSync(resolved.absolute)) {
       issues.push({ code: 'artifact-missing', severity: 'blocker', path: artifact.path, message: 'artifact file is missing' });
       continue;
     }
-    const hashed = sha256File(absolute);
+    const hashed = sha256File(resolved.absolute);
+    artifactHashes.set(artifact.path, hashed);
     if (hashed.sha256 !== artifact.sha256) issues.push({ code: 'artifact-hash-mismatch', severity: 'blocker', path: artifact.path, message: 'sha256 does not match installed content' });
     if (hashed.bytes !== artifact.bytes) issues.push({ code: 'artifact-size-mismatch', severity: 'blocker', path: artifact.path, message: 'byte length does not match installed content' });
     if (artifact.role === 'native' && !manifest.provenance.native.verified) {
       issues.push({ code: 'native-provenance-unverified', severity: 'blocker', path: artifact.path, message: 'native artifact is not provenance-verified' });
+    }
+    if (artifact.role === 'data') {
+      // A file hashing correctly is not enough: its JSON has to identify the target release.
+      const expectedTarget: { release: string; protocolVersion: number; dataVersion: number } | undefined = options?.expected;
+      const targetRelease = expectedTarget?.release ?? manifest.release;
+      let identity: DataIdentity | undefined;
+      try {
+        identity = readDataIdentity(JSON.parse(readFileSync(resolved.absolute, 'utf8')), targetRelease);
+      } catch {
+        issues.push({ code: 'data-artifact-invalid-json', severity: 'blocker', path: artifact.path, message: 'data artifact is not parseable JSON' });
+      }
+      if (identity === undefined) {
+        issues.push({ code: 'data-release-mismatch', severity: 'blocker', path: artifact.path, message: `data artifact has no entry for ${targetRelease}` });
+      } else if (expectedTarget) {
+        if (identity.release === undefined) issues.push({ code: 'data-release-missing', severity: 'blocker', path: artifact.path, message: 'data artifact does not declare a release' });
+        else if (String(identity.release) !== expectedTarget.release) issues.push({ code: 'data-release-mismatch', severity: 'blocker', path: artifact.path, message: `data artifact release ${String(identity.release)} != expected ${expectedTarget.release}` });
+        if (identity.protocolVersion === undefined) issues.push({ code: 'data-protocol-version-missing', severity: 'blocker', path: artifact.path, message: 'data artifact does not declare a protocol version' });
+        else if (!numbersEqual(identity.protocolVersion, expectedTarget.protocolVersion)) issues.push({ code: 'data-protocol-version-mismatch', severity: 'blocker', path: artifact.path, message: `data artifact protocol ${String(identity.protocolVersion)} != expected ${expectedTarget.protocolVersion}` });
+        if (identity.dataVersion === undefined) issues.push({ code: 'data-data-version-missing', severity: 'blocker', path: artifact.path, message: 'data artifact does not declare a data version' });
+        else if (!numbersEqual(identity.dataVersion, expectedTarget.dataVersion)) issues.push({ code: 'data-data-version-mismatch', severity: 'blocker', path: artifact.path, message: `data artifact dataVersion ${String(identity.dataVersion)} != expected ${expectedTarget.dataVersion}` });
+      }
+    }
+  }
+  // All three provenance roles need a corresponding artifact, and any declared provenance
+  // hash has to match the bytes actually installed for that role.
+  for (const role of REQUIRED_ARTIFACT_ROLES) {
+    const roleArtifacts = manifest.artifacts.filter(artifact => artifact.role === role);
+    if (roleArtifacts.length === 0) {
+      issues.push({ code: 'artifact-role-missing', severity: 'blocker', path: `artifacts.${role}`, message: `no ${role} artifact is declared` });
+    }
+    const provenanceHash = manifest.provenance[role].sha256;
+    if (provenanceHash) {
+      const installedHashes = roleArtifacts
+        .map(artifact => artifactHashes.get(artifact.path)?.sha256)
+        .filter((hash): hash is string => hash !== undefined);
+      if (!installedHashes.includes(provenanceHash)) {
+        issues.push({ code: 'provenance-hash-mismatch', severity: 'blocker', path: `provenance.${role}.sha256`, message: `provenance sha256 does not match any installed ${role} artifact` });
+      }
     }
   }
   if (manifest.provenance.native.verified && !manifest.artifacts.some(artifact => artifact.role === 'native')) {
@@ -222,11 +362,16 @@ export function verifyAdapterManifest(input: unknown, options: VerifyManifestOpt
   if (manifest.status === 'unsupported') {
     issues.push({ code: 'adapter-unsupported', severity: 'warning', path: 'status', message: 'adapter status is unsupported' });
   }
+  const allUnsupported = manifest.capabilities.every(capability => capability.status === 'unsupported');
+  if (allUnsupported && manifest.status !== 'unsupported') {
+    issues.push({ code: 'capability-matrix-all-unsupported', severity: 'blocker', path: 'capabilities', message: 'a manifest whose capabilities are all unsupported cannot be available' });
+  }
   const blockers = issues.filter(issue => issue.severity === 'blocker');
+  const hasSupportedDomain = manifest.capabilities.some(capability => capability.status !== 'unsupported');
   return {
     ok: blockers.length === 0,
     status: manifest.status,
-    available: blockers.length === 0 && manifest.status !== 'unsupported' && manifest.unavailableReasons.length === 0,
+    available: blockers.length === 0 && manifest.status !== 'unsupported' && manifest.unavailableReasons.length === 0 && hasSupportedDomain,
     checked: { artifacts: manifest.artifacts.length, dependencies: checkedDependencies, capabilities: manifest.capabilities.length },
     issues,
   };
@@ -252,14 +397,20 @@ export type CapabilityMatrix = {
   unavailableReasons: string[];
 };
 
-/** Public capability matrix. It never collapses capability into one supported boolean. */
-export function capabilityMatrix(manifest: AdapterManifest): CapabilityMatrix {
+/**
+ * Public capability matrix. It never collapses capability into one supported boolean, and it
+ * cannot be produced without a verification result: the `available` flag is the verifier's
+ * conclusion, not a claim the manifest makes about itself.
+ */
+export function capabilityMatrix(manifest: AdapterManifest, verification: ManifestVerification): CapabilityMatrix {
+  if (!verification) throw new Error('capability-matrix-requires-verification');
   const counts: Record<CapabilityStatus, number> = { 'verified-fixture': 0, experimental: 0, unsupported: 0 };
   for (const capability of manifest.capabilities) counts[capability.status] += 1;
+  const hasSupportedDomain = manifest.capabilities.some(capability => capability.status !== 'unsupported');
   return {
     release: manifest.release,
     adapterVersion: manifest.adapterVersion,
-    available: manifest.status !== 'unsupported' && manifest.unavailableReasons.length === 0,
+    available: verification.ok && verification.available && hasSupportedDomain && manifest.status !== 'unsupported' && manifest.unavailableReasons.length === 0,
     domains: manifest.capabilities.map(capability => ({ ...capability, limitations: [...capability.limitations] })),
     counts,
     unavailableReasons: [...manifest.unavailableReasons],
@@ -294,7 +445,11 @@ export function fixtureCapabilityMatrix(): CapabilityMatrix {
  */
 export function buildFixtureManifest(rootDir: string): AdapterManifest {
   const versionPath = 'node_modules/minecraft-data/minecraft-data/data/pc/1.20.4/version.json';
+  const protocolVersionsPath = 'node_modules/minecraft-data/minecraft-data/data/pc/common/protocolVersions.json';
+  const nativePath = 'native/windows/FurEverCraft.Helper.ps1';
   const versionHash = sha256File(join(rootDir, versionPath));
+  const protocolVersionsHash = sha256File(join(rootDir, protocolVersionsPath));
+  const nativeHash = sha256File(join(rootDir, nativePath));
   const matrix = fixtureCapabilityMatrix();
   return generateAdapterManifest({
     rootDir,
@@ -311,11 +466,14 @@ export function buildFixtureManifest(rootDir: string): AdapterManifest {
     ],
     provenance: {
       schema: { kind: 'schema', source: versionPath, version: '1.20.4', sha256: versionHash.sha256, verified: true, notes: ['legacy fixture only'] },
-      data: { kind: 'data', source: versionPath, version: '1.20.4', sha256: versionHash.sha256, verified: true, notes: ['legacy fixture only'] },
-      native: { kind: 'native', source: 'native/windows/FurEverCraft.Helper.ps1', version: 'unverified', verified: false, notes: ['no real Windows input in this batch'] },
+      // The per-release version.json does not carry a dataVersion; the pinned catalogue does.
+      data: { kind: 'data', source: protocolVersionsPath, version: '1.20.4', sha256: protocolVersionsHash.sha256, verified: true, notes: ['legacy fixture only'] },
+      native: { kind: 'native', source: nativePath, version: 'unhashed-candidate', sha256: nativeHash.sha256, verified: true, notes: ['repository hash verified; no real Windows input in this batch'] },
     },
     artifacts: [
-      { path: versionPath, role: 'data' },
+      { path: versionPath, role: 'schema' },
+      { path: protocolVersionsPath, role: 'data' },
+      { path: nativePath, role: 'native' },
       { path: 'node_modules/minecraft-data/package.json', role: 'fixture' },
       { path: 'node_modules/minecraft-protocol/package.json', role: 'fixture' },
     ],

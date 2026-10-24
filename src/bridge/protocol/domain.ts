@@ -16,12 +16,12 @@ export type DomainProjection = {
   sessionEpoch: string;
   sequence: string;
   /** Stable scope so projections from another world/account cannot be merged. */
-  scope: { serverProfileId: string; dimension: string; worldGenerationId: string };
+  scope: ProjectionScope;
   payload: Record<string, unknown>;
   evidence: { packet: string; direction: string; phase: string };
 };
 
-export type ProjectionScope = { serverProfileId: string; dimension: string; worldGenerationId: string };
+export type ProjectionScope = { serverProfileId: string; dimension: string; worldGenerationId: string; accountId?: string };
 
 const number = (input: unknown): number | undefined => (typeof input === 'number' && Number.isFinite(input) ? input : undefined);
 

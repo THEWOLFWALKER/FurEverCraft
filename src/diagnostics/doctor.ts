@@ -34,7 +34,11 @@ export type DoctorBodyReport = DoctorCapability & {
   legacy2d: boolean;
   source: string;
   dimension: string;
+  /** Effective input availability: a configured gate that is open but control-revoked is disabled. */
   inputs: DoctorCapability;
+  /** Raw configured input gate, kept separate from effective availability. */
+  inputsEnabled: boolean;
+  effectiveInputsEnabled: boolean;
   jump: 'none' | 'short' | 'unknown';
   capabilities: Record<string, unknown>;
   observation?: { revision: string; freshness: string; gap: boolean };
@@ -155,7 +159,26 @@ function networkReport(runtime: RuntimeAssembly): DoctorCapability {
   return { state: 'disabled', reason: 'network-gate-disabled' };
 }
 
+/**
+ * Input availability is the conjunction of the configured gate and the attached service's
+ * admission state. Reporting the raw gate as available while control is revoked would tell an
+ * operator that writes can be dispatched when every write is actually rejected.
+ */
+function inputsReport(runtime: RuntimeAssembly): { inputs: DoctorCapability; raw: boolean; effective: boolean } {
+  const raw = runtime.inputsEnabled;
+  const controlOpen = runtime.controlOpen();
+  const effective = raw && controlOpen;
+  return {
+    raw,
+    effective,
+    inputs: effective
+      ? { state: 'available' }
+      : { state: 'disabled', reason: raw ? 'control-revoked' : 'input-gate-disabled' },
+  };
+}
+
 function bodyReport(runtime: RuntimeAssembly): DoctorBodyReport {
+  const inputState = inputsReport(runtime);
   const adapter = runtime.bodyAdapter;
   if (adapter) {
     let observation: BodyStateView | undefined;
@@ -174,9 +197,9 @@ function bodyReport(runtime: RuntimeAssembly): DoctorBodyReport {
       legacy2d: false,
       source: adapter.source,
       dimension: adapter.context.dimension,
-      inputs: runtime.inputsEnabled
-        ? { state: 'available' }
-        : { state: 'disabled', reason: 'input-gate-disabled' },
+      inputs: inputState.inputs,
+      inputsEnabled: inputState.raw,
+      effectiveInputsEnabled: inputState.effective,
       jump: capabilities.jump === 'short' ? 'short' : capabilities.jump === 'none' ? 'none' : 'unknown',
       capabilities: redact(capabilities) as Record<string, unknown>,
       ...(observation ? { observation: { revision: observation.revision, freshness: observation.freshness, gap: observation.gap } } : {}),
@@ -205,7 +228,9 @@ function bodyReport(runtime: RuntimeAssembly): DoctorBodyReport {
     legacy2d: true,
     source: String(bridge.capabilities?.source ?? 'legacy-2d'),
     dimension: runtime.bridge.context.dimension,
-    inputs: runtime.inputsEnabled ? { state: 'available' } : { state: 'disabled', reason: 'input-gate-disabled' },
+    inputs: inputState.inputs,
+    inputsEnabled: inputState.raw,
+    effectiveInputsEnabled: inputState.effective,
     jump: 'none',
     capabilities,
   };
@@ -429,7 +454,7 @@ export type UnavailableDoctorInput = {
  */
 export function unavailableDoctorReport(input: UnavailableDoctorInput): DoctorReport {
   const capability: DoctorCapability = { state: 'unavailable', reason: input.reason };
-  const body: DoctorBodyReport = { ...capability, mode: 'unknown', threeDimensional: false, legacy2d: false, source: 'unavailable', dimension: 'unknown', inputs: capability, jump: 'unknown', capabilities: {} };
+  const body: DoctorBodyReport = { ...capability, mode: 'unknown', threeDimensional: false, legacy2d: false, source: 'unavailable', dimension: 'unknown', inputs: capability, inputsEnabled: false, effectiveInputsEnabled: false, jump: 'unknown', capabilities: {} };
   return {
     version: 1,
     generatedAt: input.generatedAt ?? Date.now(),

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRuntime } from '../../src/execution/factory.js';
 import { createControlServer } from '../../src/server/index.js';
+import { BridgeService } from '../../src/bridge/service/orchestrator.js';
 
 type HttpResult = { status: number; headers: Record<string, string | string[] | undefined>; body: string; json: () => any };
 
@@ -107,6 +108,53 @@ describe('P24 authenticated doctor endpoint', { timeout: 20_000 }, () => {
       expect(paired.body).not.toContain('sk-p24-doctor-secret');
       expect(paired.body).not.toContain('p24-cli-bearer');
       expect(paired.body).not.toContain('p24-pair-code');
+    } finally {
+      await close();
+      openServers.pop();
+    }
+  });
+});
+
+describe('P24 doctor/capabilities effective control state', { timeout: 20_000 }, () => {
+  it('reports inputs disabled as control-revoked while the attached bridge service is unarmed', async () => {
+    const service = new BridgeService({});
+    const runtime = createRuntime({ bridgeService: { service } });
+    const server = createControlServer(runtime);
+    const close = async () => { await server.close(); runtime.close(); };
+    openServers.push({ close });
+    try {
+      await runtime.startBridgeService!();
+      await server.listen({ port: 0, host: '127.0.0.1' });
+      const address = server.server.address();
+      if (!address || typeof address === 'string') throw new Error('server-address-unavailable');
+      const port = address.port;
+
+      const capabilities = await httpGet(port, '/api/v1/capabilities');
+      expect(capabilities.status).toBe(200);
+      expect(capabilities.json()).toMatchObject({
+        inputsEnabled: true,
+        effectiveInputsEnabled: false,
+        inputControl: { open: false, state: 'disabled', reason: 'control-revoked' },
+      });
+      const unarmed = await httpGet(port, '/api/v1/doctor');
+      expect(unarmed.status).toBe(200);
+      expect(unarmed.json()).toMatchObject({
+        body: { inputsEnabled: true, effectiveInputsEnabled: false, inputs: { state: 'disabled', reason: 'control-revoked' } },
+      });
+      expect(unarmed.json().warnings).toContain('body-inputs:control-revoked');
+
+      service.armControl('fresh-observation');
+      const armed = await httpGet(port, '/api/v1/capabilities');
+      expect(armed.json()).toMatchObject({
+        inputsEnabled: true,
+        effectiveInputsEnabled: true,
+        inputControl: { open: true, state: 'available' },
+      });
+      expect((await httpGet(port, '/api/v1/doctor')).json().body).toMatchObject({
+        inputsEnabled: true,
+        effectiveInputsEnabled: true,
+        inputs: { state: 'available' },
+      });
     } finally {
       await close();
       openServers.pop();

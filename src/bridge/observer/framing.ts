@@ -22,6 +22,12 @@ export type ObserverCompressionState = 'disabled' | 'enabled' | 'unknown';
 export type ControlEvent =
   | { type: 'compression'; enabled: true; threshold: number }
   | { type: 'compression'; enabled: false }
+  /**
+   * Explicitly declares that compression changed but the new state could not be
+   * recognised. Interpretation stops before the next frame instead of assuming a
+   * framing mode; this is how the `compression-unknown` branch is reached.
+   */
+  | { type: 'compression'; enabled: 'unknown'; reason?: string }
   | { type: 'phase'; phase: ObserverPhase }
   | { type: 'control-unknown'; reason?: string };
 
@@ -64,6 +70,8 @@ export type DecodedFrame = {
   frameBytes: number;
   payloadBytes: number;
   compressed: boolean;
+  /** Present while compression is unknown and framing is parsed under this explicit assumption. */
+  compressionAssumed?: 'uncompressed';
   body: Buffer;
   phase: ObserverPhase;
   compression: ObserverCompressionState;
@@ -109,7 +117,13 @@ export class DirectionalFrameDecoder {
   private byteOffsetValue = 0n;
   private frameSequenceValue = 0n;
   private phaseValue: ObserverPhase | 'unknown' = 'unknown';
-  private compressionValue: ObserverCompressionState = 'disabled';
+  /**
+   * Production observer has no 26.3 control-packet recogniser, so compression must start
+   * unknown. Frames are still parsed under an explicit, reported "assumed uncompressed"
+   * assumption until a recognised control event establishes the real state.
+   */
+  private compressionValue: ObserverCompressionState = 'unknown';
+  private compressionAssumedValue = true;
   private thresholdValue: number | null = null;
   private stoppedReason?: string;
   private readonly budget: FrameBudget;
@@ -130,6 +144,8 @@ export class DirectionalFrameDecoder {
 
   get phase(): ObserverPhase { return phaseState(this.phaseValue); }
   get compression(): ObserverCompressionState { return this.compressionValue; }
+  /** Non-undefined only while compression is unknown and uncompressed framing is assumed. */
+  get compressionAssumed(): 'uncompressed' | undefined { return this.compressionAssumedValue ? 'uncompressed' : undefined; }
   get compressionThreshold(): number | null { return this.thresholdValue; }
   get byteOffset(): string { return this.byteOffsetValue.toString(); }
   get frameSequence(): string { return this.frameSequenceValue.toString(); }
@@ -146,15 +162,25 @@ export class DirectionalFrameDecoder {
     if (this.stopped) return;
     if (event.type === 'control-unknown') { this.markUnknown(event.reason ?? 'control-unknown'); return; }
     if (event.type === 'phase') { this.phaseValue = event.phase; return; }
+    if (event.enabled === 'unknown') {
+      // A transition happened but its direction is unrecognised: stop guessing rather
+      // than continuing to parse compressed bytes as if they were uncompressed.
+      this.compressionValue = 'unknown';
+      this.compressionAssumedValue = false;
+      this.thresholdValue = null;
+      return;
+    }
     if (event.enabled) {
       if (!Number.isInteger(event.threshold) || event.threshold < 0 || event.threshold > this.budget.maxDecompressedBytes) {
         this.markUnknown('compression-control-invalid');
         return;
       }
       this.compressionValue = 'enabled';
+      this.compressionAssumedValue = false;
       this.thresholdValue = event.threshold;
     } else {
       this.compressionValue = 'disabled';
+      this.compressionAssumedValue = false;
       this.thresholdValue = null;
     }
   }
@@ -177,7 +203,8 @@ export class DirectionalFrameDecoder {
     this.consumedOffset = 0n;
     this.frameSequenceValue = 0n;
     this.phaseValue = 'unknown';
-    this.compressionValue = 'disabled';
+    this.compressionValue = 'unknown';
+    this.compressionAssumedValue = true;
     this.thresholdValue = null;
     this.stoppedReason = undefined;
   }
@@ -206,11 +233,16 @@ export class DirectionalFrameDecoder {
         return this.failure('decompressed-too-large', frames);
       }
       if (this.compressionValue === 'unknown') {
-        this.markUnknown('compression-unknown');
-        return this.failure('compression-unknown', frames);
+        if (!this.compressionAssumedValue) {
+          this.markUnknown('compression-unknown');
+          return this.failure('compression-unknown', frames);
+        }
+        // Compression is unknown but the caller has not proven a transition: parse under
+        // the explicitly reported assumed-uncompressed framing rather than claiming
+        // `disabled` as a confirmed state.
       }
 
-      if (this.compressionValue === 'disabled') {
+      if (this.compressionValue !== 'enabled') {
         if (packetLength > this.budget.maxFrameBytes) {
           this.markUnknown('frame-too-large');
           return this.failure('frame-too-large', frames);
@@ -317,7 +349,8 @@ export class DirectionalFrameDecoder {
     if (this.stopped) return undefined;
     const frame: DecodedFrame = {
       direction: this.direction, frameSequence: sequence, offsetStart, offsetEnd, frameBytes, payloadBytes,
-      compressed, body, phase: this.phase, compression: this.compression,
+      compressed, ...(this.compressionAssumed === 'uncompressed' ? { compressionAssumed: 'uncompressed' as const } : {}),
+      body, phase: this.phase, compression: this.compression,
     };
     frames.push(frame);
     return frame;

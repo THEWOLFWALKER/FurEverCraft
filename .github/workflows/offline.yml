@@ -32,6 +32,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      # The Windows job runs the same dist-dependent integration tests; build before testing
+      # so they execute instead of silently skipping when dist/ is absent.
+      - run: npm run build
       - run: npm run test:offline
       # Static parse of the PowerShell helper; this does not execute SendInput or capture.
       - shell: pwsh

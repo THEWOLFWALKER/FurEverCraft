@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { BridgeService, type HelperMonitor, type ObserverMonitor, type RelayMonitor } from '../../src/bridge/service/orchestrator.js';
+import { BridgeService, type BridgeServiceEvent, type HelperMonitor, type ObserverMonitor, type RelayMonitor } from '../../src/bridge/service/orchestrator.js';
 import { BoundedIpcOutbox } from '../../src/bridge/service/ipc-outbox.js';
+import { serviceCommandReply } from '../../src/bridge/service/entry.js';
+import { IpcRequestSchema, type IpcRequest } from '../../src/bridge/ipc/protocol.js';
 
 const flush = async (times = 6) => { for (let index = 0; index < times; index += 1) await new Promise(resolve => setImmediate(resolve)); };
 
@@ -132,6 +134,121 @@ describe('P09 process orchestration', () => {
     expect(service.status().ipc).toMatchObject({ messages: 0, bytes: 0 });
   });
 
+  it('closes admission synchronously on observer failure without stopping forwarding', async () => {
+    const relay = new FakeRelay();
+    const observer = new FakeObserver();
+    const helper = new FakeHelper();
+    const events: string[] = [];
+    const service = new BridgeService({ relay, observer, helper, onEvent: event => events.push(event.type) });
+    const listenerEvents: string[] = [];
+    service.on(event => listenerEvents.push(event.type));
+    await service.start();
+    service.armControl('fresh-observation');
+    expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
+
+    // No await: observer failure must close admission synchronously.
+    observer.fail('observer-crash');
+    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
+    expect(helper.releases).toBe(1);
+    expect(events).toContain('observer-failure');
+    expect(events).toContain('control-revoked');
+    expect(listenerEvents).toContain('control-revoked');
+    // Relay forwarding is not stopped by observation loss.
+    expect(relay.state).toBe('running');
+
+    // A restart/explicit arm is the only way back open; stale observation is not re-armed.
+    service.armControl('fresh-observation-after-failure');
+    expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
+    await service.stop();
+  });
+
+  it('revokes control for global observer gaps (and unknown availability) while forwarding continues', async () => {
+    const relay = new FakeRelay();
+    const service = new BridgeService({ relay });
+    const events: BridgeServiceEvent[] = [];
+    service.on(event => events.push(event));
+    await service.start();
+    service.armControl('fresh-observation');
+
+    // A scoped domain gap with known availability does not by itself invalidate control.
+    service.publishObserver({ kind: 'observer_gap', source: 'client', sessionEpoch: 's', gap: { scope: 'domain', reason: 'client-frame-gap', direction: 'client-to-server' } });
+    expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
+
+    service.publishObserver({ kind: 'observer_gap', source: 'client', sessionEpoch: 's', gap: { scope: 'global', reason: 'queue-overflow' } });
+    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
+    expect(events.filter(event => event.type === 'control-revoked')).toHaveLength(1);
+    expect(relay.state).toBe('running');
+
+    service.armControl('fresh-observation-after-global-gap');
+    // Availability unknown is also a control invalidating report, even for a domain gap.
+    service.publishObserver({ kind: 'observer_gap', source: 'client', sessionEpoch: 's', availability: 'unknown', gap: { scope: 'domain', reason: 'availability-lost' } });
+    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
+    expect(relay.state).toBe('running');
+    await service.stop();
+  });
+
+  it('notifies exactly once per IPC overflow episode, closes admission and drains on recovery', async () => {
+    let accept = false;
+    const sent: unknown[] = [];
+    const service = new BridgeService({
+      ipc: { send: message => { if (accept) sent.push(message); return accept; } },
+      maxIpcMessages: 1,
+    });
+    const overflow: BridgeServiceEvent[] = [];
+    service.on(event => { if (event.type === 'ipc-overflow') overflow.push(event); });
+
+    await service.start();
+    // Starting emits two state control messages into a one-slot queue: the first control
+    // loss must close admission and reach runtime listeners directly, not just the log.
+    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true, ipc: { controlLost: true, globalUnknown: true } });
+    expect(overflow).toHaveLength(1);
+    expect(overflow[0]).toMatchObject({ type: 'ipc-overflow', controlLost: true, globalUnknown: true });
+
+    // Further drops in the same backed-up episode do not spam listeners.
+    for (let index = 0; index < 10; index += 1) service.publishObserver({ kind: 'observation', frameSequence: String(index) });
+    expect(overflow).toHaveLength(1);
+
+    // Draining ends the episode; a later overflow is a new episode.
+    accept = true;
+    service.flush();
+    expect(service.status().ipc).toMatchObject({ messages: 0, bytes: 0 });
+    // The runtime notification was delivered directly, not re-enqueued into the same outbox.
+    expect(sent.some(message => (message as { type?: string }).type === 'ipc-overflow')).toBe(false);
+    accept = false;
+    service.publishObserver({ kind: 'observation', frameSequence: 'drain-1' });
+    service.publishObserver({ kind: 'observation', frameSequence: 'drain-2' });
+    expect(overflow).toHaveLength(2);
+    accept = true;
+    service.flush();
+    await service.stop();
+  });
+
+  it('treats an observation-only IPC overflow as global uncertainty with a synthesized gap', async () => {
+    let accept = true;
+    const service = new BridgeService({ ipc: { send: () => accept }, maxIpcMessages: 1 });
+    const events: BridgeServiceEvent[] = [];
+    service.on(event => events.push(event));
+    service.armControl('fresh-observation');
+    expect(service.status().admissionOpen).toBe(true);
+    accept = false;
+
+    service.publishObserver({ kind: 'observation', frameSequence: '1' });
+    service.publishObserver({ kind: 'observation', frameSequence: '2' });
+    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true, ipc: { controlLost: false, globalUnknown: true } });
+    expect(events.filter(event => event.type === 'ipc-overflow')).toHaveLength(1);
+    expect(events.find(event => event.type === 'ipc-overflow')).toMatchObject({ controlLost: false, globalUnknown: true });
+    const synthesized = events.find(event => event.type === 'observer-event' && (event.event as { kind?: string } | undefined)?.kind === 'observer_gap');
+    expect(synthesized).toBeDefined();
+    expect((synthesized as { event: { gap: unknown } }).event.gap).toMatchObject({ scope: 'global', reason: 'ipc-queue-overflow' });
+
+    // Same episode: no duplicate runtime notification.
+    for (let index = 0; index < 5; index += 1) service.publishObserver({ kind: 'observation', frameSequence: String(index + 3) });
+    expect(events.filter(event => event.type === 'ipc-overflow')).toHaveLength(1);
+    accept = true;
+    service.flush();
+    await service.stop();
+  });
+
   it('enforces a graceful shutdown deadline', async () => {
     const relay = new FakeRelay();
     const helper = new FakeHelper();
@@ -192,5 +309,33 @@ describe('P09 bounded IPC outbox', () => {
     const result = outbox.push({ type: 'state', blob: 'x'.repeat(100) });
     expect(result.accepted).toBe(false);
     expect(result.controlLost).toBe(true);
+  });
+});
+
+describe('P09 IPC command truthfulness', () => {
+  const request = (command: string, sessionEpoch = 'epoch'): IpcRequest => IpcRequestSchema.parse({
+    type: 'request', protocolVersion: 1, requestId: `request-${command}`, sessionEpoch, command, payload: {},
+  });
+
+  it('accepts the arm command and applies it only for the owning session epoch', () => {
+    const service = new BridgeService();
+    const armed = serviceCommandReply(request('arm'), { sessionEpoch: 'epoch', service });
+    expect(armed).toMatchObject({ kind: 'reply', ok: true, result: { armed: true, controlRevoked: false } });
+    expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
+    if (armed.kind === 'reply') expect(armed.result).toMatchObject({ status: { admissionOpen: true } });
+
+    const stale = serviceCommandReply(request('arm', 'old-epoch'), { sessionEpoch: 'epoch', service });
+    expect(stale).toMatchObject({ kind: 'reply', ok: false, error: { code: 'stale-session' } });
+  });
+
+  it('returns precise unsupported codes instead of unconditional acceptance', () => {
+    const service = new BridgeService();
+    expect(serviceCommandReply(request('observe'), { sessionEpoch: 'epoch', service }))
+      .toMatchObject({ kind: 'reply', ok: false, error: { code: 'observe-unsupported' } });
+    const future = { ...request('status'), command: 'future-command' } as unknown as IpcRequest;
+    expect(serviceCommandReply(future, { sessionEpoch: 'epoch', service }))
+      .toMatchObject({ kind: 'reply', ok: false, error: { code: 'command-unsupported' } });
+    // No fallback claims acceptance.
+    expect(service.status().admissionOpen).toBe(false);
   });
 });

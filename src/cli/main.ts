@@ -21,6 +21,7 @@ import { collectDoctorReport, unavailableDoctorReport, type DoctorReport } from 
 import { ProcessSupervisor } from '../bridge/supervisor.js';
 import { spawnBridgeServiceProcess } from '../bridge/service/spawn.js';
 import type { BridgeServiceEntryConfig } from '../bridge/service/entry.js';
+import { loadProfileConfig, type ProfileConfig } from '../config/profile.js';
 
 export async function runDemo(db = process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent-phase2-demo.sqlite', scenario?: string) {
   const names = ['autonomous','obstruction','human-steering','chat-ui','crash-recovery','bridge-fixture'] as const;
@@ -311,9 +312,17 @@ async function listenServer(server: import('fastify').FastifyInstance, host: str
   await server.listen({ port, host });
   const address = server.server.address(); if (!address || typeof address === 'string') throw new Error('server-address-unavailable'); return `http://${host}:${address.port}`;
 }
-export async function runServe(options: { db?: string; host?: string; port?: string; profile?: string; pairing?: boolean; pairingCode?: string; cliBearer?: string; webRoot?: string; allowedOrigin?: string }) {
+export async function runServe(options: { db?: string; host?: string; port?: string; profile?: string; config?: string; pairing?: boolean; pairingCode?: string; cliBearer?: string; webRoot?: string; allowedOrigin?: string }) {
+  // A serve config is strict: keys the serving runtime cannot honor (relay target, upstream
+  // gate, helper) fail instead of being accepted and ignored.
+  const profileConfig = options.config ? loadProfileConfig(resolve(options.config), 'serve') : undefined;
   const db = options.db ?? process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent.sqlite';
-  const runtime = createRuntime({ profile: (options.profile ?? 'simulated') as 'simulated' | 'simulated-3d' | 'client-offline', db });
+  const profile = options.profile ?? profileConfig?.profile ?? 'simulated';
+  const runtime = createRuntime({
+    profile: profile as 'simulated' | 'simulated-3d' | 'client-offline',
+    db,
+    ...(profileConfig?.allowModelNetwork === undefined ? {} : { allowModelNetwork: profileConfig.allowModelNetwork }),
+  });
   const host = options.host ?? '127.0.0.1';
   const pairing = options.pairing ?? true;
   const explicitPairingCode = options.pairingCode ?? process.env.MINECRAFT_AGENT_PAIRING_CODE;
@@ -323,18 +332,65 @@ export async function runServe(options: { db?: string; host?: string; port?: str
   const url = await listenServer(server, host, Number(options.port ?? 3000)); runtime.session.start();
   // A generated one-time pairing code is printed once to the owning terminal; an explicitly
   // configured code is not repeated. The CLI bearer and any API key are never logged.
-  console.log(JSON.stringify({ listening: url, profile: options.profile ?? 'simulated', db, pairing, ...(pairing && !explicitPairingCode ? { pairingCode } : {}), cliAccess: cliBearer ? 'bearer-configured' : pairing ? 'pair-with-code' : 'loopback-open', webRoot: options.webRoot ?? './dist/web' }));
+  console.log(JSON.stringify({ listening: url, profile, db, pairing, ...(pairing && !explicitPairingCode ? { pairingCode } : {}), cliAccess: cliBearer ? 'bearer-configured' : pairing ? 'pair-with-code' : 'loopback-open', webRoot: options.webRoot ?? './dist/web', ...(profileConfig ? { config: { path: resolve(options.config!), profile: profileConfig.profile ?? null, allowModelNetwork: profileConfig.allowModelNetwork ?? false } } : {}) }));
   let closing = false;
   const close = async () => { if (closing) return; closing = true; await server.close(); runtime.close(); };
   process.once('SIGINT', close); process.once('SIGTERM', close); await new Promise<void>(resolve => { const timer = setInterval(() => { if (closing || runtime.control.status().stopping) { clearInterval(timer); void close().then(resolve); } }, 25); });
 }
 
 /**
- * Run the P09 bridge-service orchestration from the CLI (not just a bare raw relay).
- * This is a real service child + relay child over loopback; external network gates stay off
- * and no real client body is invented.
+ * Minimal supervisor surface used for the explicit arm request. The `arm` IPC command is
+ * part of the bridge-service protocol; the status is re-read afterwards so a failed request
+ * is never reported as opened admission.
  */
-export async function runBridgeServiceCommand(config: BridgeServiceEntryConfig, options: { entryUrl?: URL } = {}): Promise<Record<string, unknown>> {
+export type BridgeArmSupervisor = { request<T = unknown>(command: 'arm' | 'status', payload?: unknown): Promise<T> };
+
+export type BridgeArmReport = {
+  requested: boolean;
+  admissionOpen: boolean;
+  result?: unknown;
+  error?: string;
+};
+
+/**
+ * Send `arm` only when explicitly requested, then re-read the service status so the caller
+ * reports the actual admission state instead of assuming the request succeeded.
+ */
+export async function armBridgeService(supervisor: BridgeArmSupervisor, requested: boolean): Promise<BridgeArmReport> {
+  if (!requested) return { requested: false, admissionOpen: false };
+  let result: unknown;
+  let error: string | undefined;
+  try {
+    // The literal `arm` request is only sent when the operator passed --arm.
+    result = await supervisor.request('arm', { reason: 'cli-arm' });
+  } catch (caught) {
+    error = caught instanceof Error ? caught.message : String(caught);
+  }
+  const status = await supervisor.request<{ admissionOpen?: unknown }>('status').catch(() => undefined);
+  return {
+    requested: true,
+    admissionOpen: status?.admissionOpen === true,
+    ...(error === undefined ? { result } : { error }),
+  };
+}
+
+export type BridgeServiceCommandOptions = {
+  entryUrl?: URL;
+  /** Explicit operator arming after start. Never enabled implicitly. */
+  arm?: boolean;
+  /** Truthful reporting of which target the relay child was configured with. */
+  source?: 'loopback-fixture' | 'configured-target';
+  target?: { host: string; port: number };
+  network?: string;
+};
+
+/**
+ * Run the P09 bridge-service orchestration from the CLI (not just a bare raw relay).
+ * This is a real service child + relay child; the caller supplies the relay target so service
+ * mode can use the configured upstream while fixture mode keeps its loopback echo. No real
+ * client body is invented.
+ */
+export async function runBridgeServiceCommand(config: BridgeServiceEntryConfig, options: BridgeServiceCommandOptions = {}): Promise<Record<string, unknown>> {
   const supervisor = new ProcessSupervisor({ spawn: () => spawnBridgeServiceProcess(config, options.entryUrl ? { entryUrl: options.entryUrl } : {}), ipcTimeoutMs: 10_000 });
   try {
     await supervisor.start();
@@ -345,12 +401,17 @@ export async function runBridgeServiceCommand(config: BridgeServiceEntryConfig, 
       if (status?.state === 'running' || status?.state === 'degraded') break;
       await new Promise(resolve => setTimeout(resolve, 20));
     }
+    const arming = await armBridgeService(supervisor, options.arm === true);
+    // Re-read status after arming so the result reflects what actually happened.
+    if (options.arm) status = await supervisor.request<Record<string, unknown>>('status').catch(() => status);
     const shutdown = await supervisor.request<{ stopped: boolean }>('shutdown').catch(error => ({ stopped: false, error: error instanceof Error ? error.message : String(error) }));
     return {
       mode: 'service',
       orchestration: 'bridge-service',
-      source: 'loopback-fixture',
-      network: 'disabled',
+      source: options.source ?? 'loopback-fixture',
+      network: options.network ?? 'disabled',
+      ...(options.target ? { target: { ...options.target, source: options.source ?? 'loopback-fixture' } } : {}),
+      arm: { ...arming, ...(status?.admissionOpen === undefined ? {} : { admissionOpen: status.admissionOpen === true }) },
       // There is no real Minecraft client process/world in this environment. Report the boundary
       // instead of substituting a simulated body for a live one.
       boundary: 'client-body-unavailable',
@@ -361,6 +422,110 @@ export async function runBridgeServiceCommand(config: BridgeServiceEntryConfig, 
     };
   } finally {
     await supervisor.stop().catch(() => undefined);
+  }
+}
+
+export type BridgeMode = 'fixture' | 'inspect' | 'service' | 'live';
+export type BridgeCommandOptions = { config?: string; mode?: string; arm?: boolean; output?: (value: unknown) => void };
+export type BridgeFixtureUpstream = { port: number; close(): Promise<void> };
+export type BridgeCommandDependencies = {
+  runService?: typeof runBridgeServiceCommand;
+  fixtureUpstream?: () => Promise<BridgeFixtureUpstream>;
+};
+
+/** Service mode connects to the operator-configured target; a missing target is an error. */
+export function bridgeServiceTarget(config: ProfileConfig): { host: string; port: number } {
+  if (config.targetHost === undefined || config.targetPort === undefined) throw new Error('config-key-missing:targetHost-or-targetPort');
+  return { host: config.targetHost, port: config.targetPort };
+}
+
+async function startEchoUpstream(): Promise<BridgeFixtureUpstream> {
+  const upstream = net.createServer(socket => { socket.on('data', chunk => socket.write(chunk)); });
+  await new Promise<void>((resolve, reject) => { upstream.once('error', reject); upstream.listen(0, '127.0.0.1', resolve); });
+  return {
+    port: (upstream.address() as import('node:net').AddressInfo).port,
+    close: () => new Promise<void>(resolve => upstream.close(() => resolve())),
+  };
+}
+
+/**
+ * Bridge modes with one strict loader. Fixture mode always uses a loopback echo target that is
+ * reported as fixture, never the configured real target; service mode is the only mode that
+ * uses targetHost/targetPort. The upstream gate must be explicitly true in both modes.
+ */
+export async function runBridgeCommand(options: BridgeCommandOptions = {}, deps: BridgeCommandDependencies = {}): Promise<void> {
+  const file = resolve(options.config ?? 'configs/client-offline.example.json');
+  const config = loadProfileConfig(file, 'bridge');
+  const mode = (options.mode ?? 'fixture') as BridgeMode;
+  const write = options.output ?? ((value: unknown) => console.log(JSON.stringify(redact(value))));
+  if (!['fixture', 'inspect', 'service', 'live'].includes(mode)) throw new Error('invalid-bridge-mode');
+  if (options.arm && mode !== 'service') throw new Error('arm-requires-service-mode');
+  const profile = getGameVersionProfile();
+  const configuredTarget = config.targetHost !== undefined && config.targetPort !== undefined
+    ? { host: config.targetHost, port: config.targetPort }
+    : undefined;
+  const configReport = {
+    path: file,
+    profile: config.profile ?? null,
+    allowMinecraftUpstream: config.allowMinecraftUpstream ?? false,
+    ...(configuredTarget ? { target: configuredTarget } : {}),
+  };
+
+  if (mode === 'live') {
+    if (config.allowMinecraftUpstream !== true) throw new Error('live-mode-requires-explicit-upstream-gate');
+    throw new Error('live-mode-requires-real-client-environment');
+  }
+  if (mode === 'inspect') {
+    write({
+      mode, source: 'fixture', network: 'disabled',
+      profile: versionProfileSummary(profile), protocol: { legacyCodecFixture: minecraftDataSummary(), target: profile },
+      target: configuredTarget ? { ...configuredTarget, source: 'configured-target', connected: false } : null,
+      config: configReport,
+    });
+    return;
+  }
+  if (mode === 'service') {
+    if (config.allowMinecraftUpstream !== true) throw new Error('service-mode-requires-explicit-upstream-gate');
+    const target = bridgeServiceTarget(config);
+    const result = await (deps.runService ?? runBridgeServiceCommand)({
+      relay: { listenHost: '127.0.0.1', listenPort: 0, targetHost: target.host, targetPort: target.port, allowMinecraftUpstream: true, heartbeatMs: 60 },
+      observer: { enabled: true }, shutdownGraceMs: 1_000, helloTimeoutMs: 5_000, maxRestarts: 1, backoffBaseMs: 10, maxIpcMessages: 256,
+    }, { arm: options.arm === true, source: 'configured-target', target, network: 'upstream-explicit' });
+    write({ ...result, profile: versionProfileSummary(profile), protocol: { legacyCodecFixture: minecraftDataSummary(), target: profile }, config: configReport });
+    return;
+  }
+
+  // Fixture: the configured target is deliberately not used. The loopback echo is reported
+  // as the fixture target so it can never be mistaken for a live server connection.
+  if (config.allowMinecraftUpstream !== true) throw new Error('fixture-mode-requires-explicit-upstream-gate');
+  const upstream = await (deps.fixtureUpstream ?? startEchoUpstream)();
+  const relay = createRawTcpRelay({ listenHost: '127.0.0.1', listenPort: 0, targetHost: '127.0.0.1', targetPort: upstream.port, allowMinecraftUpstream: true });
+  try {
+    await relay.start();
+    const client = net.createConnection(relay.address.port, '127.0.0.1');
+    await new Promise<void>((resolve, reject) => { client.once('connect', resolve); client.once('error', reject); });
+    const payload = Buffer.from('furevercraft-relay-fixture');
+    const response = new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      client.on('data', chunk => { chunks.push(Buffer.from(chunk)); if (Buffer.concat(chunks).length >= payload.length) resolve(Buffer.concat(chunks)); });
+      client.once('error', reject);
+    });
+    client.write(payload);
+    const echoed = await response;
+    client.end();
+    if (!echoed.equals(payload)) throw new Error('relay-fixture-byte-mismatch');
+    write({
+      mode, source: 'fixture', network: 'loopback-only',
+      target: { host: '127.0.0.1', port: upstream.port, source: 'loopback-fixture' },
+      ...(configuredTarget ? { configuredTarget: { ...configuredTarget, used: false } } : {}),
+      profile: versionProfileSummary(profile), protocol: { legacyCodecFixture: minecraftDataSummary(), target: profile },
+      scenario: { transport: 'raw-tcp', echoBytes: echoed.length, byteEquality: true, termination: 'none' },
+      sessions: relay.sessions().length,
+      config: configReport,
+    });
+  } finally {
+    await relay.stop();
+    await upstream.close();
   }
 }
 
@@ -428,9 +593,10 @@ const numberOption = (name: string, value: string | undefined): number | undefin
 
 export function main(argv = process.argv) {
   const program = new Command();
-  program.name('minecraft-agent').option('--profile <profile>', 'profile', 'simulated').option('--db <path>', 'SQLite path');
+  program.name('minecraft-agent').option('--profile <profile>', 'profile').option('--db <path>', 'SQLite path');
   program.command('demo').option('--db <path>').option('--scenario <scenario>').action((options) => runDemo(options.db, options.scenario));
   program.command('serve').option('--db <path>').option('--host <host>', 'bind host', '127.0.0.1').option('--port <port>', 'bind port', '3000')
+    .option('--config <path>', 'strict profile config')
     .option('--no-pairing', 'disable local pairing (loopback-open development mode)')
     .option('--pairing-code <code>', 'fixed local pairing code (not printed when supplied)')
     .option('--cli-bearer <token>', 'CLI bearer token (prefer MINECRAFT_AGENT_CLI_TOKEN)')
@@ -449,23 +615,9 @@ export function main(argv = process.argv) {
     const db = options.db ?? command.parent?.opts().db;
     console.log(JSON.stringify(redact(runDoctorCommand({ profile, ...(db ? { db } : {}) }))));
   });
-  program.command('bridge').option('--config <path>', 'profile config').option('--mode <mode>', 'fixture|inspect|service|live', 'fixture').action(async (options) => { const file = resolve(options.config ?? 'configs/client-offline.example.json'); const config = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; const mode = options.mode as string; if (!['fixture', 'inspect', 'service', 'live'].includes(mode)) throw new Error('invalid-bridge-mode'); if (mode === 'live') { if (config.allowMinecraftUpstream !== true) throw new Error('live-mode-requires-explicit-upstream-gate'); throw new Error('live-mode-requires-real-client-environment'); } const profile=getGameVersionProfile(); if (mode === 'inspect') { console.log(JSON.stringify(redact({ mode, source: 'fixture', network: 'disabled', profile: versionProfileSummary(profile), protocol: { legacyCodecFixture: minecraftDataSummary(), target: profile }, config }))); return; }
-    const upstream=net.createServer(socket=>{socket.on('data',chunk=>socket.write(chunk));}); await new Promise<void>((resolve,reject)=>{upstream.once('error',reject);upstream.listen(0,'127.0.0.1',resolve);}); const targetPort=(upstream.address() as import('node:net').AddressInfo).port;
-    if (mode === 'service') {
-      if (config.allowMinecraftUpstream !== true) throw new Error('service-mode-requires-explicit-upstream-gate');
-      try {
-        // The service child owns the relay child + observer; the Runtime/CLI only sees IPC.
-        const result = await runBridgeServiceCommand({
-          relay: { listenHost: '127.0.0.1', listenPort: 0, targetHost: '127.0.0.1', targetPort, allowMinecraftUpstream: true, heartbeatMs: 60 },
-          observer: { enabled: true }, shutdownGraceMs: 1_000, helloTimeoutMs: 5_000, maxRestarts: 1, backoffBaseMs: 10, maxIpcMessages: 256,
-        });
-        console.log(JSON.stringify(redact({ ...result, profile: versionProfileSummary(profile), protocol: { legacyCodecFixture: minecraftDataSummary(), target: profile } })));
-      } finally { await new Promise<void>(resolve=>upstream.close(()=>resolve())); }
-      return;
-    }
-    const relay=createRawTcpRelay({listenHost:'127.0.0.1',listenPort:0,targetHost:'127.0.0.1',targetPort,allowMinecraftUpstream:true});
-    try { await relay.start(); const client=net.createConnection(relay.address.port,'127.0.0.1'); await new Promise<void>((resolve,reject)=>{client.once('connect',resolve);client.once('error',reject);}); const payload=Buffer.from('furevercraft-relay-fixture'); const response=new Promise<Buffer>((resolve,reject)=>{const chunks:Buffer[]=[];client.on('data',chunk=>{chunks.push(Buffer.from(chunk));if(Buffer.concat(chunks).length>=payload.length)resolve(Buffer.concat(chunks));});client.once('error',reject);}); client.write(payload); const echoed=await response; client.end(); if(!echoed.equals(payload)) throw new Error('relay-fixture-byte-mismatch'); console.log(JSON.stringify(redact({mode,source:'fixture',network:'loopback-only',profile:versionProfileSummary(profile),protocol:{legacyCodecFixture:minecraftDataSummary(),target:profile},scenario:{transport:'raw-tcp',echoBytes:echoed.length,byteEquality:true,termination:'none'},sessions:relay.sessions().length}))); } finally { await relay.stop(); await new Promise<void>(resolve=>upstream.close(()=>resolve())); }
-  });
+  program.command('bridge').option('--config <path>', 'profile config').option('--mode <mode>', 'fixture|inspect|service|live', 'fixture')
+    .option('--arm', 'send an explicit arm IPC request after service start')
+    .action((options) => runBridgeCommand({ ...(options.config ? { config: options.config } : {}), mode: options.mode, arm: options.arm === true }));
   program.command('goal:revise').requiredOption('--id <goalId>').requiredOption('--revision <revision>').requiredOption('--change <change>').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(redact(store.reviseGoal(options.id, Number(options.revision), options.change)))); } finally { store.close(); } });
   program.command('events').option('--cursor <cursor>', 'cursor', '0').option('--limit <limit>', '100').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(new SessionRuntime(new FakeClientBridge(), store).events.read(options.cursor, Number(options.limit)))); } finally { store.close(); } });
   program.command('trace:export')

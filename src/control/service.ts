@@ -171,12 +171,25 @@ export class ControlService {
   capabilities() {
     const bridge = this.runtime.bridge as { capabilities?: unknown };
     const body = this.bodyState();
+    const controlOpen = this.runtime.controlOpen();
+    const inputsEnabled = this.runtime.inputsEnabled;
+    const effectiveInputsEnabled = inputsEnabled && controlOpen;
     return {
       profile: this.runtime.bridge.context.serverProfileId,
       provider: this.providerMetadata,
       bridge: redact(bridge.capabilities ?? {}),
       skills: this.runtime.router.availableSkills?.() ?? [],
-      inputsEnabled: this.runtime.inputsEnabled,
+      // Keep the raw configured gate visible, but never present it as usable while the
+      // attached bridge service has admission closed.
+      inputsEnabled,
+      effectiveInputsEnabled,
+      inputControl: effectiveInputsEnabled
+        ? { open: controlOpen, state: 'available' as const }
+        : {
+            open: controlOpen,
+            state: 'disabled' as const,
+            reason: inputsEnabled ? 'control-revoked' : 'input-gate-disabled',
+          },
       body: body ? { threeDimensional: body.threeDimensional, mode: body.mode, source: body.source, dimension: body.dimension } : { threeDimensional: false, mode: 'unknown', source: 'unknown', dimension: this.runtime.bridge.context.dimension },
       limitations: [
         ...(this.providerMetadata.transport === 'unavailable' ? ['provider-unavailable'] : []),

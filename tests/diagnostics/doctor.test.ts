@@ -10,6 +10,7 @@ import { SimulatedBodyAdapter } from '../../src/fixtures/body-adapter.js';
 import { SparseVoxelWorld } from '../../src/motor/geometry.js';
 import { collectDoctorReport, unavailableDoctorReport } from '../../src/diagnostics/doctor.js';
 import { runDoctorCommand } from '../../src/cli/main.js';
+import { BridgeService } from '../../src/bridge/service/orchestrator.js';
 
 const context: BodyContext = { serverProfileId: 'simulated', worldGenerationId: 'doctor-world', connectionEpoch: '1', bodyEpoch: '1', dimension: 'overworld' };
 const cleanup: string[] = [];
@@ -130,6 +131,42 @@ describe('P21 doctor reports actual Runtime/Store capabilities', () => {
       collectDoctorReport(runtime);
       expect(runtime.session.state).toBe(before);
       expect(runtime.store.listExecutions()).toHaveLength(0);
+    } finally { runtime.close(); }
+  });
+
+  it('reports effective inputs as control-revoked while an attached bridge service is unarmed', async () => {
+    const service = new BridgeService({});
+    const runtime = createRuntime({ clock: new ManualClock(), bridgeService: { service } });
+    try {
+      await runtime.startBridgeService!();
+      expect(service.status().admissionOpen).toBe(false);
+      // The raw configured gate is still on, but nothing may be dispatched.
+      const unarmed = collectDoctorReport(runtime);
+      expect(unarmed.body).toMatchObject({
+        inputsEnabled: true,
+        effectiveInputsEnabled: false,
+        inputs: { state: 'disabled', reason: 'control-revoked' },
+      });
+      expect(unarmed.warnings).toContain('body-inputs:control-revoked');
+      expect(runtime.control.capabilities()).toMatchObject({
+        inputsEnabled: true,
+        effectiveInputsEnabled: false,
+        inputControl: { open: false, state: 'disabled', reason: 'control-revoked' },
+      });
+
+      service.armControl('fresh-observation');
+      const armed = collectDoctorReport(runtime);
+      expect(armed.body).toMatchObject({
+        inputsEnabled: true,
+        effectiveInputsEnabled: true,
+        inputs: { state: 'available' },
+      });
+      expect(armed.warnings).not.toContain('body-inputs:control-revoked');
+      expect(runtime.control.capabilities()).toMatchObject({
+        inputsEnabled: true,
+        effectiveInputsEnabled: true,
+        inputControl: { open: true, state: 'available' },
+      });
     } finally { runtime.close(); }
   });
 });

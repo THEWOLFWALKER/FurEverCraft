@@ -72,6 +72,52 @@ export type BridgeServiceEntryHandle = {
   stop(reason?: string): Promise<void>;
 };
 
+export type ServiceCommandReply =
+  | { kind: 'reply'; ok: boolean; result?: unknown; error?: { code: string; message: string } }
+  | { kind: 'shutdown' }
+  | { kind: 'start-observer' }
+  | { kind: 'stop-observer' };
+
+/**
+ * Resolve one IPC request against the owning service. Session epoch is checked here so
+ * every command (including arm) is fenced to the owner that was handed the epoch.
+ */
+export function serviceCommandReply(
+  request: IpcRequest,
+  context: { sessionEpoch: string; service: BridgeService; observer?: ObserverMonitor },
+): ServiceCommandReply {
+  if (request.sessionEpoch !== context.sessionEpoch) {
+    return { kind: 'reply', ok: false, error: { code: 'stale-session', message: 'session epoch mismatch' } };
+  }
+  switch (request.command) {
+    case 'status':
+      return { kind: 'reply', ok: true, result: { sessionEpoch: context.sessionEpoch, ...context.service.status(), observer: context.observer?.state() ?? null } };
+    case 'capabilities':
+      return { kind: 'reply', ok: true, result: { profile: 'client-offline', network: 'disabled', observer: context.observer?.state() ?? null } };
+    case 'shutdown':
+      return { kind: 'shutdown' };
+    case 'start-observer':
+      return { kind: 'start-observer' };
+    case 'stop-observer':
+      return { kind: 'stop-observer' };
+    case 'arm': {
+      context.service.armControl('operator-ipc-arm');
+      const status = context.service.status();
+      return { kind: 'reply', ok: true, result: { armed: status.admissionOpen, controlRevoked: status.controlRevoked, status } };
+    }
+    case 'observe':
+      return {
+        kind: 'reply', ok: false,
+        error: { code: 'observe-unsupported', message: 'the bridge service observer is passive; observe is not supported' },
+      };
+    default:
+      return {
+        kind: 'reply', ok: false,
+        error: { code: 'command-unsupported', message: `unsupported command: ${String((request as { command?: unknown }).command)}` },
+      };
+  }
+}
+
 export async function runBridgeServiceEntry(
   config: BridgeServiceEntryConfig,
   ipc: ServiceIpc,
@@ -126,33 +172,22 @@ export async function runBridgeServiceEntry(
     // A hello/response/event from the parent is not a command; ignore non-requests.
     if (!parsed.success) return;
     const request = parsed.data;
-    if (request.sessionEpoch !== sessionEpoch) {
-      respond(request, false, undefined, { code: 'stale-session', message: 'session epoch mismatch' });
-      return;
-    }
-    if (request.command === 'status') {
-      respond(request, true, { sessionEpoch, ...service.status(), observer: observer?.state() ?? null });
-      return;
-    }
-    if (request.command === 'capabilities') {
-      respond(request, true, { profile: 'client-offline', network: 'disabled', observer: observer?.state() ?? null });
-      return;
-    }
-    if (request.command === 'shutdown') {
+    const reply = serviceCommandReply(request, { sessionEpoch, service, ...(observer === undefined ? {} : { observer }) });
+    if (reply.kind === 'shutdown') {
       respond(request, true, { stopped: true });
       void stop('shutdown').then(() => { if (typeof process.send === 'function') process.exit(0); });
       return;
     }
-    if (request.command === 'start-observer') {
+    if (reply.kind === 'start-observer') {
       observer?.start();
       respond(request, true, { observer: observer?.state() ?? null });
       return;
     }
-    if (request.command === 'stop-observer') {
+    if (reply.kind === 'stop-observer') {
       void observer?.stop().then(() => respond(request, true, { observer: observer?.state() ?? null }));
       return;
     }
-    respond(request, true, { accepted: true, note: 'observer-forwarding-only' });
+    respond(request, reply.ok, reply.result, reply.error);
   };
 
   const onDisconnect = () => { void stop('parent-disconnect'); };
