@@ -123,7 +123,10 @@ describe('production integration: 3D tool → executor → skill → Motor → s
     expect(runtime.scheduler.pausedValue).toBe(false);
 
     const pending = runtime.router.invoke({ id: 'nav-pause', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 9, y: 0, z: 9 }) });
-    await new Promise(resolve => setTimeout(resolve, 25));
+    // Wait until the skill has really started input, so pause has an active execution to
+    // cancel instead of racing the executor registration.
+    for (let attempt = 0; attempt < 400 && adapter.counters.submitted === 0; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+    expect(adapter.counters.submitted).toBeGreaterThan(0);
     const paused = await runtime.control.command({ requestId: 'pause-1', command: 'pause', payload: {} });
     expect(paused.state).toBe('terminal');
     expect(runtime.scheduler.pausedValue).toBe(true);
