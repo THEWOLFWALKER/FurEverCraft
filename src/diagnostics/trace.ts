@@ -88,6 +88,8 @@ export const DEFAULT_TRACE_POLICY: TracePolicy = {
 
 export type TraceRecorderOptions = {
   capacity?: number;
+  /** Alias for capacity (the policy field name). */
+  maxRecords?: number;
   maxRecordBytes?: number;
   maxBytes?: number;
   retentionMs?: number;
@@ -141,7 +143,7 @@ export class TraceRecorder {
   /** Accepts the historical numeric capacity as well as an options object. */
   constructor(capacityOrOptions: number | TraceRecorderOptions = {}) {
     const options: TraceRecorderOptions = typeof capacityOrOptions === 'number' ? { capacity: capacityOrOptions } : capacityOrOptions;
-    this.capacity = Math.max(1, Math.floor(options.capacity ?? DEFAULT_TRACE_POLICY.maxRecords));
+    this.capacity = Math.max(1, Math.floor(options.capacity ?? options.maxRecords ?? DEFAULT_TRACE_POLICY.maxRecords));
     this.maxRecordBytes = Math.max(256, Math.floor(options.maxRecordBytes ?? DEFAULT_TRACE_POLICY.maxRecordBytes));
     this.maxBytes = Math.max(this.maxRecordBytes, Math.floor(options.maxBytes ?? DEFAULT_TRACE_POLICY.maxBytes));
     this.retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_TRACE_POLICY.retentionMs));
@@ -294,6 +296,8 @@ export type ReplayResult = {
   firstSeq?: string;
   lastSeq?: string;
   contiguous: boolean;
+  /** Alias for `gaps.length > 0`, matching EventRead terminology. */
+  gap: boolean;
   gaps: ReplayGap[];
   dropped: number;
   truncated: boolean;
@@ -301,6 +305,8 @@ export type ReplayResult = {
   categories: { event: number; inputIntent: number; effectState: number };
   inputIntents: number;
   effects: { count: number; byStatus: Record<string, number>; records: Array<{ effectId: string; status: string }> };
+  /** Full recorded effect state for rendering; never used to dispatch. */
+  effectStates: TraceEffectState[];
   faults: ReplayFault[];
   boundaries: ReplayBoundaries;
 };
@@ -336,9 +342,13 @@ function detectFaults(records: TraceRecord[]): ReplayFault[] {
       });
     } else if (record.kind === 'runtime.stopping') {
       const reason = String(payload.reason ?? 'stop');
-      faults.push({ kind: 'runtime-stopped', seq: record.seq, reason });
+      faults.push({ kind: /owner|heartbeat|lost/i.test(reason) ? 'owner-lost' : 'runtime-stopped', seq: record.seq, reason });
     } else if (record.kind === 'session.stopped' || record.kind === 'session.failed') {
-      faults.push({ kind: 'session-failed', seq: record.seq, reason: String(payload.reason ?? record.kind) });
+      const reason = String(payload.reason ?? record.kind);
+      faults.push({ kind: /owner|heartbeat|lost/i.test(reason) ? 'owner-lost' : 'session-failed', seq: record.seq, reason });
+    } else if (record.kind === 'runtime.fatal' || record.kind === 'bridge.fatal') {
+      const reason = String(payload.reason ?? record.kind);
+      faults.push({ kind: /owner|heartbeat|lost/i.test(reason) ? 'owner-lost' : 'runtime-stopped', seq: record.seq, reason });
     } else if (record.kind === 'bridge.control-revoked' || record.kind === 'bridge.owner-lost' || record.kind === 'control-revoked') {
       const reason = String(payload.reason ?? record.kind);
       faults.push({ kind: /owner|heartbeat|lost/i.test(reason) ? 'owner-lost' : 'bridge-control-revoked', seq: record.seq, reason });
@@ -414,6 +424,7 @@ export function replayTrace(
     records: eventCount,
     ...(firstSeq === undefined ? {} : { firstSeq, lastSeq }),
     contiguous: gaps.length === 0 && dropped === 0,
+    gap: gaps.length > 0,
     gaps,
     dropped,
     truncated: document.truncated === true,
@@ -421,6 +432,7 @@ export function replayTrace(
     categories: { event: eventCount - inputCategoryCount - effectCategoryCount, inputIntent: inputCategoryCount + inputIntents.length, effectState: effectCategoryCount + effects.length },
     inputIntents: inputIntents.length,
     effects: { count: effects.length, byStatus, records: effectRecords },
+    effectStates: effects.map(effect => clone(effect)),
     faults: detectFaults(document.records.filter(record => start === undefined || BigInt(record.seq) > start)),
     boundaries,
   };

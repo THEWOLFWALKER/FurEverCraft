@@ -170,6 +170,7 @@ export class ControlService {
   provider() { return redact(this.providerMetadata); }
   /** Read-only capability report over the same attached Runtime (no start/dispatch). */
   diagnostics(options?: DoctorOptions): DoctorReport { return collectDoctorReport(this.runtime, options); }
+  doctor(options?: DoctorOptions): DoctorReport { return this.diagnostics(options); }
 
   async command(input: unknown): Promise<CommandResult> {
     const parsed = CommandRequestSchema.safeParse(input);

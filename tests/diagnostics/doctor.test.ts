@@ -104,6 +104,25 @@ describe('P21 doctor reports actual Runtime/Store capabilities', () => {
     expect(cli.warnings.some(warning => warning.startsWith('runtime:'))).toBe(true);
   });
 
+  it('reads the active knowledge release rather than claiming a default knowledge base', () => {
+    const runtime = createRuntime({ clock: new ManualClock() });
+    try {
+      const empty = collectDoctorReport(runtime);
+      expect(empty.knowledge).toMatchObject({ state: 'unavailable', reason: 'no-active-release', releaseCount: 0 });
+      runtime.knowledge.publish({
+        releaseId: 'release-doctor', version: '1.0.0', createdAt: new Date(0).toISOString(),
+        manifest: {
+          manifestVersion: '1', createdAt: new Date(0).toISOString(),
+          sources: [{ sourceId: 'fixture-source', version: '1.0.0', kind: 'fixture', origin: 'test', verified: true, covers: ['block.hardness'], registeredAt: new Date(0).toISOString() }],
+        },
+        rules: [],
+      });
+      const report = collectDoctorReport(runtime);
+      expect(report.knowledge).toMatchObject({ state: 'available', activeReleaseId: 'release-doctor', activeVersion: '1.0.0', releaseCount: 1 });
+      expect(report.knowledge.coverage).toMatchObject({ unknown: false, conflicts: 0, sources: { verified: 1, unverified: 0, total: 1 } });
+    } finally { runtime.close(); }
+  });
+
   it('does not start a session or mutate the store while reporting', () => {
     const runtime = createRuntime({ clock: new ManualClock() });
     try {

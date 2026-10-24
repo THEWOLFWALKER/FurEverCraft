@@ -361,8 +361,7 @@ function externalReport(runtime: RuntimeAssembly): DoctorReport['external'] {
 }
 
 /** Build a truthful doctor report from an assembled Runtime. Read-only. */
-export function collectDoctorReport(runtime: RuntimeAssembly, options: DoctorOptions = {}): DoctorReport {
-  const provider = providerReport(runtime);
+export function collectDoctorReport(runtime: RuntimeAssembly, options: DoctorOptions = {}): DoctorReport {  const provider = providerReport(runtime);
   const network = networkReport(runtime);
   const body = bodyReport(runtime);
   const ownership = ownershipReport(runtime);
@@ -453,3 +452,6 @@ export function unavailableDoctorReport(input: UnavailableDoctorInput): DoctorRe
     warnings: [`runtime:${input.reason}`],
   };
 }
+
+/** Convenience alias for the capability report. */
+export const doctor = collectDoctorReport;
