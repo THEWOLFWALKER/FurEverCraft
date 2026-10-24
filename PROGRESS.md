@@ -4,23 +4,23 @@ Current authorization: `NEXT_BATCH.md` P01–P24, with the five-round review con
 
 **Scope of these results:** offline Linux only. No real Minecraft server/world, Windows input, desktop capture, paid model API, or live 26.3 client interoperability was used. Node 22 is the locally verified runtime (`v22.23.4`, npm `10.9.9`, Linux x86_64); cloud CI was not run or observed.
 
-## Final verification snapshot (HEAD `f1c5f90`)
+## Final verification snapshot (HEAD `c7815a2`)
 
-Final branch/HEAD: `main` at `f1c5f90` (`fix(P24 rounds 3-5): enforce scope, recovery, gates and truthful reporting`). The built `dist/` is present so conditional child-process tests execute. The run was serial and followed all Round 3–5 fixes. This documentation pass changes docs only.
+Final branch/HEAD: `main` at `c7815a2` (`fix(P24 final): truthful skills, control, bridge and docs after audit`). The built `dist/` is present so conditional child-process tests execute. The validation followed the Round 3–5 fixes and the post-review audit fixes. This documentation pass changes docs only.
 
 | Command | Actual result |
 |---|---|
 | `npx tsc --noEmit` | pass (exit 0) |
 | `npm run build` | pass (exit 0) |
-| `npm run test:offline` | **58 files / 578 tests passed**, 0 skipped |
+| `npm run test:offline` | **58 files / 601 tests passed**, 0 skipped |
 | `npm run build:web` | pass (exit 0) |
 | `npm run test:v:offline` | integration **11 files / 71 tests**, soak **2 files / 2 tests**, diagnostics **2 files / 25 tests** — **98 tests**, all passed |
 | `npm run test:web:e2e` | **9/9 Playwright Chromium tests passed**, headless, no screenshots/video/trace |
-| `npm run demo:offline` | **6/6 scenarios** completed (`autonomous`, `obstruction`, `human-steering`, `chat-ui`, `crash-recovery`, `bridge-fixture`) |
-| `npm run doctor` | exit 0; truthful `status: "degraded"` for the default simulated/legacy-2D runtime; no live claims |
-| `npm run doctor -- --profile simulated-3d` | exit 0; runtime profile `simulated-3d`, body 3D; never a client claim |
+| `npm run demo:offline` | **6/6 scenarios** completed (`autonomous`, `obstruction`, `human-steering`, `chat-ui`, `crash-recovery`, `bridge-fixture`); `human-steering` reports the real navigation result (`oldResult:"succeeded"`), `chat-ui` derives `messageRetried:false`/`dispatchAttempts:1` with `scenarioAssertions`, and `crash-recovery` derives `reconciled`/`ambiguous` |
+| `npm run doctor` | exit 0; truthful `status: "degraded"` for the default simulated/legacy-2D runtime (`runtimeProfile` simulated, body legacy-2d); no live claims |
+| `npm run doctor -- --profile simulated-3d` | exit 0; runtime profile `simulated-3d`, body mode 3d, `threeDimensional: true`; never a client claim |
 
-P24 now includes `tests/integration/p24-doctor.test.ts`, the authenticated doctor endpoint, Round 1–5 fixes and the final consistency pass. Round history: Round 1–2 checkpoint `17cdf06`; Round 3 `ee9eea7`; Rounds 4–5 plus fixes on `f1c5f90`. Rounds 4 and 5 were run concurrently at the user's explicit request to speed up delivery; a full post-fix validation then ran on `f1c5f90`.
+P24 now includes `tests/integration/p24-doctor.test.ts`, the authenticated doctor endpoint, Round 1–5 fixes and the final consistency pass. Round history: Round 1–2 checkpoint `17cdf06`; Round 3 `ee9eea7`; Rounds 4–5 on `f1c5f90`; post-review audit fixes on `c7815a2`. Rounds 4 and 5 were run concurrently at the user's explicit request to speed up delivery; a post-review independent audit (workflow) then produced additional truthful-behavior fixes in `c7815a2` (explore_area/start_skill fail-closed on legacy, real body release channel, observed preconditions, cancel/quit receipt truthfulness, provider non-success mapping, observer recovery/arm/shutdown truthfulness, capability advertisement narrowing, dead facade removal), followed by a full validation on that commit.
 
 ## Current profile status
 
@@ -57,7 +57,7 @@ P24 now includes `tests/integration/p24-doctor.test.ts`, the authenticated docto
 | P21 doctor/trace/replay | done-offline | `src/diagnostics/doctor.ts`, `src/diagnostics/trace.ts`, `src/control/service.ts` `diagnostics()`; `trace:export`/`trace:replay` CLI; authenticated `GET /api/v1/doctor` | `tests/diagnostics/doctor.test.ts` (11), `tests/diagnostics/trace.test.ts` (14), `tests/integration/p24-doctor.test.ts`, diagnostics suite (25) |
 | P22 Playwright E2E | done-offline | `tests/e2e/**`, `playwright.config.ts` — pairing, goal, execution, effects, cancel, pause/resume, SSE reconnect, token mode, simulated-3d, provider warning; browser+CLI share one Runtime; **limit: simulated/fixture body** | 9/9 Chromium tests passed; no screenshot/video/trace |
 | P23 fault combinations/soak | done-offline | `tests/unit/p23-fault-combinations.test.ts`, `tests/unit/p23-provider-motor.test.ts`, `tests/integration/p23-process-faults.test.ts`, `tests/soak/p23-fault-soak.test.ts` — child crashes, slow observer, IPC backpressure, write failures, provider/Motor faults; 60 virtual minutes + short wall-clock smoke | 4 integration tests, 1 soak test, combined-fault units |
-| **P24 final consistency + five reviews** | **done-offline** | Trace npm scripts, authenticated `/api/v1/doctor` plus integration test, current docs, Rounds 1–5 fixes. Rounds 4–5 ran concurrently per user instruction; final fixes landed in `f1c5f90`. **Offline scope only** | `package.json`, `src/server/index.ts`, `tests/integration/p24-doctor.test.ts`, `tests/unit/p24-round2.test.ts`, `p24-round3-*`, `p24-round4-cli`, `p24-round5-*`; full validation above |
+| **P24 final consistency + five reviews** | **done-offline** | Trace npm scripts, authenticated `/api/v1/doctor` plus integration test, current docs, Rounds 1–5 fixes. Rounds 4–5 ran concurrently per user instruction; Rounds 4–5 fixes landed in `f1c5f90` and post-review audit fixes in `c7815a2`. **Offline scope only** | `package.json`, `src/server/index.ts`, `tests/integration/p24-doctor.test.ts`, `tests/unit/p24-round2.test.ts`, `p24-round3-*`, `p24-round4-cli`, `p24-round5-*`; full validation above |
 
 ## P24 completion record
 
@@ -65,8 +65,8 @@ P24 now includes `tests/integration/p24-doctor.test.ts`, the authenticated docto
 - The P24 documentation/consistency items completed before Round 1 were the missing `trace:export`/`trace:replay` npm scripts, authenticated `GET /api/v1/doctor`, its integration test, and truthful updates to `CLAUDE.md`, `PROGRESS.md`, `WORKSTREAM.md` and `DELIVERY_REPORT.md`.
 - Round 1 fixed the public 3D wiring, capability routing, effect/receipt gaps and 3D/2D state leaks. Round 2 fixed stop/pause terminality, bridge-service control enforcement, crash-restart execution/receipt settlement, account/dimension fencing, abort-aware waits, graceful child shutdown and bounded retention.
 - Round 3 completed at `ee9eea7` and fixed observer/relay truthfulness and recovery, projection/manifest trust, scope isolation, provider/knowledge validation, config strictness and CLI/security issues.
-- Rounds 4 and 5 were executed **concurrently on the same tree at the user's explicit instruction to speed up delivery**. Round 4 covered user flows and test credibility (auth-mode/SSE/pause/provider UX, real `serve --db`, config/provider gate, bridge fixtures, CI ordering); Round 5 independently re-read the system after the earlier fixes and covered per-session observer recovery, IPC/arm semantics, projection resync fencing, input-skill gating and capability reporting.
-- All Round 3–5 findings were fixed; the final serial validation on `f1c5f90` is the snapshot above. P24 is `done-offline` for this offline scope and is not evidence of live 26.3, Windows or paid-model compatibility.
+- Rounds 4 and 5 were executed **concurrently on the same tree at the user's explicit instruction to speed up delivery**. Round 4 covered user flows and test credibility (auth-mode/SSE/pause/provider UX, real `serve --db`, config/provider gate, bridge fixtures, CI ordering); Round 5 independently re-read the system after the earlier fixes and covered per-session observer recovery, IPC/arm semantics, projection resync fencing, input-skill gating and capability reporting. After the five rounds, a post-review independent audit (workflow) added truthful-behavior fixes in `c7815a2`.
+- All Round 3–5 findings were fixed; a post-review independent audit (workflow) then produced additional truthful-behavior fixes in `c7815a2` (explore_area/start_skill fail-closed on legacy, real body release channel, observed preconditions, cancel/quit receipt truthfulness, provider non-success mapping, observer recovery/arm/shutdown truthfulness, capability advertisement narrowing, dead facade removal). The final validation on `c7815a2` is the snapshot above. P24 is `done-offline` for this offline scope and is not evidence of live 26.3, Windows or paid-model compatibility.
 
 ## Review rounds
 
@@ -76,7 +76,7 @@ P24 now includes `tests/integration/p24-doctor.test.ts`, the authenticated docto
 | Round 2 — concurrency/crash/lifecycle | done-offline | Completed 2026-10-24; whole-repo chain trace with injected ordering/failures; 10 findings fixed; checkpoint `17cdf06`; see `DELIVERY_REPORT.md` |
 | Round 3 — protocol/data/permissions | done-offline | Completed at `ee9eea7`; observer/relay, projection/manifest, control/data scope, provider/knowledge and config/CLI/security fixes |
 | Round 4 — user flows/test credibility | done-offline | Run concurrently with Round 5 per user instruction; auth-mode/SSE/pause/provider UX, real `serve --db`, strict config/provider gate, bridge fixtures, CI ordering |
-| Round 5 — final independent reread/regression | done-offline | Run concurrently with Round 4 per user instruction; per-session observer recovery, IPC/arm semantics, projection scope/anti-replay, input-skill and capability truthfulness; final checks on `f1c5f90` |
+| Round 5 — final independent reread/regression | done-offline | Run concurrently with Round 4 per user instruction; per-session observer recovery, IPC/arm semantics, projection scope/anti-replay, input-skill and capability truthfulness; fixes on `f1c5f90` |
 
 ## Known limits and external blocks
 

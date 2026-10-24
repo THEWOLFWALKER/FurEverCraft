@@ -5,9 +5,9 @@ Target repository: https://github.com/THEWOLFWALKER/FurEverCraft
 
 ## Current state
 
-- Branch / HEAD: `main` at `f1c5f90` (`fix(P24 rounds 3-5): enforce scope, recovery, gates and truthful reporting`).
-- Round history: Round 1–2 checkpoint `17cdf06`; Round 3 checkpoint `ee9eea7`; Rounds 4–5 and final fixes on `f1c5f90`.
-- All five review rounds in `REVIEW.md` are complete. Rounds 4 and 5 were executed concurrently at the user's explicit request to speed up delivery; the full post-fix validation then ran serially on `f1c5f90`.
+- Branch / HEAD: `main` at `c7815a2` (`fix(P24 final): truthful skills, control, bridge and docs after audit`).
+- Round history: Round 1–2 checkpoint `17cdf06`; Round 3 checkpoint `ee9eea7`; Rounds 4–5 on `f1c5f90`; post-review audit fixes on `c7815a2`.
+- All five review rounds in `REVIEW.md` are complete. Rounds 4 and 5 were executed concurrently at the user's explicit request to speed up delivery. A post-review independent audit (workflow) then produced additional truthful-behavior fixes in `c7815a2` (explore_area/start_skill fail-closed on legacy, real body release channel, observed preconditions, cancel/quit receipt truthfulness, provider non-success mapping, observer recovery/arm/shutdown truthfulness, capability advertisement narrowing, dead facade removal); the full validation was re-run on `c7815a2`.
 - P24 is `done-offline` for this offline scope. This is not evidence of live Minecraft 26.3, Windows input/capture or paid-model compatibility.
 
 The v0.2 design in `docs/design/` and implementation batch in `NEXT_BATCH.md` replace the current design direction of the earlier v0.1/phase-two handoff. Earlier documents are retained as history or implementation context; they do not override v0.2 decisions where they conflict.
@@ -98,7 +98,7 @@ npm run serve -- --config <serve-config.json> --provider openai --model <model>
 
 ## Evidence status
 
-Final serial validation on `f1c5f90`: `npx tsc --noEmit` exit 0; `npm run build` exit 0; `npm run test:offline` 58 files / 578 tests, 0 skipped; `npm run build:web` exit 0; `npm run test:v:offline` 98 tests (integration 11 files / 71, soak 2/2, diagnostics 2 files / 25); `npm run test:web:e2e` 9/9 Chromium headless with no screenshots/video/trace; `npm run demo:offline` 6/6; `npm run doctor` exit 0 with truthful `degraded`; `npm run doctor -- --profile simulated-3d` exit 0 with runtime profile `simulated-3d` and a 3D body.
+Final validation on `c7815a2`: `npx tsc --noEmit` exit 0; `npm run build` exit 0; `npm run test:offline` 58 files / 601 tests, 0 skipped; `npm run build:web` exit 0; `npm run test:v:offline` 98 tests (integration 11 files / 71, soak 2/2, diagnostics 2 files / 25); `npm run test:web:e2e` 9/9 Chromium headless with no screenshots/video/trace; `npm run demo:offline` 6/6; `npm run doctor` exit 0 with truthful `degraded` (runtimeProfile simulated, body legacy-2d); `npm run doctor -- --profile simulated-3d` exit 0 with runtime profile `simulated-3d`, body mode 3d and `threeDimensional: true`.
 
 Read `PROGRESS.md` and `DELIVERY_REPORT.md` for implementation and verification states. Design documents are contracts, not implementation evidence. Local Node 22 (`v22.23.4`, npm `10.9.9`, Linux x86_64) verification is not proof that cloud CI ran; the CI workflow defines a Playwright browser job, but no CI run was observed. Real client/server/Windows/API compatibility remains unverified until separately authorized testing.
 

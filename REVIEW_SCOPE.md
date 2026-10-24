@@ -1,11 +1,11 @@
 # Review Scope — FurEverCraft P01–P24 离线交付
 
 > 分支：`main`
-> 当前 HEAD：`f1c5f90`（`fix(P24 rounds 3-5): enforce scope, recovery, gates and truthful reporting`）
-> Review 历史：Round 1–2 checkpoint `17cdf06`；Round 3 `ee9eea7`；Round 4–5 与最终修复 `f1c5f90`
+> 当前 HEAD：`c7815a2`（`fix(P24 final): truthful skills, control, bridge and docs after audit`）
+> Review 历史：Round 1–2 checkpoint `17cdf06`；Round 3 `ee9eea7`；Round 4–5 `f1c5f90`；post-review audit 修复 `c7815a2`
 > 运行环境：Linux x86_64，Node `v22.23.4`，npm `10.9.9`，仅离线
 >
-> 五轮 review 已全部完成。按用户明确指示，Round 4 与 Round 5 并发执行以加快交付；所有修复完成后，最终完整检查在 `f1c5f90` 上串行执行。P24 在离线范围内为 `done-offline`；不代表真实 Minecraft 26.3、Windows 或付费模型 API 已验证。
+> 五轮 review 已全部完成。按用户明确指示，Round 4 与 Round 5 并发执行以加快交付；之后由 workflow 执行的一次 post-review 独立审计在 `c7815a2` 产生了额外的 truthful-behavior 修复（explore_area/start_skill 在 legacy 下 fail-closed、真实 body release 通道、observed 前置条件、cancel/quit receipt 真实性、provider 非成功映射、observer recovery/arm/shutdown 真实性、能力声明收窄、移除 dead facade），最终完整检查在 `c7815a2` 上重跑。P24 在离线范围内为 `done-offline`；不代表真实 Minecraft 26.3、Windows 或付费模型 API 已验证。
 
 本文用于说明这次 review 应该看什么、哪些是已完成、哪些是明确受限或受外部阻塞，尽量避免把“尚未实现/按设计保持不可用”误报为回归缺陷。**这不是对 review 范围的限制**；任何真实的正确性、并发、安全、资源上界、测试可信度问题都欢迎指出。
 
@@ -31,18 +31,18 @@
 
 ## 2. 当前可运行的检查（均为实际执行结果）
 
-最终串行检查，HEAD `f1c5f90`，构建后运行（`dist/` 存在，子进程测试不会因缺 dist 而跳过）：
+最终检查，HEAD `c7815a2`，构建后运行（`dist/` 存在，子进程测试不会因缺 dist 而跳过）：
 
 ```bash
 npx tsc --noEmit              # exit 0
 npm run build                 # exit 0
-npm run test:offline          # 58 files / 578 tests passed, 0 skipped
+npm run test:offline          # 58 files / 601 tests passed, 0 skipped
 npm run build:web             # exit 0
 npm run test:v:offline        # 98 tests: integration 11/71, soak 2/2, diagnostics 2/25
 npm run test:web:e2e          # 9/9 Playwright Chromium tests passed
 npm run demo:offline          # 6/6 scenarios passed
-npm run doctor                # exit 0，truthful degraded
-npm run doctor -- --profile simulated-3d  # exit 0，runtime profile simulated-3d，body 3D
+npm run doctor                # exit 0，truthful degraded（runtimeProfile simulated，body legacy-2d）
+npm run doctor -- --profile simulated-3d  # exit 0，runtime profile simulated-3d，body mode 3d，threeDimensional true
 ```
 
 E2E 使用 Playwright + Chromium（headless，无截图/录像/trace）。没有真实 Minecraft、真实模型 API、真实 Windows 输入，也没有观察到 CI 实际运行。
@@ -109,7 +109,7 @@ E2E 使用 Playwright + Chromium（headless，无截图/录像/trace）。没有
 | P21 doctor/trace/replay | done-offline | `src/diagnostics/doctor.ts`、`trace.ts`，`tests/diagnostics/**`（25），认证 `/api/v1/doctor` |
 | P22 Playwright E2E | done-offline | `tests/e2e/**`，9/9 Chromium tests passed；**限制：模拟/fixture body，无截图/录像/trace** |
 | P23 组合故障/长时 | done-offline | `tests/unit/p23-*`、`tests/integration/p23-process-faults.test.ts`、`tests/soak/p23-fault-soak.test.ts`；60 虚拟分钟 + 墙钟 smoke |
-| P24 最终一致性与五轮 review | done-offline | 五轮全部完成；Round 4/5 按用户指示并发执行；最终检查在 `f1c5f90`；**仅离线范围** |
+| P24 最终一致性与五轮 review | done-offline | 五轮全部完成；Round 4/5 按用户指示并发执行（修复在 `f1c5f90`）；post-review 审计修复与最终检查在 `c7815a2`；**仅离线范围** |
 
 状态词只表示：`done-offline` = 离线可执行并有测试；`done-limited` = 实现范围/验证边界受限，限制见上；`blocked-external` = 依赖本批禁止的真实环境/数据；`not-done` = 未满足验收。
 
@@ -164,7 +164,7 @@ E2E 使用 Playwright + Chromium（headless，无截图/录像/trace）。没有
 
 ## 8. 如何复现与反馈
 
-在当前交付树（`main` @ `f1c5f90`）运行：
+在当前交付树（`main` @ `c7815a2`）运行：
 
 ```bash
 npm ci
@@ -182,7 +182,7 @@ npm run doctor -- --profile simulated-3d
 
 ## 9. 提交说明
 
-- 当前交付：`main` @ `f1c5f90`（P01–P24 + 五轮 review 修复 + 最终文档整理）
-- 检查点：Round 1–2 `17cdf06`；Round 3 `ee9eea7`；Round 4–5 与最终修复 `f1c5f90`
-- 五轮已完成；Rounds 4/5 按用户明确指示并发执行，最终完整检查在 `f1c5f90` 串行执行
+- 当前交付：`main` @ `c7815a2`（P01–P24 + 五轮 review 修复 + post-review 审计修复 + 最终文档整理）
+- 检查点：Round 1–2 `17cdf06`；Round 3 `ee9eea7`；Round 4–5 `f1c5f90`；post-review 审计修复 `c7815a2`
+- 五轮已完成；Rounds 4/5 按用户明确指示并发执行，post-review 审计修复后最终完整检查在 `c7815a2` 重跑
 - 不代表真实 26.3、Windows 或付费模型 API 已验证；CI 未被观察到运行

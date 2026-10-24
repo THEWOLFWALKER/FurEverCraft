@@ -3,7 +3,7 @@
 ## 当前权威与范围
 
 - 当前开发批次是 `NEXT_BATCH.md` 的 **P01–P24**；设计权威是 `docs/design/*-v0.2.md`，审查合同是 `REVIEW.md`，当前状态与证据见 `PROGRESS.md`、`WORKSTREAM.md` 和 `DELIVERY_REPORT.md`。
-- 当前交付状态：`main` @ `f1c5f90`；P24 与 `REVIEW.md` 五轮 review 已完成（Round 1–2 checkpoint `17cdf06`，Round 3 `ee9eea7`，Round 4–5 与最终修复 `f1c5f90`）。Rounds 4/5 按用户明确指示并发执行；最终完整检查在 `f1c5f90` 串行通过。该状态只证明离线范围。
+- 当前交付状态：`main` @ `c7815a2`；P24 与 `REVIEW.md` 五轮 review 已完成（Round 1–2 checkpoint `17cdf06`，Round 3 `ee9eea7`，Round 4–5 `f1c5f90`，post-review 审计修复 `c7815a2`）。Rounds 4/5 按用户明确指示并发执行；五轮后由 workflow 执行的一次 post-review 独立审计在 `c7815a2` 产生额外 truthful-behavior 修复，最终完整检查在 `c7815a2` 重跑通过。该状态只证明离线范围。
 - 权威顺序：用户最新明确指令 > 本文件与 `NEXT_BATCH.md` > v0.2 设计合同 > 旧阶段文档。旧 `DECISIONS.md` 中的 1.20.4/protocol 765 terminating-proxy 内容只保留为历史，不是当前实现目标。
 - 旧文档中的 F/B/U/M/A/V 编号是可追溯的历史分组，不再是当前批次编号；报告 P01–P24 时必须使用当前编号和实际证据。
 - 当前目标游戏版本 Java Edition **26.3**（协议 777、DataVersion 5023 为候选来源数据）。没有可核对的 26.3 schema/native/data 时，对应 decoder/domain 必须保持 `unavailable`/`unsupported`，不得猜字段、不得把 fixture 或最新依赖当作 26.3 支持。
@@ -18,7 +18,7 @@
 - `blocked-external`：任务本身依赖本批禁止的真实环境/数据/API；必须写明精确缺件与影响。
 - `not-done`：尚未实现或尚未满足验收；进行中的工作也归入此类，不得提前标成 `done-*`。
 
-P24 和五轮 review 已在 `f1c5f90` 按离线验收完成，记录在 `PROGRESS.md`/`WORKSTREAM.md`/`DELIVERY_REPORT.md`；测试数量、提交数量或“已跑过一轮”不能替代证据。后续用户协同 review 反馈仍须修复并定向回归，但不自动开启第六轮全仓 review。
+P24 和五轮 review 已在 `c7815a2` 按离线验收完成，记录在 `PROGRESS.md`/`WORKSTREAM.md`/`DELIVERY_REPORT.md`；测试数量、提交数量或“已跑过一轮”不能替代证据。五轮之后的 post-review 独立审计修复（explore_area/start_skill 在 legacy 下 fail-closed、真实 body release 通道、observed 前置条件、cancel/quit receipt 真实性、provider 非成功映射、observer recovery/arm/shutdown 真实性、能力声明收窄、移除 dead facade）已落在 `c7815a2`。后续用户协同 review 反馈仍须修复并定向回归，但不自动开启第六轮全仓 review。
 
 ## 固定架构与不变量
 

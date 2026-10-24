@@ -2,7 +2,7 @@
 
 ## Status
 
-`main` at `f1c5f90` contains the offline-verifiable P01–P24 implementation on Linux. All five review rounds required by `REVIEW.md` are complete: Round 1–2 at checkpoint `17cdf06`, Round 3 at `ee9eea7`, and Rounds 4–5 (run concurrently at the user's explicit request to speed up delivery) with their fixes on `f1c5f90`. The final full validation ran serially on `f1c5f90` after those fixes. P24 is `done-offline` for that scope.
+`main` at `c7815a2` contains the offline-verifiable P01–P24 implementation on Linux. All five review rounds required by `REVIEW.md` are complete: Round 1–2 at checkpoint `17cdf06`, Round 3 at `ee9eea7`, and Rounds 4–5 (run concurrently at the user's explicit request to speed up delivery) with their fixes on `f1c5f90`. A post-review independent audit (workflow) then produced additional truthful-behavior fixes in `c7815a2` (explore_area/start_skill fail-closed on legacy, real body release channel, observed preconditions, cancel/quit receipt truthfulness, provider non-success mapping, observer recovery/arm/shutdown truthfulness, capability advertisement narrowing, dead facade removal). The final full validation was re-run on `c7815a2`. P24 is `done-offline` for that scope.
 
 Nothing here is a claim of live Minecraft 26.3, Windows, or paid-API compatibility. Real Minecraft servers/worlds, real Windows input/capture, game assets, and paid model APIs were not used. Local results use Node `v22.23.4` / npm `10.9.9` on Linux x86_64; cloud CI was not run or observed.
 
@@ -14,14 +14,14 @@ Nothing here is a claim of live Minecraft 26.3, Windows, or paid-API compatibili
 - **Runtime/bridge**: one RuntimeAssembly per storage path with cross-process owner lock; raw loopback TCP relay with read-only observer; framing/compression budgets and per-TCP-session observer epochs. The default `simulated` profile remains explicit legacy 2D; the public `simulated-3d` profile (`serve --profile simulated-3d`, `doctor --profile simulated-3d`) assembles the simulated BodyAdapter/Motor chain through the same ControlService and single Runtime. Neither is a real client. `serve --config` uses the strict loader, and `serve --provider openai|anthropic` is honored only with `allowModelNetwork: true` and an API key.
 - **Diagnostics**: truthful doctor over the attached runtime/store; bounded trace export and side-effect-free replay.
 
-## Final verification snapshot (HEAD `f1c5f90`)
+## Final verification snapshot (HEAD `c7815a2`)
 
-`main` at `f1c5f90` (`fix(P24 rounds 3-5): enforce scope, recovery, gates and truthful reporting`), post-build so conditional child-process tests execute. The run was serial and followed all Round 3–5 fixes. This documentation pass changes docs only. Node `v22.23.4` / npm `10.9.9`, Linux x86_64.
+`main` at `c7815a2` (`fix(P24 final): truthful skills, control, bridge and docs after audit`), post-build so conditional child-process tests execute. The validation followed all Round 3–5 fixes and the post-review audit fixes. This documentation pass changes docs only. Node `v22.23.4` / npm `10.9.9`, Linux x86_64.
 
 ```text
 npx tsc --noEmit              exit 0
 npm run build                 exit 0
-npm run test:offline          58 files / 578 tests passed, 0 skipped
+npm run test:offline          58 files / 601 tests passed, 0 skipped
 npm run build:web             exit 0
 npm run test:v:offline        integration 11 files / 71 tests passed
                               soak         2 files /  2 tests passed
@@ -29,9 +29,9 @@ npm run test:v:offline        integration 11 files / 71 tests passed
                               total 98 tests passed
 npm run test:web:e2e          9/9 Chromium tests passed (headless; no screenshots/video/trace)
 npm run demo:offline          6/6 scenarios passed
-npm run doctor                exit 0; truthful "degraded" default report
+npm run doctor                exit 0; truthful "degraded" default report (runtimeProfile simulated, body legacy-2d)
 npm run doctor -- --profile simulated-3d
-                              exit 0; runtime profile simulated-3d, body 3D, no live claim
+                              exit 0; runtime profile simulated-3d, body mode 3d, threeDimensional true, no live claim
 ```
 
 Additional P24 checks: `npm run trace:export -- --db <tmp> --out <tmp>` exits 0 and writes a bounded trace from a fresh DB; `npm run trace:replay -- --file <tmp>` exits 0 with `contiguous: true`, `input: disabled`, `network: disabled`, `paidApis: disabled`, `sideEffects: not-resent`. The doctor integration test proves unauthenticated access is denied and an authenticated CLI bearer receives the same truthful P21 report. A real `serve --profile simulated-3d --no-pairing` process served a status document whose `body` was 3D, and `/api/v1/capabilities` listed the 3D skills; it was stopped and its temporary DB removed. The E2E suite also exercises a real compiled `serve --db` process, token/bearer-only mode, simulated-3d, pause and provider-unavailable feedback, and SSE reconnect without event loss.
@@ -50,7 +50,7 @@ Full evidence paths and test counts are in `PROGRESS.md`; implementation/test lo
 | Control/Agent | P14–P18 | P14–P16 done-offline (CLI, web, security/SSE); P17/P18 done-limited (injected provider transport, bounded skill lifecycle) |
 | Knowledge/Diagnostics | P19–P21 | P19/P20 done-limited (fixture knowledge, bounded scoped memory with optional z); P21 done-offline (doctor/trace/replay) |
 | Verification | P22/P23 | done-offline — real headless Playwright E2E with fixture body (9 tests); combined faults + 60 virtual-minute soak + wall-clock smoke |
-| Finalization | P24 | done-offline — docs, trace scripts, doctor endpoint and all five review rounds complete; Rounds 4–5 ran concurrently per user instruction and final fixes/validation are on `f1c5f90` |
+| Finalization | P24 | done-offline — docs, trace scripts, doctor endpoint and all five review rounds complete; Rounds 4–5 ran concurrently per user instruction, their fixes are on `f1c5f90`, and post-review audit fixes with the current validation are on `c7815a2` |
 
 ## Exact 26.3 data gaps
 
@@ -76,7 +76,7 @@ The installed dependency tree does not provide verified Minecraft 26.3 codec/dom
 
 ## Five-round completion and final verification
 
-All five rounds in `REVIEW.md` were completed internally. Round 1–2 ended at checkpoint `17cdf06`; Round 3 ended at `ee9eea7`. At the user's explicit instruction, Round 4 and Round 5 were then run **concurrently on the same tree to accelerate delivery** instead of the default sequential order. Every finding accepted in those rounds was fixed (or recorded as the unchanged external 26.3 boundary), and a single full post-fix validation was executed serially on `f1c5f90`; see the final verification snapshot above.
+All five rounds in `REVIEW.md` were completed internally. Round 1–2 ended at checkpoint `17cdf06`; Round 3 ended at `ee9eea7`. At the user's explicit instruction, Round 4 and Round 5 were then run **concurrently on the same tree to accelerate delivery** instead of the default sequential order. Every finding accepted in those rounds was fixed (or recorded as the unchanged external 26.3 boundary) with fixes on `f1c5f90`; a post-review independent audit (workflow) then produced additional truthful-behavior fixes in `c7815a2`, and the final full validation was re-run on `c7815a2`; see the final verification snapshot above.
 
 `REVIEW_SCOPE.md` remains the orientation document: architecture chains, P01–P24 status, review focus areas, known limitations, and the items that are deliberately unimplemented or externally blocked. The real 26.3 relay→decoder→projector→WorldState chain remains blocked on missing 26.3 schema/native/data; the current observer emits frame metadata only.
 
@@ -97,7 +97,7 @@ Assertions target contracts or observable behavior; fixture provenance stays lab
 
 - Start: `ccb9f8e` (`p24-final`, the worktree was first created at `c27dcfa` and fast-forwarded to this actual HEAD).
 - Round 1 code/tests: `cf092ad`.
-- End state: Round 1 checkpoint (historical; the final state is `f1c5f90`).
+- End state: Round 1 checkpoint (historical; the final state is `c7815a2`).
 - Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only.
 
 Whole-repo scan covered `src/**`, real CLI/server/web entrypoints, `tests/**`, `configs/**`, `package.json`, Playwright/CI/native-helper configuration, and the current docs. Diffs and symbol references were used for orientation, then the following chains were re-traced from source:
@@ -137,7 +137,7 @@ No finding was dismissed as false-premise. The only external block remains the r
 
 ### Remaining affected tasks
 
-- At Round 1 time P24 was still in progress; it is now `done-offline` after Rounds 2–5 and the final `f1c5f90` validation.
+- At Round 1 time P24 was still in progress; it is now `done-offline` after Rounds 2–5, the post-review audit fixes and the final `c7815a2` validation.
 - P08 remains **done-limited / externally blocked** for real 26.3 projection; the observer emits no typed packet payload, and synthetic projectors are not a production substitute.
 - P02/P03/P11/P13/P20 moved from the previously limited/injected-only state to an explicit public `simulated-3d` assembly; they remain simulated evidence, not real-client validation.
 - The `simulated-3d` fixture body and the legacy fake bridge can still carry separate state for legacy-only tools (place/look/chat); this is documented as a fixture limitation, not production capability.
@@ -148,7 +148,7 @@ No finding was dismissed as false-premise. The only external block remains the r
 
 - Start: `033f29a` (`p24-final`, Round 1 merged), Worktree `agent-a19cecd12f9b7c9d1`, clean.
 - Round 2 code/tests: `b6d7f42`.
-- End state: Round 2 checkpoint `17cdf06` (historical; the final state is `f1c5f90`).
+- End state: Round 2 checkpoint `17cdf06` (historical; the final state is `c7815a2`).
 - Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only. No real Minecraft, Windows input/capture or model API was used.
 
 Whole-repo review, with the following chains re-traced and fault-injected:
@@ -192,7 +192,7 @@ No finding was dismissed as false-premise. One behavior was deliberately retaine
 
 ### Remaining affected tasks
 
-- At Round 2 time P24 was still in progress; it is now `done-offline` after Rounds 3–5 and the final `f1c5f90` validation.
+- At Round 2 time P24 was still in progress; it is now `done-offline` after Rounds 3–5, the post-review audit fixes and the final `c7815a2` validation.
 - P08/P10/P11/P17/P18/P19/P20 remain `done-limited`/externally blocked exactly as recorded above; Round 2 changed lifecycle/fencing behavior but did not create 26.3 decode or live evidence.
 - No new external block was introduced. The bridge-service control gate is test-verified; a production attachment still needs its operator/observation arming step, which is the existing P09 contract.
 
@@ -202,7 +202,7 @@ No finding was dismissed as false-premise. One behavior was deliberately retaine
 
 - Start: `17cdf06` (Round 1–2 checkpoint).
 - Round 3 code/tests ended at `ee9eea7`.
-- End state for the whole batch: `f1c5f90` after Rounds 4–5 and final fixes.
+- End state for the whole batch: `c7815a2` after Rounds 4–5, the post-review audit fixes and the final validation.
 - Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only.
 
 Whole-repo review across `src/**`, entrypoints, tests, configs, scripts and current docs. The end-to-end chains re-traced for this round were:
@@ -241,7 +241,7 @@ The recorded Round 3 outcomes are fixed and blocked-external; no false-premise o
 - `tests/unit/p24-round3-provider.test.ts` — response shape/truncation, streamed tool-call ids, per-run ledger, abort pairing, provider switch, bounded history and sliding retry.
 - `tests/integration/synthetic-observation-chain.test.ts` — synthetic-only assembly, stale epoch/gap fencing and forged-provenance refusal.
 
-The authoritative full-suite counts are the final `f1c5f90` snapshot above.
+The authoritative full-suite counts are the final `c7815a2` snapshot above.
 
 ## Review Round 4
 
@@ -249,7 +249,7 @@ The authoritative full-suite counts are the final `f1c5f90` snapshot above.
 
 - Start: after the Round 3 checkpoint `ee9eea7`.
 - Executed **concurrently with Round 5 at the user's explicit instruction to speed up delivery**; both rounds operated on the same working tree.
-- End state: final fixes and validation on `f1c5f90`.
+- End state: fixes on `f1c5f90`; post-review audit fixes and final validation on `c7815a2`.
 - Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only.
 
 Coverage focused on real user flows and test credibility across the serving CLI, browser console, headless E2E, strict configs, bridge fixtures and CI workflow: pairing and bearer modes, SSE recovery, pause/stop feedback, provider-unavailable turns, simulated-3d rendering, isolated `serve --db` processes, gateway truthfulness and process cleanup after failed startup.
@@ -272,7 +272,7 @@ The recorded Round 4 outcomes are fixed; no false-premise outcome was recorded. 
 - `tests/unit/p24-round4-cli.test.ts` — merged `--db` handling, non-inert model gate, failed-startup release of lock/listeners, and default bridge fixture.
 - `tests/e2e/control-flow.spec.ts` — token/bearer-only mode and public auth-mode, real compiled `serve --db` flow, simulated-3d profile/body, pause rejection, provider warning and SSE reconnect cursor retention.
 
-The authoritative full-suite counts are the final `f1c5f90` snapshot above.
+The authoritative full-suite counts are the final `c7815a2` snapshot above.
 
 ## Review Round 5
 
@@ -280,7 +280,7 @@ The authoritative full-suite counts are the final `f1c5f90` snapshot above.
 
 - Start: after the Round 3 checkpoint `ee9eea7`, sharing the tree with Round 4.
 - Executed **concurrently with Round 4 at the user's explicit instruction to speed up delivery**.
-- End state: final fixes and validation on `f1c5f90`.
+- End state: fixes on `f1c5f90`; post-review audit fixes and final validation on `c7815a2`.
 - Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only.
 
 Independent re-read of the whole system after the earlier fixes, emphasizing cross-round regressions, observer lifecycle/epochs, IPC semantics, projection resync fencing, skill/input gating, capability/profile reporting, resource bounds and final build artifacts.
@@ -298,11 +298,11 @@ Independent re-read of the whole system after the earlier fixes, emphasizing cro
 | Medium | Handshake and global-park bounds | The handshake limit could apply beyond the handshake frame, and a global park could resume an un-anchored direction after only one direction reset. The limit is scoped to the handshake frame, and both directions stay parked until each is anchored. | fixed |
 | High (external boundary) | Real 26.3/live evidence | No real 26.3 decode/projection or live client/server/Windows/model evidence exists in this batch. The scope/anti-replay fixes harden the synthetic path only; they do not create real packet payloads. | blocked-external — missing 26.3 schema/native/data and prohibited live environment |
 
-The recorded Round 5 outcomes are fixed and blocked-external; no false-premise outcome was recorded. All fixed items were covered by targeted regressions, and the final full validation was executed after these fixes on `f1c5f90`.
+The recorded Round 5 outcomes are fixed and blocked-external; no false-premise outcome was recorded. All fixed items were covered by targeted regressions, and the final full validation was executed after the post-review audit fixes on `c7815a2`.
 
 ### Targeted regressions
 
 - `tests/unit/p24-round5-observer.test.ts` — concurrent/sequential session isolation, recovered observer epoch, ack progress, queued-vs-rejected IPC, arm refusal, stopped directions, global park anchoring and service capability truthfulness.
 - `tests/unit/p24-round5-input-gate.test.ts` — manifest-derived input skills, fail-closed unknown skills, `explore_area` gating and legacy-2D advertisement filtering.
 - `tests/unit/p24-round3-projection.test.ts` — scope binding and resync anti-replay checks added during the Round 5 pass.
-- Final serial run on `f1c5f90`: typecheck, build, build:web, 58 files / 578 offline tests, 98 versioned/soak/diagnostics tests, 9/9 E2E, 6/6 demo, and both doctor profiles. See the final snapshot above.
+- Final run on `c7815a2`: typecheck, build, build:web, 58 files / 601 offline tests, 98 versioned/soak/diagnostics tests, 9/9 E2E, 6/6 demo, and both doctor profiles. See the final snapshot above.
