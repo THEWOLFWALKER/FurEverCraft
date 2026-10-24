@@ -179,13 +179,18 @@ export type GatherBodyResult = {
   observedFree: boolean;
 };
 
+export type GatherBodyOptions = BodyNavigationOptions & {
+  /** Called after navigation and immediately before the durable-effect dispatch boundary. */
+  onBeforeDig?: () => void;
+};
+
 /**
  * P11 gather path: find an observed block, navigate to a supported standing
  * cell next to it through the motor chain, then dig. Success requires an
  * observation showing the target free; an accepted dig receipt alone is not
  * evidence.
  */
-export async function gatherBody(body: BodyAdapter, clock: Clock, block: string, options: BodyNavigationOptions): Promise<GatherBodyResult> {
+export async function gatherBody(body: BodyAdapter, clock: Clock, block: string, options: GatherBodyOptions): Promise<GatherBodyResult> {
   const executionId = nextId('exec');
   if (!body.findBlock || !body.digBlock) return { executionId, status: 'failed', reason: 'gather-capability-unavailable', collected: 0, items: [], observedFree: false };
   const target = await body.findBlock(block);
@@ -201,6 +206,10 @@ export async function gatherBody(body: BodyAdapter, clock: Clock, block: string,
       return { executionId, status: navigation.status === 'canceled' ? 'canceled' : 'failed', reason: navigation.reason ?? 'navigation-failed', target, navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path, ...(navigation.reason ? { reason: navigation.reason } : {}) }, collected: 0, items: [], observedFree: false };
     }
   }
+  // Navigation is not the side effect; the dispatch boundary is immediately
+  // before the dig so the caller can persist its barrier while all preconditions
+  // (position, observed target) are already satisfied.
+  options.onBeforeDig?.();
   const dig = await body.digBlock(target, block);
   const after = await body.observe();
   const observed = after.cells.get(`${target.x},${target.y},${target.z}`);
@@ -297,7 +306,7 @@ export async function gatherBlocksSkill(ctx: BodySkillContext, block: string, bu
   if (!body) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   const clock = body.clock ?? ctx.clock;
   if (!clock) return { ok: false, outcome: 'failed', reason: 'clock-required' };
-  const result = await gatherBody(body, clock, block, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
+  const result = await gatherBody(body, clock, block, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}), onBeforeDig: () => ctx.report({ stage: 'dispatch', completed: 0, total: 1, message: 'dig' }) });
   const outcome = result.status === 'confirmed' ? 'confirmed' : result.status === 'partial' ? 'partial' : result.status === 'canceled' ? 'canceled' : 'failed';
   return outcome === 'confirmed'
     ? { ok: true, outcome, value: result }

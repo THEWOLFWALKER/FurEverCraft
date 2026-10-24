@@ -218,7 +218,10 @@ describe('P11 navigation → Motor → sink chain', () => {
   it('gathers only after navigating to a supported standing cell and observing the target free', async () => {
     const { adapter, body, world, clock } = makeHarness();
     world.setBlock({ x: 3, y: 0, z: 1 }, 'full_cube', 'coal_ore');
-    const result = await gatherBody(adapter, clock, 'coal_ore', navOptions());
+    let dispatchBoundaryState: string | undefined;
+    const result = await gatherBody(adapter, clock, 'coal_ore', navOptions({ onBeforeDig: () => { dispatchBoundaryState = world.get({ x: 3, y: 0, z: 1 }).cell; } }));
+    // The durable dispatch boundary is crossed while the target is still observed blocked.
+    expect(dispatchBoundaryState).toBe('blocked');
     expect(result.status).toBe('confirmed');
     expect(result.observedFree).toBe(true);
     expect(result.collected).toBe(1);
