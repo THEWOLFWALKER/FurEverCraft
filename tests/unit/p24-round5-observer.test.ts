@@ -4,6 +4,7 @@ import { createRawTcpRelay } from '../../src/bridge/relay/raw.js';
 import {
   RelayObserverSupervisor,
   createRelayObserverPublisher,
+  runRelayEntry,
   type RelayObserverHost,
   type RelayObserverHostFactory,
 } from '../../src/bridge/relay/entry.js';
@@ -254,11 +255,52 @@ describe('Round 5 — observer state is per TCP session', () => {
     }
   });
 
+  it('does not report recovery when no observer host could be installed', async () => {
+    const sent: Array<Record<string, any>> = [];
+    const manager = new RelayObserverSupervisor(
+      { send: message => { sent.push(message as Record<string, any>); return true; } },
+      'relay_entry_epoch',
+      { enabled: true, createHost: () => { throw new Error('observer-worker-unavailable'); } },
+    );
+    try {
+      manager.bindSession('relay_session_failed');
+      // bindSession already tried and failed; recovery must try again and still not claim success.
+      const result = await manager.startObservation();
+      expect(result).toMatchObject({
+        supported: true, recovered: false, reason: 'observer-recovery-failed',
+        installedHosts: 0, expectedHosts: 1,
+      });
+      expect(result.observer.sessions).toHaveLength(0);
+      expect(sent.some(message => message.payload?.kind === 'observer-failure')).toBe(true);
+    } finally {
+      await manager.stop();
+    }
+  });
+
   it('reports observer commands as unsupported when observation is disabled', async () => {
     const manager = new RelayObserverSupervisor({ send: () => true }, 'relay_entry_epoch', { enabled: false });
     const result = await manager.startObservation();
     expect(result).toMatchObject({ supported: false, recovered: false });
     expect(manager.attach('relay_session_1', 'client-to-server', new Uint8Array([1]))).toBe(false);
+  });
+
+  it('advertises only relay IPC capabilities that are implemented', async () => {
+    const sent: Array<Record<string, any>> = [];
+    const handle = await runRelayEntry({
+      listenHost: '127.0.0.1', listenPort: 0, targetHost: '127.0.0.1', targetPort: 1,
+      allowMinecraftUpstream: true, observer: { enabled: true },
+    }, {
+      send: message => { sent.push(message as Record<string, any>); return true; },
+      on: () => undefined,
+      off: () => undefined,
+    });
+    try {
+      const hello = sent.find(message => message.type === 'hello')!;
+      expect(hello.capabilities).toEqual(['control', 'observer']);
+      expect(hello.capabilities).not.toContain('observe');
+    } finally {
+      await handle.stop();
+    }
   });
 });
 
@@ -335,7 +377,9 @@ describe('Round 5 — arm is refused during an active IPC episode', () => {
   it('refuses arm while global unknown and revokes again for a later drop after recovery', async () => {
     let mode: 'ok' | 'fail' = 'ok';
     const sent: unknown[] = [];
+    const relay = { state: 'running', start: async () => undefined, stop: async () => undefined, onExit: () => () => undefined };
     const service = new BridgeService({
+      relay,
       ipc: { send: message => { if (mode === 'fail') throw new Error('channel-unavailable'); sent.push(message); return true; } },
       maxIpcMessages: 1,
     });
@@ -549,6 +593,11 @@ describe('Round 5 — service start failure is not reported as success', () => {
     }, ipc, { log: () => undefined });
     try {
       expect(sent.some(message => message.type === 'hello')).toBe(true);
+      const hello = sent.find(message => message.type === 'hello')!;
+      // Only implemented capabilities are advertised: the passive observer is present, but
+      // there is no `observe` IPC command on this service.
+      expect(hello.capabilities).toEqual(['control', 'relay', 'observer']);
+      expect(hello.capabilities).not.toContain('observe');
       expect(onMessage).toBeDefined();
       onMessage!({ type: 'request', protocolVersion: 1, requestId: 'recover-1', sessionEpoch: handle.sessionEpoch, command: 'start-observer', payload: {} });
       await waitFor(() => sent.some(message => message.type === 'response' && message.requestId === 'recover-1'), 'observer-recovery-response');
@@ -558,6 +607,70 @@ describe('Round 5 — service start failure is not reported as success', () => {
       expect(child.sent.some(message => message.type === 'request' && message.command === 'start-observer')).toBe(true);
     } finally {
       await handle.stop('test-cleanup');
+    }
+  });
+
+  it('sends the shutdown reply only after the service stop completes', async () => {
+    const order: string[] = [];
+    const exitCodes: number[] = [];
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { exitCodes.push(code ?? 0); return undefined as never; }) as typeof process.exit);
+    class SlowRelayChild implements ChildProcessLike {
+      readonly pid = 9876;
+      readonly sent: Array<Record<string, any>> = [];
+      private readonly handlers = new Map<string, Set<(value?: unknown) => void>>();
+      send(message: unknown) {
+        const request = message as Record<string, any>;
+        this.sent.push(request);
+        queueMicrotask(() => {
+          if (request.type === 'hello') {
+            this.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'relay_child_epoch', bootEpoch: 'relay_boot', capabilities: [] });
+          } else if (request.type === 'request' && request.command === 'shutdown') {
+            order.push('relay-stop-requested');
+            setTimeout(() => {
+              order.push('relay-exited');
+              this.emit('message', { type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch: 'relay_child_epoch', ok: true, result: { stopped: true } });
+              this.emit('exit', 0);
+            }, 30);
+          }
+        });
+        return true;
+      }
+      on(event: 'message' | 'exit' | 'error', listener: (value?: unknown) => void) {
+        const set = this.handlers.get(event) ?? new Set(); set.add(listener); this.handlers.set(event, set); return this;
+      }
+      kill() { return true; }
+      emit(event: 'message' | 'exit' | 'error', value?: unknown) { for (const listener of this.handlers.get(event) ?? []) listener(value); }
+    }
+    relaySpawnState.child = new SlowRelayChild();
+    const sent: Array<Record<string, any>> = [];
+    let onMessage: ((value?: unknown) => void) | undefined;
+    const ipc = {
+      send: (message: unknown) => {
+        const value = message as Record<string, any>;
+        sent.push(value);
+        if (value.type === 'response' && value.requestId === 'shutdown-order') order.push('service-shutdown-reply');
+        return true;
+      },
+      on: (event: 'message' | 'disconnect', listener: (value?: unknown) => void) => { if (event === 'message') onMessage = listener; return undefined; },
+      off: () => undefined,
+    };
+    const handle = await runBridgeServiceEntry({
+      relay: { listenHost: '127.0.0.1', listenPort: 0, targetHost: '127.0.0.1', targetPort: 25565, allowMinecraftUpstream: true },
+      observer: { enabled: false },
+      helloTimeoutMs: 500,
+      shutdownGraceMs: 1_000,
+    }, ipc, { log: () => undefined });
+    try {
+      onMessage!({ type: 'request', protocolVersion: 1, requestId: 'shutdown-order', sessionEpoch: handle.sessionEpoch, command: 'shutdown', payload: {} });
+      await waitFor(() => sent.some(message => message.type === 'response' && message.requestId === 'shutdown-order'), 'shutdown-response', 2_000);
+      const reply = sent.find(message => message.type === 'response' && message.requestId === 'shutdown-order')!;
+      expect(reply).toMatchObject({ ok: true, result: { stopped: true } });
+      // The reply must not precede the relay child's stop completion.
+      expect(order).toEqual(['relay-stop-requested', 'relay-exited', 'service-shutdown-reply']);
+      expect(exitCodes).toEqual([0]);
+    } finally {
+      await handle.stop('test-cleanup');
+      exit.mockRestore();
     }
   });
 

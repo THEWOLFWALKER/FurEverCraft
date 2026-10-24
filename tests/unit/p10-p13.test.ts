@@ -89,6 +89,8 @@ describe('P10 3D body contract migration', () => {
       walk: () => undefined,
     };
     const legacy = new Legacy2DBodyAdapter(bridge, clock);
+    // The legacy 2D contract does not guarantee orientation, so it must not advertise turn.
+    expect(legacy.capabilities.turn).toBe(false);
     const observation = await legacy.observe();
     expect(observation.threeDimensional).toBe(false);
     expect(observation.coordinateMapping).toBe('legacy-2d-xz');

@@ -157,9 +157,9 @@ export function exploreArea(ctx: SkillContext, radius: number): SkillResult | Pr
   if (getAttachedBodyAdapter(ctx.bridge)) {
     return exploreAreaSkill({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, radius);
   }
-  const snapshot = ctx.bridge.snapshot();
-  ctx.report({ stage: 'dispatch', completed: 1, total: 1, message: 'observed-local-area' });
-  return { ok: true, outcome: 'confirmed', value: { radius, position: snapshot.position, observed: Object.keys(snapshot.cells).length, source: snapshot.source, legacy2d: true } };
+  // Reading a planar snapshot is observation, not movement. Reporting confirmed here
+  // would claim that a world-3d skill explored an area when no body input was issued.
+  return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
 }
 export function digOne(ctx: SkillContext, target: { x: number; y: number }): SkillResult {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
@@ -305,6 +305,9 @@ function finishReturn(
 ): SkillResult | Promise<SkillResult> {
   if (!resolved.ok) return { ok: false, outcome: 'failed', reason: resolved.reason };
   if (body) return navigateToSkill({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, resolved.target, budget);
+  // A remembered world-3d place can carry a real z. The planar bridge cannot execute it,
+  // and dropping z would silently navigate to a different (flattened) location.
+  if (resolved.target.z !== undefined) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   return navigateTo(ctx, { x: resolved.target.x, y: resolved.target.y }, budget);
 }
 

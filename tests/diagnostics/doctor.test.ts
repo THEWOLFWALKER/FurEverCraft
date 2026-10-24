@@ -11,7 +11,7 @@ import { SparseVoxelWorld } from '../../src/motor/geometry.js';
 import { collectDoctorReport, unavailableDoctorReport } from '../../src/diagnostics/doctor.js';
 import { SQLiteStore } from '../../src/persistence/store.js';
 import { runDoctorCommand } from '../../src/cli/main.js';
-import { BridgeService } from '../../src/bridge/service/orchestrator.js';
+import { BridgeService, type RelayMonitor } from '../../src/bridge/service/orchestrator.js';
 
 const context: BodyContext = { serverProfileId: 'simulated', worldGenerationId: 'doctor-world', connectionEpoch: '1', bodyEpoch: '1', dimension: 'overworld' };
 const cleanup: string[] = [];
@@ -176,7 +176,8 @@ describe('P21 doctor reports actual Runtime/Store capabilities', () => {
   });
 
   it('reports effective inputs as control-revoked while an attached bridge service is unarmed', async () => {
-    const service = new BridgeService({});
+    const relay: RelayMonitor = { state: 'running', start: async () => undefined, stop: async () => undefined, onExit: () => () => undefined };
+    const service = new BridgeService({ relay });
     const runtime = createRuntime({ clock: new ManualClock(), bridgeService: { service } });
     try {
       await runtime.startBridgeService!();

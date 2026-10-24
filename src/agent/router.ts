@@ -7,7 +7,7 @@ import { sameStableScope } from '../persistence/store.js';
 import { Executor, type InputArbiter, type Progress } from '../execution/runtime.js';
 import { skillRequiresInput, type AdmissionDecision, type ExecutionAdmission } from '../execution/admission.js';
 import { skillImplementations } from '../skills/skills.js';
-import { findSkill, findSkills, skillManifests } from '../skills/registry.js';
+import { findSkills, skillManifests } from '../skills/registry.js';
 import type { EventHub } from '../diagnostics/events.js';
 import { redactError } from '../diagnostics/redaction.js';
 import { MemoryService, createPlaceResolver, type MemoryScope } from '../autonomous/memory.js';
@@ -16,7 +16,7 @@ import { ProviderSession } from '../providers/session.js';
 import { assertModelResponse } from '../providers/canonical.js';
 import { ProviderError } from '../providers/shared.js';
 import type { ProviderMetadata } from '../control/dto.js';
-import { getAttachedBodyAdapter, bodyStateFromObservation } from '../motor/contracts.js';
+import { getAttachedBodyAdapter, bodyStateFromObservation, isReal3DObservation } from '../motor/contracts.js';
 import type { MotorFactory } from '../motor/controller.js';
 import type { SkillLifecycle } from '../skills/lifecycle.js';
 import { syntheticCapture } from '../autonomous/bounds.js';
@@ -146,6 +146,87 @@ export class ToolRouter {
       }
     }).map(manifest => manifest.id as string);
   }
+  /**
+   * Observe truthful evidence for the manifest prerequisites of one skill. Only positively
+   * observed entries are returned; an absent entry stays unmet and fails the lifecycle gate
+   * closed. This replaces the former fabricated `{ name: true }` map for every declaration.
+   */
+  private async observedPreconditions(skill: string, args: Record<string, unknown>): Promise<Record<string, boolean>> {
+    const evidence: Record<string, boolean> = {};
+    const body = getAttachedBodyAdapter(this.bridge);
+    const readSnapshot = () => { try { return this.bridge.snapshot(); } catch { return undefined; } };
+    const set = (name: string, value: boolean) => { if (value) evidence[name] = true; };
+    const coordinate = (name: string): number | undefined => {
+      const value = Number(args[name]);
+      return Number.isInteger(value) ? value : undefined;
+    };
+    switch (skill) {
+      case 'navigate_to': {
+        if (body) {
+          try {
+            const observation = await body.observe();
+            set('current-position', isReal3DObservation(observation)
+              && [observation.pose.x, observation.pose.y, observation.pose.z].every(Number.isFinite));
+          } catch { /* unknown position */ }
+        } else {
+          const observed = readSnapshot();
+          set('current-position', Boolean(observed && observed.freshness === 'current' && observed.gap !== true
+            && Number.isFinite(observed.position.x) && Number.isFinite(observed.position.y)));
+        }
+        break;
+      }
+      case 'observe_ui': {
+        const observed = readSnapshot();
+        const ui = observed?.fields?.ui;
+        set('ui-observation', Boolean(observed && (!ui || (ui.available !== false && ui.freshness !== 'unknown'))));
+        break;
+      }
+      case 'send_chat':
+        set('chat-ui', typeof this.bridge.dispatchChat === 'function');
+        break;
+      case 'place_one': {
+        const x = coordinate('x'), y = coordinate('y');
+        if (x !== undefined && y !== undefined) {
+          try { set('free-target', this.bridge.cell(x, y) === 'free'); } catch { /* unknown target */ }
+        }
+        set('inventory', Number.isInteger(this.bridge.inventory) && this.bridge.inventory > 0);
+        break;
+      }
+      case 'wait_for_condition':
+        // The router supplies a real clock to every skill program it starts.
+        set('clock', true);
+        break;
+      case 'look_at':
+        set('orientation', typeof this.bridge.lookAt === 'function');
+        break;
+      case 'explore_area': {
+        if (body) {
+          try { set('local-observation', isReal3DObservation(await body.observe())); } catch { /* unknown observation */ }
+        }
+        break;
+      }
+      case 'dig_one': {
+        const x = coordinate('x'), y = coordinate('y');
+        if (x !== undefined && y !== undefined) {
+          try { set('reachable-target', this.bridge.cell(x, y) === 'blocked'); } catch { /* unknown target */ }
+        }
+        set('tool', typeof this.bridge.dig === 'function');
+        break;
+      }
+      case 'collect_nearby':
+        set('entity-observation', Boolean(body?.collectNearby ?? this.bridge.collectNearby));
+        break;
+      case 'gather_blocks':
+        // A 3D body's own find/dig contract is the evidence; the legacy pair is used only
+        // when no adapter is attached.
+        set('known-target', body ? Boolean(body.findBlock && body.digBlock) : Boolean(this.bridge.digBlock && this.bridge.adjacentBlock));
+        break;
+      case 'return_to_place':
+        set('remembered-place', Boolean(this.memory || body?.findPlace || typeof this.bridge.findPlace === 'function'));
+        break;
+    }
+    return evidence;
+  }
   async invoke(call: ToolCall, admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal } = {}): Promise<z.infer<typeof ToolCallResultSchema>> {
     let raw: unknown;
     try { raw = JSON.parse(call.arguments || '{}'); } catch { return { callId: call.id, name: call.name, ok: false, error: 'invalid-json-arguments' }; }
@@ -270,7 +351,7 @@ export class ToolRouter {
           // execution exists. Prepared intent is persisted before dispatch; only a confirmed outcome settles it.
           // collect_nearby mutates inventory and therefore needs the same durable barrier as dig/chat/place.
           const sideEffect = skill === 'place_one' || skill === 'send_chat' || skill === 'dig_one' || skill === 'gather_blocks' || skill === 'collect_nearby';
-          const run = await this.runWriteSkill(call, skill, args, executeArgs, sideEffect, admissionContext);
+          const run = await this.runWriteSkill(call, skill, args, executeArgs, sideEffect, admissionContext, true);
           if (!run.ok) {
             this.events?.publish(`tool.${call.name}`, { callId: call.id, result: run.result }, false);
             return { callId: call.id, name: call.name, ok: false, result: run.result, error: run.error };
@@ -331,6 +412,7 @@ export class ToolRouter {
     executeArgs: unknown,
     sideEffect: boolean,
     admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal },
+    requireAdvertised = false,
   ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
     const implementation = skillImplementations[skill as keyof typeof skillImplementations];
     if (!implementation || !this.executor || !this.store) return { ok: false, error: 'unsupported-skill' };
@@ -348,6 +430,13 @@ export class ToolRouter {
     }
     const rejected = this.checkAdmission(skill, admissionContext, admittedContext);
     if (rejected && !rejected.ok) return { ok: false, error: rejected.code, result: { code: rejected.code, message: rejected.message } };
+    // Registration is not availability: once precise admission gates (owner, control, input,
+    // capability) have had their say, refuse a skill the current body does not advertise. A
+    // world-3d skill must never be dispatched into the legacy planar path just because an
+    // implementation exists in the registry.
+    if (requireAdvertised && !this.availableSkills().includes(skill)) {
+      return { ok: false, error: 'skill-unavailable', result: { code: 'skill-unavailable', skill } };
+    }
     const effectId = sideEffect ? nextId('effect') : undefined;
     let effectPrepared = false;
     const execution = await this.executor.start(admissionContext.goalId ?? 'agent', skill, args, async (lease, report, signal) => {
@@ -402,11 +491,9 @@ export class ToolRouter {
         return result instanceof Promise ? await result : result;
       };
       if (this.lifecycle) {
-        // The lifecycle owns pause/cancel/human-control fencing for the run. The skill still
-        // performs its own evidence checks; lifecycle preconditions mirror the manifest because
-        // admission/executor have already gated dispatch.
-        const manifest = findSkill(skill);
-        const preconditions = Object.fromEntries((manifest?.prerequisites ?? []).map(name => [name, true]));
+        // The lifecycle owns pause/cancel/human-control fencing for the run. Preconditions are
+        // passed as observed evidence, not assumed true; an unobserved prerequisite fails closed.
+        const preconditions = await this.observedPreconditions(skill, args);
         const snapshot = await this.lifecycle.run(skill, lifeSignal => invokeSkill(lifeSignal), { generation: this.lifecycle.generationValue, preconditions });
         if (snapshot.state === 'suspended' && snapshot.outcome === 'paused') return { ok: false, outcome: 'canceled', reason: 'paused' };
         if (snapshot.state === 'canceled') return { ok: false, outcome: 'canceled', reason: snapshot.reason };

@@ -159,6 +159,36 @@ describe('Round 3 — CLI utility commands respect the single owner', () => {
     expect(probe.release()).toBe(true);
   });
 
+  it('derives demo scenario outcomes from observed results instead of hardcoded claims', async () => {
+    const db = tempDb();
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const document = await runDemo(db);
+      const scenarios = document.scenarios as Array<Record<string, any>>;
+      const byName = Object.fromEntries(scenarios.map(scenario => [scenario.scenario, scenario]));
+      // The first navigation really finished before the revision; no supersession occurred.
+      expect(byName['human-steering']?.oldResult).toBe('succeeded');
+      expect(byName['human-steering']?.oldResult).not.toBe('superseded');
+      // Retry/UI claims come from the bridge calls that actually happened.
+      expect(byName['chat-ui']?.dispatchAttempts).toBe(1);
+      expect(byName['chat-ui']?.messageRetried).toBe(false);
+      // Derived from the observed dispatch count, not a hardcoded success flag.
+      expect(byName['chat-ui']?.unknownMessageNotRetried).toBe(true);
+      expect(byName['chat-ui']?.unknownMessageNotRetried).toBe(byName['chat-ui']?.dispatchAttempts <= 1);
+      expect(byName['chat-ui']?.uiHandoff).toEqual(['gameplay', 'chat', 'gameplay']);
+      expect(byName['chat-ui']?.scenarioAssertions).toEqual({ unknownMessageNotRetried: true });
+      // Reconciliation outcome and status come from the rebuilt runtime's recovery result.
+      expect(byName['crash-recovery']?.outcome).toBe('reconciled');
+      expect(byName['crash-recovery']?.reconciled).toEqual([{ effectId: 'effect_demo', status: 'ambiguous' }]);
+      expect(byName['crash-recovery']?.reconciledStatus).toBe('ambiguous');
+      // Cleanup is proven by a late observation that the removed subscriber did not receive.
+      expect(byName['bridge-fixture']?.disconnectCleanup).toBe(true);
+      expect(byName['bridge-fixture']?.lateObservationDelivered).toBe(false);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it('keeps the HTTP-attached ControlService path usable while the Runtime owns the lock', async () => {
     const db = tempDb();
     const runtime = createRuntime({ db });

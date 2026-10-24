@@ -35,7 +35,7 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
  * It implements the same hello/response IPC contract and records every request it receives.
  */
 type FakeServiceChild = ChildProcessLike & { readonly sent: Array<Record<string, unknown>> };
-function fakeServiceChild(status: Record<string, unknown>): FakeServiceChild {
+function fakeServiceChild(status: Record<string, unknown>, shutdownResult: Record<string, unknown> = { stopped: true }): FakeServiceChild {
   const listeners = new Map<string, Array<(value?: unknown) => void>>();
   const sent: Array<Record<string, unknown>> = [];
   const emit = (event: string, value?: unknown) => {
@@ -52,7 +52,7 @@ function fakeServiceChild(status: Record<string, unknown>): FakeServiceChild {
       } else if (request.type === 'request') {
         const base = { type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch: 'child-epoch', ok: true };
         if (request.command === 'status') reply({ ...base, result: status });
-        else if (request.command === 'shutdown') reply({ ...base, result: { stopped: true } });
+        else if (request.command === 'shutdown') reply({ ...base, result: shutdownResult });
         else reply({ ...base, result: {} });
       }
       return true;
@@ -343,6 +343,12 @@ describe('Round 3 — bridge service child config and readiness guard', () => {
     expect(childConfig).not.toHaveProperty('source');
     expect(JSON.stringify(childConfig)).not.toContain('client-offline');
     expect(JSON.stringify(childConfig)).not.toContain('disabled');
+  });
+
+  it('surfaces a failed shutdown instead of reporting a clean stop', async () => {
+    const child = fakeServiceChild({ state: 'running' }, { stopped: false, error: 'relay-stop-failed:close-error', forced: true });
+    const result = await runBridgeServiceCommand({ relay }, { spawn: () => child });
+    expect(result.shutdown).toMatchObject({ stopped: false, error: 'relay-stop-failed:close-error', forced: true });
   });
 
   it('rejects instead of returning a normal result when the final status never becomes usable', async () => {

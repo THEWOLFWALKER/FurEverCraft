@@ -27,7 +27,12 @@ export type BodyCapabilities = {
 };
 /** Capabilities that are actually implemented and may be planned against today. */
 export const SIMULATED_BODY_CAPABILITIES: BodyCapabilities = { threeDimensional: true, turn: true, walk: true, stop: true, jump: 'short', jumpMaxRise: 1, stepUp: false, controlledDrop: false };
-export const LEGACY_2D_CAPABILITIES: BodyCapabilities = { threeDimensional: false, turn: true, walk: true, stop: true, jump: 'none', jumpMaxRise: 0, stepUp: false, controlledDrop: false };
+/**
+ * The legacy 2D contract has no guaranteed orientation surface (`lookAt` is optional), so it
+ * must not advertise `turn`. A caller that requires turn on a legacy body must prove it from
+ * the concrete adapter/bridge instead of relying on this conservative capability report.
+ */
+export const LEGACY_2D_CAPABILITIES: BodyCapabilities = { threeDimensional: false, turn: false, walk: true, stop: true, jump: 'none', jumpMaxRise: 0, stepUp: false, controlledDrop: false };
 
 export type ObservedCell = { pos: BlockPos; cell: CellKnowledge; shape: ShapeKind; block?: string; revision: string };
 export type WorldObservation = {

@@ -3,6 +3,7 @@
 ## 当前权威与范围
 
 - 当前开发批次是 `NEXT_BATCH.md` 的 **P01–P24**；设计权威是 `docs/design/*-v0.2.md`，审查合同是 `REVIEW.md`，当前状态与证据见 `PROGRESS.md`、`WORKSTREAM.md` 和 `DELIVERY_REPORT.md`。
+- 当前交付状态：`main` @ `f1c5f90`；P24 与 `REVIEW.md` 五轮 review 已完成（Round 1–2 checkpoint `17cdf06`，Round 3 `ee9eea7`，Round 4–5 与最终修复 `f1c5f90`）。Rounds 4/5 按用户明确指示并发执行；最终完整检查在 `f1c5f90` 串行通过。该状态只证明离线范围。
 - 权威顺序：用户最新明确指令 > 本文件与 `NEXT_BATCH.md` > v0.2 设计合同 > 旧阶段文档。旧 `DECISIONS.md` 中的 1.20.4/protocol 765 terminating-proxy 内容只保留为历史，不是当前实现目标。
 - 旧文档中的 F/B/U/M/A/V 编号是可追溯的历史分组，不再是当前批次编号；报告 P01–P24 时必须使用当前编号和实际证据。
 - 当前目标游戏版本 Java Edition **26.3**（协议 777、DataVersion 5023 为候选来源数据）。没有可核对的 26.3 schema/native/data 时，对应 decoder/domain 必须保持 `unavailable`/`unsupported`，不得猜字段、不得把 fixture 或最新依赖当作 26.3 支持。
@@ -17,7 +18,7 @@
 - `blocked-external`：任务本身依赖本批禁止的真实环境/数据/API；必须写明精确缺件与影响。
 - `not-done`：尚未实现或尚未满足验收；进行中的工作也归入此类，不得提前标成 `done-*`。
 
-P24 和五轮 review 在全部完成前不得标为 `done-offline`。测试数量、提交数量或“已跑过一轮”都不是完成依据。
+P24 和五轮 review 已在 `f1c5f90` 按离线验收完成，记录在 `PROGRESS.md`/`WORKSTREAM.md`/`DELIVERY_REPORT.md`；测试数量、提交数量或“已跑过一轮”不能替代证据。后续用户协同 review 反馈仍须修复并定向回归，但不自动开启第六轮全仓 review。
 
 ## 固定架构与不变量
 
@@ -54,6 +55,8 @@ P24 和五轮 review 在全部完成前不得标为 `done-offline`。测试数�
 - 禁止：连接真实 Minecraft 服务器/加入世界、启动真实游戏服、下载游戏 JAR/资产、运行真实 SendInput/桌面截图、调用线上付费模型 API、自行开展新的网页/论文/仓库研究。
 - 允许：本机 npm 构建与依赖安装；127.0.0.1 无游戏引擎 TCP/HTTP 夹具；注入 transport/sink；headless 本地网页 E2E（不截图/录像/trace）；读取已安装依赖源码与既有固定候选源码。
 - 外部能力 gate（`allowMinecraftUpstream`、`allowModelNetwork`、`allowOsInput`、`allowScreenCapture`）独立且默认关闭；loopback 测试授权不得回退成真实目标或 Fake 生产后端。
+- 本地认证模式必须如实报告：默认 `pairing`；`--no-pairing` + CLI bearer 为 `bearer-only`（浏览器访问禁用，公开非秘密 `/api/v1/auth-mode`）；`--no-pairing` 且无 bearer 为 `loopback-open` 开发模式。非 TTY 的 `serve` 必须显式提供 pairing code（`--pairing-code` 或 `MINECRAFT_AGENT_PAIRING_CODE`），不得静默启动不可配对的服务。
+- `serve --config` 使用 strict loader，只接受 serve 能执行的键；未使用键必须报 `config-key-unused`。`--provider` 仅在 config `allowModelNetwork:true` 且提供 API key 时有效；开放 gate 无 provider、无 gate 选 provider、无 key 都必须失败。`bridge:fixture` 与 `bridge:protocol` 都是离线 fixture/检查路径，不是 live。
 
 ## 交付规则
 

@@ -4,7 +4,7 @@ import { IpcRequestSchema, type IpcRequest } from '../ipc/protocol.js';
 import { spawnRelayProcess } from '../relay/spawn.js';
 import type { RelayEntryConfig } from '../relay/entry.js';
 import { ProcessSupervisor } from '../supervisor.js';
-import { BridgeService, type ObserverMonitor } from './orchestrator.js';
+import { BridgeService, type BridgeShutdownResult, type ObserverMonitor } from './orchestrator.js';
 
 /**
  * Passive observer monitor over the relay child's IPC stream. The worker lives in the relay
@@ -36,6 +36,11 @@ class RelayObserverMonitor implements ObserverMonitor {
     if (value.event === 'diagnostic') {
       const payload = value.payload as { kind?: string; reason?: string } | undefined;
       if (payload?.kind === 'observer-failure') {
+        // Never leave a stale 'running' report after a worker failure: admission arming reads
+        // this state, and a later relay-state heartbeat may not arrive before the operator arm.
+        const current = this.stateValue && typeof this.stateValue === 'object'
+          ? this.stateValue as Record<string, unknown> : {};
+        this.stateValue = { ...current, running: false, availability: 'unknown', lastFailure: payload.reason ?? 'observer-worker-failure' };
         for (const listener of this.failures) { try { listener(payload.reason ?? 'observer-worker-failure'); } catch { /* isolated */ } }
       }
       return;
@@ -80,7 +85,7 @@ export type ServiceIpc = {
 export type BridgeServiceEntryHandle = {
   readonly sessionEpoch: string;
   readonly service: BridgeService;
-  stop(reason?: string): Promise<void>;
+  stop(reason?: string): Promise<BridgeShutdownResult>;
 };
 
 export type ServiceCommandReply =
@@ -143,10 +148,15 @@ export function serviceCommandReply(
       return { kind: 'stop-observer' };
     case 'arm': {
       const armed = context.service.armControl('operator-ipc-arm');
+      const refusal = context.service.armRefusalReason;
       const status = context.service.status();
       return armed
         ? { kind: 'reply', ok: true, result: { armed: true, controlRevoked: status.controlRevoked, status } }
-        : { kind: 'reply', ok: false, result: { armed: false, controlRevoked: status.controlRevoked, status }, error: { code: 'control-arm-refused', message: 'control cannot be armed while IPC loss/backpressure is unresolved' } };
+        : {
+          kind: 'reply', ok: false,
+          result: { armed: false, controlRevoked: status.controlRevoked, ...(refusal === undefined ? {} : { refusal }), status },
+          error: { code: 'control-arm-refused', message: `control cannot be armed: ${refusal ?? 'unspecified-refusal'}` },
+        };
     }
     case 'observe':
       return {
@@ -172,6 +182,7 @@ export async function runBridgeServiceEntry(
     try { process.stderr.write(`${JSON.stringify(redact({ level, event, ...(fields ?? {}) }))}\n`); } catch { /* best effort */ }
   });
   let stopped = false;
+  let stopPromise: Promise<BridgeShutdownResult> | undefined;
   let service!: BridgeService;
   const observerEnabled = config.observer?.enabled !== false;
   const observer = observerEnabled ? new RelayObserverMonitor(event => service?.publishObserver(event)) : undefined;
@@ -201,12 +212,18 @@ export async function runBridgeServiceEntry(
     service.emit({ type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch, ok, ...(result === undefined ? {} : { result }), ...(error === undefined ? {} : { error }) }, true);
   };
 
-  const stop = async (reason = 'shutdown') => {
-    if (stopped) return;
+  const stop = (reason = 'shutdown'): Promise<BridgeShutdownResult> => {
+    if (stopPromise) return stopPromise;
+    // Stop accepting commands while shutdown is in flight; the shutdown reply itself is sent
+    // only after the service reports its real stop outcome.
     stopped = true;
-    await service.stop(reason);
-    service.flush();
-    try { ipc.off?.('message', onMessage); ipc.off?.('disconnect', onDisconnect); } catch { /* best effort */ }
+    stopPromise = (async () => {
+      const result = await service.stop(reason);
+      service.flush();
+      try { ipc.off?.('message', onMessage); ipc.off?.('disconnect', onDisconnect); } catch { /* best effort */ }
+      return result;
+    })();
+    return stopPromise;
   };
 
   const onMessage = (value: unknown) => {
@@ -217,8 +234,19 @@ export async function runBridgeServiceEntry(
     const request = parsed.data;
     const reply = serviceCommandReply(request, { sessionEpoch, service, ...(observer === undefined ? {} : { observer }), config });
     if (reply.kind === 'shutdown') {
-      respond(request, true, { stopped: true });
-      void stop('shutdown').then(() => { if (typeof process.send === 'function') process.exit(0); });
+      // Acknowledge only after the service has actually attempted to stop every child. A
+      // per-child failure or a forced escalation is reported as `stopped:false`, never as a
+      // clean stop.
+      void stop('shutdown').then(result => {
+        // The request itself completed; its result carries whether the shutdown was clean.
+        // Sending ok:false here would make the correlated transport discard `forced`/`error`.
+        respond(
+          request,
+          true,
+          { stopped: result.stopped, ...(result.stopped ? {} : { error: result.error ?? 'shutdown-failed', forced: result.forced }) },
+        );
+        if (typeof process.send === 'function') process.exit(result.stopped ? 0 : 1);
+      });
       return;
     }
     if (reply.kind === 'start-observer') {
@@ -240,7 +268,7 @@ export async function runBridgeServiceEntry(
     respond(request, reply.ok, reply.result, reply.error);
   };
 
-  const onDisconnect = () => { void stop('parent-disconnect'); };
+  const onDisconnect = () => { void stop('parent-disconnect').then(result => process.exit(result.stopped ? 0 : 1)); };
 
   ipc.on('message', onMessage);
   ipc.on('disconnect', onDisconnect);
@@ -258,7 +286,13 @@ export async function runBridgeServiceEntry(
     throw error;
   }
   // Advertise the session only after the service actually reached running/degraded.
-  ipc.send({ type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch, bootEpoch, capabilities: ['control', 'observe', 'relay', 'observer'] });
+  // Advertise only capabilities this entry implements. `observe` is not a service command
+  // (the observer is passive and `observe` is rejected as unsupported), and `observer` is only
+  // advertised when an observer monitor is actually configured.
+  ipc.send({
+    type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch, bootEpoch,
+    capabilities: ['control', 'relay', ...(observer === undefined ? [] : ['observer'])],
+  });
 
   return { sessionEpoch, service, stop };
 }
@@ -274,7 +308,9 @@ if (process.send && process.env.FUREVERCRAFT_SERVICE_CONFIG) {
     on: (event, listener) => process.on(event, listener),
     off: (event, listener) => process.off(event, listener),
   }).then(handle => {
-    const shutdown = (signal: string) => { void handle.stop(signal).then(() => process.exit(process.exitCode ?? 0)); };
+    const shutdown = (signal: string) => {
+      void handle.stop(signal).then(result => process.exit(result.stopped ? (process.exitCode ?? 0) : 1));
+    };
     process.once('SIGINT', () => shutdown('SIGINT'));
     process.once('SIGTERM', () => shutdown('SIGTERM'));
   }, () => { process.exit(1); });

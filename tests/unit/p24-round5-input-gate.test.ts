@@ -108,4 +108,34 @@ describe('Round 5 F1 — skill advertisement honors coordinate space and body', 
     expect(catalog.ok).toBe(true);
     expect((catalog.result as Array<{ id: string }>).map(skill => skill.id)).toEqual(['explore_area']);
   });
+
+  it('rejects start_skill for a registered skill the current body does not advertise', async () => {
+    const runtime = track(createRuntime({ clock: new ManualClock() }));
+    expect(runtime.router.availableSkills()).not.toContain('explore_area');
+    // The implementation exists in the registry, but availability is body-derived. It must not
+    // run (and must not record a confirmed observation as a successful exploration).
+    const result = await runtime.router.invoke(exploreCall('legacy-explore-start'));
+    expect(result).toMatchObject({ ok: false, error: 'skill-unavailable' });
+    expect(runtime.store.listExecutions()).toHaveLength(0);
+    expect(runtime.store.listEffects()).toHaveLength(0);
+  });
+
+  it('passes observed prerequisite evidence so an unmet prerequisite fails closed', async () => {
+    const bridge = new FakeClientBridge(12);
+    bridge.block(1, 0);
+    const runtime = track(createRuntime({ bridge, clock: new ManualClock() }));
+    const result = await runtime.router.invoke({
+      id: 'blocked-place',
+      name: 'start_skill',
+      arguments: JSON.stringify({ skill: 'place_one', x: 1, y: 0, proposalId: 'blocked-place' }),
+    });
+    expect(result.ok).toBe(false);
+    expect(String(result.error)).toContain('precondition:free-target');
+    // The gate failed before dispatch: no inventory or cell change, no confirmed execution.
+    expect(bridge.inventory).toBe(8);
+    expect(bridge.cell(1, 0)).toBe('blocked');
+    expect(runtime.store.getExecution('blocked-place')).toMatchObject({ status: 'failed' });
+    expect(runtime.store.listExecutions().some(execution => execution.status === 'succeeded')).toBe(false);
+    expect(runtime.store.listEffects().some(effect => effect.status === 'confirmed')).toBe(false);
+  });
 });

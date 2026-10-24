@@ -1,53 +1,56 @@
-# FurEverCraft v0.2 Delivery Report — P01–P23 merged, P24 Rounds 1–2 complete
+# FurEverCraft v0.2 Delivery Report — P01–P24, five review rounds complete
 
 ## Status
 
-The merged `p24-final` branch contains an offline-verifiable implementation of P01–P23 on Linux. P24 is **in progress**: the documentation/consistency items are in place, Rounds 1–2 of the five required review rounds are complete, and Rounds 3–5 remain. Nothing here is a claim of live Minecraft 26.3, Windows, or paid-API compatibility.
+`main` at `f1c5f90` contains the offline-verifiable P01–P24 implementation on Linux. All five review rounds required by `REVIEW.md` are complete: Round 1–2 at checkpoint `17cdf06`, Round 3 at `ee9eea7`, and Rounds 4–5 (run concurrently at the user's explicit request to speed up delivery) with their fixes on `f1c5f90`. The final full validation ran serially on `f1c5f90` after those fixes. P24 is `done-offline` for that scope.
 
-Real Minecraft servers/worlds, real Windows input/capture, game assets, and paid model APIs were not used. Local results use Node `v22.23.4` / npm `10.9.9`; cloud CI was not observed.
+Nothing here is a claim of live Minecraft 26.3, Windows, or paid-API compatibility. Real Minecraft servers/worlds, real Windows input/capture, game assets, and paid model APIs were not used. Local results use Node `v22.23.4` / npm `10.9.9` on Linux x86_64; cloud CI was not run or observed.
 
 ## What is actually runnable
 
 - **CLI**: `demo`, `serve`, `attach`, `status`, `doctor`, `bridge` (fixture/inspect/service; live remains gated), `goal:revise`, `events`, `trace:export`, `trace:replay`.
-- **HTTP control plane**: Fastify `/api/v1` reads/writes, local pairing (one-time code, HttpOnly/SameSite session, CSRF), loopback/Host/Origin checks, CLI bearer, SSE snapshot/cursor/gap recovery. P24 adds authenticated `GET /api/v1/doctor`.
-- **Web console**: React/Vite five-area control UI (overview, conversation, tasks, world, settings/diagnostics) served from the same ControlService as the CLI.
-- **Runtime/bridge**: one RuntimeAssembly per storage path with cross-process owner lock; raw loopback TCP relay with read-only observer; framing/compression budgets. The default `simulated` profile remains explicit legacy 2D; the public `simulated-3d` profile (`serve --profile simulated-3d`, `doctor --profile simulated-3d`) assembles the simulated BodyAdapter/Motor chain through the same ControlService and single Runtime. Neither is a real client.
+- **HTTP control plane**: Fastify `/api/v1` reads/writes, local pairing (one-time 128-bit code, HttpOnly/SameSite session, CSRF), loopback/Host/Origin checks, CLI bearer, SSE snapshot/cursor/gap recovery, and the public non-secret `GET /api/v1/auth-mode`. Auth modes are `pairing` (default), `bearer-only` (`--no-pairing` with a CLI bearer; browser access disabled) and `loopback-open` (`--no-pairing` without a bearer). P24 adds authenticated `GET /api/v1/doctor`.
+- **Web console**: React/Vite five-area control UI (overview, conversation, tasks, world, settings/diagnostics) served from the same ControlService as the CLI. In token/bearer-only mode it truthfully shows that browser access is disabled and directs the operator to the CLI bearer.
+- **Runtime/bridge**: one RuntimeAssembly per storage path with cross-process owner lock; raw loopback TCP relay with read-only observer; framing/compression budgets and per-TCP-session observer epochs. The default `simulated` profile remains explicit legacy 2D; the public `simulated-3d` profile (`serve --profile simulated-3d`, `doctor --profile simulated-3d`) assembles the simulated BodyAdapter/Motor chain through the same ControlService and single Runtime. Neither is a real client. `serve --config` uses the strict loader, and `serve --provider openai|anthropic` is honored only with `allowModelNetwork: true` and an API key.
 - **Diagnostics**: truthful doctor over the attached runtime/store; bounded trace export and side-effect-free replay.
 
-## Verified checks (offline Linux, 2026-10-24)
+## Final verification snapshot (HEAD `f1c5f90`)
 
-Merged baseline `ccb9f8e` (`p24-final`), post-build so conditional child-process tests execute. Round 2 started at `033f29a`; its code/tests are `b6d7f42`. Node `v22.23.4` / npm `10.9.9`.
+`main` at `f1c5f90` (`fix(P24 rounds 3-5): enforce scope, recovery, gates and truthful reporting`), post-build so conditional child-process tests execute. The run was serial and followed all Round 3–5 fixes. This documentation pass changes docs only. Node `v22.23.4` / npm `10.9.9`, Linux x86_64.
 
 ```text
-npm run typecheck            pass
-npm run build                pass
-npm run build:web            pass
-npm run test:offline         47 files / 409 tests passed, 0 skipped
-npm run test:v:offline       integration 10 files / 56 tests passed
-                             soak         2 files /  2 tests passed
-                             diagnostics  2 files / 15 tests passed
-npm run test:web:e2e         1 spec / 2 Chromium tests passed
-npm run demo:offline         6/6 scenarios passed
-npm run doctor               exit 0; truthful "degraded" default report
+npx tsc --noEmit              exit 0
+npm run build                 exit 0
+npm run test:offline          58 files / 578 tests passed, 0 skipped
+npm run build:web             exit 0
+npm run test:v:offline        integration 11 files / 71 tests passed
+                              soak         2 files /  2 tests passed
+                              diagnostics  2 files / 25 tests passed
+                              total 98 tests passed
+npm run test:web:e2e          9/9 Chromium tests passed (headless; no screenshots/video/trace)
+npm run demo:offline          6/6 scenarios passed
+npm run doctor                exit 0; truthful "degraded" default report
 npm run doctor -- --profile simulated-3d
-                             exit 0; simulated 3D body, no live claim
+                              exit 0; runtime profile simulated-3d, body 3D, no live claim
 ```
 
-Additional P24 checks: `npm run trace:export -- --db <tmp> --out <tmp>` exited 0 and wrote a bounded 0-record trace from a fresh DB; `npm run trace:replay -- --file <tmp>` exited 0 with `contiguous: true`, `input: disabled`, `network: disabled`, `paidApis: disabled`, `sideEffects: not-resent`. The doctor integration test proves unauthenticated access is denied and an authenticated CLI bearer receives the same truthful P21 report. A real `serve --profile simulated-3d --no-pairing` process served a status document whose `body` was 3D with non-zero-capable z, and `/api/v1/capabilities` listed the 3D skills; it was stopped and its temporary DB removed.
+Additional P24 checks: `npm run trace:export -- --db <tmp> --out <tmp>` exits 0 and writes a bounded trace from a fresh DB; `npm run trace:replay -- --file <tmp>` exits 0 with `contiguous: true`, `input: disabled`, `network: disabled`, `paidApis: disabled`, `sideEffects: not-resent`. The doctor integration test proves unauthenticated access is denied and an authenticated CLI bearer receives the same truthful P21 report. A real `serve --profile simulated-3d --no-pairing` process served a status document whose `body` was 3D, and `/api/v1/capabilities` listed the 3D skills; it was stopped and its temporary DB removed. The E2E suite also exercises a real compiled `serve --db` process, token/bearer-only mode, simulated-3d, pause and provider-unavailable feedback, and SSE reconnect without event loss.
 
-## P01–P23 status summary
+No real Minecraft, paid model API, Windows input/capture, or CI run was used or observed.
+
+## P01–P24 status summary
 
 Full evidence paths and test counts are in `PROGRESS.md`; implementation/test locations are summarized here.
 
 | Area | Tasks | Status |
 |---|---|---|
 | Foundation | P01–P04 | done-offline — single Runtime assembly, execution/effect barrier, atomic ownership, recovery budget |
-| Bridge | P05–P09 | P05/P06/P09 done-offline; P07/P08 done-limited (26.3 data absent; synthetic projectors are test-only and are not connected to relay/observer or WorldState) |
+| Bridge | P05–P09 | P05/P06/P09 done-offline; P07/P08 done-limited (26.3 data absent; synthetic projectors are test-only, labelled synthetic-only, and are not connected to relay/observer or WorldState) |
 | Motion | P10–P13 | P10/P11 done-limited (3D contract + simulated Motor; some legacy 2D tools); public `simulated-3d` profile; P12/P13 done-offline (realtime control, simulated body) |
-| Control/Agent | P14–P18 | P14–P16 done-offline (CLI, web, security/SSE); P17/P18 done-limited (injected provider transport, limited skill lifecycle) |
+| Control/Agent | P14–P18 | P14–P16 done-offline (CLI, web, security/SSE); P17/P18 done-limited (injected provider transport, bounded skill lifecycle) |
 | Knowledge/Diagnostics | P19–P21 | P19/P20 done-limited (fixture knowledge, bounded scoped memory with optional z); P21 done-offline (doctor/trace/replay) |
-| Verification | P22/P23 | done-offline — real headless Playwright E2E with fixture body; combined faults + 60 virtual-minute soak + wall-clock smoke |
-| Finalization | P24 | **not-done / external review handoff** — docs, trace scripts, doctor endpoint, Round 1 and Round 2 complete; internal Rounds 3–5 stopped by user instruction and replaced by external review |
+| Verification | P22/P23 | done-offline — real headless Playwright E2E with fixture body (9 tests); combined faults + 60 virtual-minute soak + wall-clock smoke |
+| Finalization | P24 | done-offline — docs, trace scripts, doctor endpoint and all five review rounds complete; Rounds 4–5 ran concurrently per user instruction and final fixes/validation are on `f1c5f90` |
 
 ## Exact 26.3 data gaps
 
@@ -67,15 +70,15 @@ The installed dependency tree does not provide verified Minecraft 26.3 codec/dom
 - **No Windows input/capture:** the helper/driver is tested through injected transport and static/unit checks only; no real SendInput, SDL3 calibration, or desktop capture.
 - **No paid model API:** OpenAI/Anthropic paths use injected transports/fixtures; all network/model gates default off. No real model request was made.
 - **Motor is simulated only:** the 3D path has simulated-body evidence (walk/turn/stop/short jump); `stepUp`/`controlledDrop` remain disabled and there is no real 26.3 physics/terrain evidence.
-- **E2E body is a fixture:** P22 starts a real Fastify server, real Chromium and real CLI, but the body is the legacy fake bridge (not a Minecraft client, and not the 3D `SimulatedBodyAdapter`). This is browser/control-flow evidence only.
+- **E2E body is a fixture/simulated body:** P22 starts a real Fastify server, real Chromium and real CLI. Most flows use the legacy fake bridge; the simulated-3d flow uses the simulated 3D body and asserts the runtime profile/body. None is a Minecraft client. This is browser/control-flow evidence only.
 - **No screenshots:** E2E explicitly disables screenshots, video and traces; no visual evidence is claimed.
-- **CI unobserved:** Node 22 and Playwright pass locally; cloud CI results are not known.
+- **CI unobserved:** Node 22 and Playwright pass locally, and the workflow defines a Playwright browser job, but cloud CI results are not known.
 
-## External review handoff (P24)
+## Five-round completion and final verification
 
-Per the user's latest instruction, the internal five-round review contract was stopped after Round 2 and is replaced by the user's external review. **Rounds 3–5 were not run internally.** P24 therefore remains `not-done`; findings returned by the external review will be fixed with targeted regression, and only then can P24 be closed.
+All five rounds in `REVIEW.md` were completed internally. Round 1–2 ended at checkpoint `17cdf06`; Round 3 ended at `ee9eea7`. At the user's explicit instruction, Round 4 and Round 5 were then run **concurrently on the same tree to accelerate delivery** instead of the default sequential order. Every finding accepted in those rounds was fixed (or recorded as the unchanged external 26.3 boundary), and a single full post-fix validation was executed serially on `f1c5f90`; see the final verification snapshot above.
 
-`REVIEW_SCOPE.md` is the handoff document: architecture chains, P01–P23 status, review focus areas, known limitations, and the items that are deliberately unimplemented or externally blocked. The real 26.3 relay→decoder→projector→WorldState chain remains blocked on missing 26.3 schema/native/data; the current observer emits frame metadata only.
+`REVIEW_SCOPE.md` remains the orientation document: architecture chains, P01–P24 status, review focus areas, known limitations, and the items that are deliberately unimplemented or externally blocked. The real 26.3 relay→decoder→projector→WorldState chain remains blocked on missing 26.3 schema/native/data; the current observer emits frame metadata only.
 
 ## Honest limits that must not be misreported
 
@@ -94,7 +97,7 @@ Assertions target contracts or observable behavior; fixture provenance stays lab
 
 - Start: `ccb9f8e` (`p24-final`, the worktree was first created at `c27dcfa` and fast-forwarded to this actual HEAD).
 - Round 1 code/tests: `cf092ad`.
-- End state: the documentation commit containing this section (P24 remains in progress; Rounds 2–5 not started).
+- End state: Round 1 checkpoint (historical; the final state is `f1c5f90`).
 - Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only.
 
 Whole-repo scan covered `src/**`, real CLI/server/web entrypoints, `tests/**`, `configs/**`, `package.json`, Playwright/CI/native-helper configuration, and the current docs. Diffs and symbol references were used for orientation, then the following chains were re-traced from source:
@@ -117,7 +120,7 @@ Whole-repo scan covered `src/**`, real CLI/server/web entrypoints, `tests/**`, `
 | R1-7 | Medium | `SQLiteStore.addActionReceipt`/`updateActionReceipt` throws; `src/control/service.ts:233`, `:250` | A failed pending-receipt write returned `accepted/in-flight` for work that never started; a failed completion write returned `terminal` even though no durable receipt existed. | **fixed** — `unknown` with `receipt-unavailable` / `receipt-write-failed`; two control-service regressions assert no goal write and pending receipt respectively. |
 | R1-8 | Medium | Non-default `nav`/`motor` passed to `createRuntime`; `src/execution/factory.ts`, `src/motor/controller.ts:65`, `:323` | Both injection seams were decorative: custom nav was not consulted, and `MotionController` always constructed `Motor3D` directly. | **fixed** — nav passed into skill context for the planar path, and `MotorFactory` wired through `MotionController.executeStep`; regressions assert the injected nav and Motor factory are used. |
 | R1-9 | Low | Default legacy `simulated` profile; tool `find_skills`/`availableSkills`; public `navigate_to` schema requires x/y/z. `src/agent/router.ts:104` | `navigate_to` was advertised on the legacy profile but always failed with `body-adapter-unavailable`/argument errors; the catalog overstated capabilities. | **fixed** — legacy profile no longer advertises navigate_to, `find_skills` filters by the same available set, and admission rejects it; regression (`does not advertise navigate_to on the legacy profile...`). |
-| R1-10 | High (external boundary) | `src/bridge/observer/bounded.ts:254` emits frame metadata only; `src/bridge/protocol/projection-pipeline.ts` is used only by tests; `WorldState` has no runtime producer. | No production socket→projection→WorldState/tools chain exists. The relay/observer can forward and report framing state, but there is no decoded 26.3 packet payload to project. | **blocked-external** — missing verified 26.3 schema/native/data and decodable packet payloads; the pipeline is explicitly test-only and the docs were corrected (`REVIEW_SCOPE.md`). No fake projection was wired. Remaining P08/P24 work; see the 26.3 gaps above. |
+| R1-10 | High (external boundary) | `src/bridge/observer/bounded.ts:254` emits frame metadata only; `src/bridge/protocol/projection-pipeline.ts` is used only by tests; `WorldState` has no runtime producer. | No production socket→projection→WorldState/tools chain exists. The relay/observer can forward and report framing state, but there is no decoded 26.3 packet payload to project. | **blocked-external** — missing verified 26.3 schema/native/data and decodable packet payloads; the pipeline is explicitly test-only and the docs were corrected (`REVIEW_SCOPE.md`). No fake projection was wired. Remaining P08 work; see the 26.3 gaps above. |
 
 No finding was dismissed as false-premise. The only external block remains the real 26.3 decode/projection boundary; live client/server/Windows/API evidence is still outside the authorized environment.
 
@@ -126,15 +129,15 @@ No finding was dismissed as false-premise. The only external block remains the r
 - `npm run typecheck` — pass after each fix set.
 - `npx vitest run --config vitest.config.ts tests/integration/integration-wiring.test.ts tests/unit/control-service.test.ts` — pass (34 tests at that point; the file now has 23 integration tests).
 - `npx vitest run --config vitest.config.ts tests/integration/integration-wiring.test.ts tests/unit/p10-p13.test.ts` — 58 tests pass.
-- `npm run test:offline` — **46 files / 394 tests pass**.
-- `npm run test:v:offline` — integration **10 files / 56 tests**, soak **2 files / 2 tests**, diagnostics **2 files / 15 tests** pass.
+- `npm run test:offline` — **46 files / 394 tests pass** (Round 1 checkpoint, historical).
+- `npm run test:v:offline` — integration **10 files / 56 tests**, soak **2 files / 2 tests**, diagnostics **2 files / 15 tests** pass (Round 1 checkpoint, historical).
 - `npm run build` — pass; `node dist/cli/main.js doctor --profile simulated-3d` reports a simulated 3D body and no live claim.
 - Public-entry smoke: real `serve --profile simulated-3d --no-pairing` process; `/api/v1/status` returned `body.mode: "3d"`, `threeDimensional: true`, `z: 0.5`, and `/api/v1/capabilities` listed the 3D skills. Process and temporary DB were cleaned up.
 - Full standard checks (`build:web`, `test:web:e2e`, `demo:offline`, default `doctor`) were rerun after the fixes; results are in the verification snapshot above.
 
 ### Remaining affected tasks
 
-- P24 remains **not-done**: internal Round 3–5 stopped after Round 2 and replaced by the user's external review.
+- At Round 1 time P24 was still in progress; it is now `done-offline` after Rounds 2–5 and the final `f1c5f90` validation.
 - P08 remains **done-limited / externally blocked** for real 26.3 projection; the observer emits no typed packet payload, and synthetic projectors are not a production substitute.
 - P02/P03/P11/P13/P20 moved from the previously limited/injected-only state to an explicit public `simulated-3d` assembly; they remain simulated evidence, not real-client validation.
 - The `simulated-3d` fixture body and the legacy fake bridge can still carry separate state for legacy-only tools (place/look/chat); this is documented as a fixture limitation, not production capability.
@@ -145,7 +148,7 @@ No finding was dismissed as false-premise. The only external block remains the r
 
 - Start: `033f29a` (`p24-final`, Round 1 merged), Worktree `agent-a19cecd12f9b7c9d1`, clean.
 - Round 2 code/tests: `b6d7f42`.
-- End state: this documentation commit (P24 remains in progress; Rounds 3–5 not started).
+- End state: Round 2 checkpoint `17cdf06` (historical; the final state is `f1c5f90`).
 - Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only. No real Minecraft, Windows input/capture or model API was used.
 
 Whole-repo review, with the following chains re-traced and fault-injected:
@@ -181,14 +184,125 @@ No finding was dismissed as false-premise. One behavior was deliberately retaine
 - `npm run typecheck` — pass.
 - `npm run build` — pass (dist rebuilt so child-process tests execute).
 - `npm run build:web` — pass (Vite 5.4.11).
-- `npm run test:offline` — **47 files / 409 tests pass**, 0 skipped.
-- `npm run test:v:offline` — integration **10 files / 56 tests**, soak **2 files / 2 tests**, diagnostics **2 files / 15 tests** pass.
-- `npm run test:web:e2e` — 2 Chromium tests pass (headless, no screenshots/video/trace).
+- `npm run test:offline` — **47 files / 409 tests pass** (Round 2 checkpoint, historical).
+- `npm run test:v:offline` — integration **10 files / 56 tests**, soak **2 files / 2 tests**, diagnostics **2 files / 15 tests** pass (Round 2 checkpoint, historical).
+- `npm run test:web:e2e` — 2 Chromium tests pass (Round 2 checkpoint, historical; final suite has 9).
 - `npm run demo:offline` — 6/6 scenarios pass; crash-recovery still leaves the ambiguous effect pending rather than promoting it.
 - `npm run doctor` — exit 0, truthful `degraded`; `npm run doctor -- --profile simulated-3d` — exit 0, simulated 3D body, no live claim.
 
 ### Remaining affected tasks
 
-- P24 remains **not-done**: internal Rounds 3–5 were stopped after Round 2 and replaced by the user's external review.
+- At Round 2 time P24 was still in progress; it is now `done-offline` after Rounds 3–5 and the final `f1c5f90` validation.
 - P08/P10/P11/P17/P18/P19/P20 remain `done-limited`/externally blocked exactly as recorded above; Round 2 changed lifecycle/fencing behavior but did not create 26.3 decode or live evidence.
 - No new external block was introduced. The bridge-service control gate is test-verified; a production attachment still needs its operator/observation arming step, which is the existing P09 contract.
+
+## Review Round 3
+
+### State and coverage
+
+- Start: `17cdf06` (Round 1–2 checkpoint).
+- Round 3 code/tests ended at `ee9eea7`.
+- End state for the whole batch: `f1c5f90` after Rounds 4–5 and final fixes.
+- Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only.
+
+Whole-repo review across `src/**`, entrypoints, tests, configs, scripts and current docs. The end-to-end chains re-traced for this round were:
+
+1. socket → relay → observer worker → framing/compression → bounded queue → observation events, including overflow, stop/restart and IPC control.
+2. synthetic observation envelope → projection pipeline → WorldState → tool-visible consumer, including scope, epoch, sequence and gap handling; real 26.3 decode remains unavailable.
+3. adapter candidate manifest → artifact provenance → capability matrix → runtime/profile gate.
+4. control command → scoped execution/receipt → recovery/dedupe → stable-scope reads → SSE.
+5. provider request/stream → canonical history → tool-call pairing → retry/abort → knowledge query scope.
+6. CLI/web entry → auth/pairing/redaction → strict config → bridge/service startup and truthful capabilities.
+
+### Findings and decisions
+
+| Severity | Theme | Finding and actual impact | Decision |
+|---|---|---|---|
+| High | Observer truthfulness and recovery | Observer state was not per-TCP-session, compression could be reported as `disabled` when it was actually unknown, and stopped directions could still emit. An operator/consumer could treat guessed framing as real. Per-session contexts/epochs, `unknown` compression, start/stop recovery, stopped-direction suppression and per-direction park anchoring were enforced. | fixed |
+| High | Relay/service control and IPC | Attach/ack queues and lifetimes were not fully bounded; `send() === false` was treated as rejection although it means queued; arm could be accepted during an overflow episode; relay/service children inherited more environment than needed; the handshake limit could bound more than the handshake frame; service capabilities and non-ready CLI state were not truthful. Queues, deadlines, arm refusal, env allowlists, handshake scoping and readiness/capability reporting were corrected. | fixed |
+| High | Projection and WorldState fencing | Stale/old-epoch snapshots, non-advancing sequences, gaps and foreign accounts could influence consumer state; unknown nested variable-length data could be silently stripped; resync anchors were not scope/epoch-bound. Scope binding, anti-replay resync validation, recursion-safe rejection, account scope and bounded dedupe were added. | fixed |
+| High | Adapter manifest trust | Capability/provenance declarations could be accepted without matching installed artifacts. Content/hash/role/version verification, data-identity checks, path containment (absolute/traversal/symlink) and fail-closed options were enforced; an all-unsupported matrix is never reported as available. | fixed |
+| High | Control/data scope isolation | Goals, executions, effects, events, places, memories and SSE snapshots could leak across stable scopes; receipt scope omitted world/dimension; recovery/proposal dedupe could cross accounts; memory timestamps used a monotonic uptime clock. Stable-scope filtering, durable execution context, scoped recovery/dedupe, world/dimension receipt scope, wall-clock timestamps and pagination/bounded reads were added. | fixed |
+| Medium | CLI, pairing and secret handling | Pairing codes were shorter than the stated strength, empty codes were accepted, failed attempts were not per-source locked out, utility commands could create a fake runtime instead of taking ownership/read-only, attach doctor was not authenticated, child env was broad, and redaction missed pairing/session identifiers. 128-bit codes, empty-code rejection, lockout, ownership/read-only utility paths, authenticated attach doctor, minimal child env, redaction and explicit non-TTY pairing requirements were implemented. | fixed |
+| High | Provider and knowledge validation | Malformed/truncated provider responses could look like terminal success; streamed tool-call ids/arguments were not fully validated; the write ledger persisted across runs; abort could leave incomplete tool groups; provider switching and canonical history needed bounded, paired trimming; knowledge lacked runtime scope/validity/conflict handling. Response/truncation rejection, per-run ledger reset, complete abort results, switchable providers with canonical history, scope injection and bounded group eviction were added. | fixed |
+| Medium | Motor/skills/Windows gates | `INPUT_SKILLS` and advertised skills were not consistently derived from manifests, so `explore_area` could escape the input gate or legacy 2D could advertise world-3D skills; Windows capabilities were not derived from driver/capture/dry-run state; capture gating was not independent across composite/driver/helper. Manifest-derived skills, fail-closed unknown skills, legacy advertisement filtering, derived Windows capabilities, dry-run default and independent capture gates were implemented. | fixed |
+| High (external boundary) | Real 26.3 projection | The relay/observer still emit frame metadata only; no verified 26.3 schema/native/data exists to decode payloads and feed the real projection/WorldState chain. The synthetic observer→pipeline→consumer assembly test was explicitly labelled synthetic-only rather than implying production evidence. | blocked-external — missing 26.3 schema/native/data; no fake decode was wired |
+
+The recorded Round 3 outcomes are fixed and blocked-external; no false-premise outcome was recorded. All fixed items above were verified by targeted regressions; the real 26.3 boundary is the only external block.
+
+### Targeted regressions
+
+- `tests/unit/p24-round3-adapter.test.ts` — artifact/provenance/hash/path verification and fail-closed profile gate.
+- `tests/unit/p24-round3-cli-security.test.ts` — ownership/read-only utility commands, minimal child env, pairing/session redaction, non-TTY pairing code and 128-bit codes.
+- `tests/unit/p24-round3-config.test.ts` — strict config keys, bridge target/gate semantics, arm reporting, service readiness and Node/CI ordering.
+- `tests/unit/p24-round3-data.test.ts` — wall-clock memory, stable-scope reads/SSE, receipt world/dimension, execution/goal isolation, runtime-profile reporting and bounded diagnostics.
+- `tests/unit/p24-round3-observer.test.ts` — compression truthfulness, sticky global gaps, bounded host accounting and relay backpressure.
+- `tests/unit/p24-round3-projection.test.ts` — per-direction uncertainty, resync/epoch fencing, nested unknown rejection, WorldState sequence/gap/account fencing.
+- `tests/unit/p24-round3-provider.test.ts` — response shape/truncation, streamed tool-call ids, per-run ledger, abort pairing, provider switch, bounded history and sliding retry.
+- `tests/integration/synthetic-observation-chain.test.ts` — synthetic-only assembly, stale epoch/gap fencing and forged-provenance refusal.
+
+The authoritative full-suite counts are the final `f1c5f90` snapshot above.
+
+## Review Round 4
+
+### State and coverage
+
+- Start: after the Round 3 checkpoint `ee9eea7`.
+- Executed **concurrently with Round 5 at the user's explicit instruction to speed up delivery**; both rounds operated on the same working tree.
+- End state: final fixes and validation on `f1c5f90`.
+- Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only.
+
+Coverage focused on real user flows and test credibility across the serving CLI, browser console, headless E2E, strict configs, bridge fixtures and CI workflow: pairing and bearer modes, SSE recovery, pause/stop feedback, provider-unavailable turns, simulated-3d rendering, isolated `serve --db` processes, gateway truthfulness and process cleanup after failed startup.
+
+### Findings and decisions
+
+| Severity | Theme | Finding and actual impact | Decision |
+|---|---|---|---|
+| High | Serve config/provider gate | `allowModelNetwork: true` without a provider could start a scripted provider while implying network capability, and provider selection without the gate could never be honored. The gate is now non-inert: open gate without a provider fails (`model-provider-required`), provider without the gate fails (`model-network-gate-disabled`), missing key fails, and startup reports effective provider metadata. | fixed |
+| Medium | Browser auth-mode truthfulness | In bearer-only mode the browser could show a pairing workflow that could never succeed. A public non-secret `/api/v1/auth-mode` exposes `pairing` / `bearer-only` / `loopback-open`; token mode now shows “browser access disabled; use the CLI bearer” and keeps unauthenticated reads/writes refused. | fixed |
+| Medium | SSE, pause and provider feedback | Reconnect behavior could be asserted without proving cursor retention/no loss; pause could allow new work to appear accepted; provider-unavailable turns could look like a green terminal receipt. E2E now asserts a retained non-zero cursor with no event loss, visible pause rejection and a provider warning. | fixed |
+| Medium | User-flow/test credibility | The serving flow was previously exercised mostly through harness code. A real compiled `serve --db` process is now tested with isolated DB/port and clean shutdown; simulated-3d E2E asserts runtime profile and 3D body; the synthetic projection chain is marked synthetic-only. | fixed |
+| Medium | Bridge fixture/config ergonomics | The default bridge command depended on a config that cannot run fixture mode, and the fixture/protocol scripts were not clearly separated. A dedicated `configs/bridge-fixture.example.json` and `bridge:fixture` script were added; `bridge:protocol` remains the version/protocol inspection path; fixture mode always uses the loopback echo target and never the configured real target. | fixed |
+| Medium | CI ordering and browser coverage | Dist-dependent integration tests could skip when `dist/` was absent, and the workflow did not define a browser E2E job. The workflow builds before those tests and defines a Playwright Chromium job. This is a workflow definition only; CI was not run/observed. | fixed |
+
+The recorded Round 4 outcomes are fixed; no false-premise outcome was recorded. Live 26.3, Windows and paid-model behavior remain blocked-external as before; no Round 4 change claims them.
+
+### Targeted regressions
+
+- `tests/unit/p24-round4-cli.test.ts` — merged `--db` handling, non-inert model gate, failed-startup release of lock/listeners, and default bridge fixture.
+- `tests/e2e/control-flow.spec.ts` — token/bearer-only mode and public auth-mode, real compiled `serve --db` flow, simulated-3d profile/body, pause rejection, provider warning and SSE reconnect cursor retention.
+
+The authoritative full-suite counts are the final `f1c5f90` snapshot above.
+
+## Review Round 5
+
+### State and coverage
+
+- Start: after the Round 3 checkpoint `ee9eea7`, sharing the tree with Round 4.
+- Executed **concurrently with Round 4 at the user's explicit instruction to speed up delivery**.
+- End state: final fixes and validation on `f1c5f90`.
+- Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only.
+
+Independent re-read of the whole system after the earlier fixes, emphasizing cross-round regressions, observer lifecycle/epochs, IPC semantics, projection resync fencing, skill/input gating, capability/profile reporting, resource bounds and final build artifacts.
+
+### Findings and decisions
+
+| Severity | Theme | Finding and actual impact | Decision |
+|---|---|---|---|
+| High | Observer per-session isolation and recovery | Two concurrent TCP sessions, or a later sequential session, could inherit observer epochs/frames; attach backpressure could leave a recovered observer without a fresh host/epoch; ack tracking could measure absolute post time rather than progress; a direction stopped by backpressure could still produce observations. Per-session context/epoch isolation, fresh host/epoch recovery, progress-based ack deadlines and stopped-direction suppression were enforced. | fixed |
+| High | IPC queued-vs-rejected semantics | `send() === false` means queued, not rejected. Treating it as failure produced false gaps/overflow and could reject a request that was actually sent once. Publisher, supervisor and service paths now treat false as queued exactly once; arm is refused during an active overflow/unknown episode and re-revoked after a later drop. | fixed |
+| High | Projection scope and resync anti-replay | A pipeline could bind to the first projection without rejecting a later different account/world/dimension/server profile; non-decimal or non-advancing resync anchors could move the fence. Scope binding now rejects differing scopes, and resync anchors must be decimal and advancing. | fixed |
+| High | Input-skill gating | `INPUT_SKILLS` could miss a manifest-declared input skill (`explore_area`) or admit an unknown skill; legacy 2D could advertise world-3D skills. Skills are derived from manifests, unknown skills fail closed, `explore_area` is gated, and legacy 2D advertisement is filtered. | fixed |
+| Medium | Capability/profile truthfulness | `runtimeProfile` was conflated with `serverProfileId`; Windows capabilities were not derived from driver enabled/capture/dry-run state; capture gating was not independent at composite/driver/helper. Reporting is now separated, capabilities are derived, dry-run is the default, and capture gates are independent. | fixed |
+| Medium | Service command/start truthfulness | Service capabilities could report hardcoded profile/network/target; observer commands with no observer could look supported; start failure could be reported as success. Capabilities now report the real configured values, unsupported commands are explicit, and the CLI fails when the service never reaches a usable state. | fixed |
+| Medium | Handshake and global-park bounds | The handshake limit could apply beyond the handshake frame, and a global park could resume an un-anchored direction after only one direction reset. The limit is scoped to the handshake frame, and both directions stay parked until each is anchored. | fixed |
+| High (external boundary) | Real 26.3/live evidence | No real 26.3 decode/projection or live client/server/Windows/model evidence exists in this batch. The scope/anti-replay fixes harden the synthetic path only; they do not create real packet payloads. | blocked-external — missing 26.3 schema/native/data and prohibited live environment |
+
+The recorded Round 5 outcomes are fixed and blocked-external; no false-premise outcome was recorded. All fixed items were covered by targeted regressions, and the final full validation was executed after these fixes on `f1c5f90`.
+
+### Targeted regressions
+
+- `tests/unit/p24-round5-observer.test.ts` — concurrent/sequential session isolation, recovered observer epoch, ack progress, queued-vs-rejected IPC, arm refusal, stopped directions, global park anchoring and service capability truthfulness.
+- `tests/unit/p24-round5-input-gate.test.ts` — manifest-derived input skills, fail-closed unknown skills, `explore_area` gating and legacy-2D advertisement filtering.
+- `tests/unit/p24-round3-projection.test.ts` — scope binding and resync anti-replay checks added during the Round 5 pass.
+- Final serial run on `f1c5f90`: typecheck, build, build:web, 58 files / 578 offline tests, 98 versioned/soak/diagnostics tests, 9/9 E2E, 6/6 demo, and both doctor profiles. See the final snapshot above.

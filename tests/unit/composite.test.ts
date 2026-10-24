@@ -50,6 +50,17 @@ describe('CompositeClientBridge', () => {
     await bridge.shutdown();
   });
 
+  it('never advertises protocol forwarding, which this composite does not implement', () => {
+    const protocol = new ProtocolSession('fixture-session');
+    const bridge = new CompositeClientBridge({
+      protocol,
+      profile: { profile: 'client-offline', allowMinecraftUpstream: true },
+    });
+    expect(bridge.capabilities.protocolObservation).toBe(true);
+    expect(bridge.capabilities.protocolForwarding).toBe(false);
+    expect(bridge.capabilities.limitations).toContain('protocol-forwarding-unavailable');
+  });
+
   it('never grants real client actions to simulated or unsupported profiles', async () => {
     const protocol = new ProtocolSession('fixture-session');
     const simulated = new CompositeClientBridge({

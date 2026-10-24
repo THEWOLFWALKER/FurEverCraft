@@ -35,6 +35,29 @@ export function commandScopeOf(context: unknown): string {
 const terminal = new Set(['succeeded', 'failed', 'canceled']);
 /** Operator lifecycle commands must take effect even while paused; a replay after stop must not unpause. */
 const lifecycleCommands = new Set<CommandRequest['command']>(['pause', 'resume', 'stop', 'quit']);
+/** Provider stop reasons that represent a complete, successful answer. */
+const providerSuccessStops = new Set(['stop', 'end_turn', 'stop_sequence']);
+type ProviderStopFailure = { state: 'unknown' | 'rejected'; code: string };
+/** Map a non-success stop reason to an explicit uncertain/rejected receipt instead of terminal. */
+function providerStopFailure(stopReason: unknown): ProviderStopFailure | undefined {
+  if (typeof stopReason !== 'string' || providerSuccessStops.has(stopReason)) return undefined;
+  if (stopReason === 'unavailable') return { state: 'unknown', code: 'provider-unavailable' };
+  if (stopReason === 'cancel' || stopReason === 'canceled' || stopReason === 'cancelled' || stopReason === 'aborted') return { state: 'rejected', code: 'provider-canceled' };
+  if (stopReason === 'length' || stopReason === 'max_tokens') return { state: 'rejected', code: 'provider-response-truncated' };
+  if (stopReason === 'max_turns') return { state: 'rejected', code: 'provider-max-turns' };
+  return { state: 'rejected', code: `provider-unexpected-stop:${stopReason}` };
+}
+type CancelFailure = { executionId: string; error: string };
+type CancelReport = {
+  /** Executions observed in a terminal canceled state after the cancel request. */
+  canceled: string[];
+  /** Cancel requests that errored or settled in another terminal state. */
+  failed: CancelFailure[];
+  /** Non-terminal executions whose cancellation is still in progress or unconfirmed. */
+  cancelRequested: CancelFailure[];
+  /** Every execution id a release attempt should cover (internal, not part of the receipt). */
+  attempted: string[];
+};
 
 export class ControlService {
   private paused = false;
@@ -349,7 +372,18 @@ export class ControlService {
         const result = this.runtime.store.reviseGoal(p.goalId, p.expectedRevision ?? request.expectedRevision ?? 0, p.change);
         return { requestId: request.requestId, command: request.command, state: 'terminal', result, payloadHash: '' };
       }
-      case 'message': { const p = MessagePayloadSchema.parse(payload); if (this.paused) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'paused', result: { queued: false }, payloadHash: '' }; const run = await this.runtime.loop.run([{ role: 'user', content: p.text }], undefined, this.abortSignal, { goalId: p.goalId, goalRevision: p.goalRevision, store: this.runtime.store, owner: this.runtime.ownerId }); if (this.stopping) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', result: { queued: false }, payloadHash: '' }; if (run.response.stopReason === 'goal-revision-conflict') return { requestId: request.requestId, command: request.command, state: 'conflict', code: 'goal-revision-conflict', result: run, payloadHash: '' }; return { requestId: request.requestId, command: request.command, state: 'terminal', result: run, payloadHash: '' }; }
+      case 'message': {
+        const p = MessagePayloadSchema.parse(payload);
+        if (this.paused) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'paused', result: { queued: false }, payloadHash: '' };
+        const run = await this.runtime.loop.run([{ role: 'user', content: p.text }], undefined, this.abortSignal, { goalId: p.goalId, goalRevision: p.goalRevision, store: this.runtime.store, owner: this.runtime.ownerId });
+        if (this.stopping) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', result: { queued: false }, payloadHash: '' };
+        if (run.response.stopReason === 'goal-revision-conflict') return { requestId: request.requestId, command: request.command, state: 'conflict', code: 'goal-revision-conflict', result: run, payloadHash: '' };
+        // A completed provider call is not always a successful answer: an unavailable provider,
+        // truncation, cancellation or turn-budget exhaustion must not be labelled terminal.
+        const failure = providerStopFailure(run.response.stopReason);
+        if (failure) return { requestId: request.requestId, command: request.command, ...failure, result: run, payloadHash: '' };
+        return { requestId: request.requestId, command: request.command, state: 'terminal', result: run, payloadHash: '' };
+      }
       case 'chat': { const p = ChatPayloadSchema.parse(payload); if (this.paused) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'paused', payloadHash: '' }; const result = await this.runtime.router.invoke({ id: request.requestId, name: 'send_chat', arguments: JSON.stringify({ text: p.text }) }, { signal: this.abortSignal, owner: this.runtime.ownerId }); if (this.stopping) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', result, payloadHash: '' }; return { requestId: request.requestId, command: request.command, state: result.ok ? 'terminal' : 'unknown', result, payloadHash: '' }; }
       case 'pause': {
         // Abort first so the pausing event precedes any command receipt that reflects the abort.
@@ -391,12 +425,17 @@ export class ControlService {
         }
       }
       case 'stop': {
-        if (this.stopping) { const canceled = await this.cancelActiveExecutions(); const body = await this.releaseBody(); return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled, body }, payloadHash: '' }; }
+        if (this.stopping) {
+          const cancellation = await this.cancelActiveExecutions();
+          const body = await this.releaseBody(cancellation.attempted);
+          return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled: cancellation.canceled, failed: cancellation.failed, cancelRequested: cancellation.cancelRequested, body }, payloadHash: '' };
+        }
         this.abortActive(); this.stopping = true; this.paused = true; this.runtime.scheduler.close(); this.runtime.lifecycle.humanControl('stop');
         // Capture what was in flight: the aborted message receipt settles before the stop event is published.
         await this.settled([...this.activeRuns.values()]);
-        const canceled = await this.cancelActiveExecutions(); const body = await this.releaseBody();
-        this.runtime.session.events.publish('runtime.stopping', { reason: 'stop', canceled, body }, true); return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled, body }, payloadHash: '' };
+        const cancellation = await this.cancelActiveExecutions(); const body = await this.releaseBody(cancellation.attempted);
+        this.runtime.session.events.publish('runtime.stopping', { reason: 'stop', canceled: cancellation.canceled, failed: cancellation.failed, cancelRequested: cancellation.cancelRequested, body }, true);
+        return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled: cancellation.canceled, failed: cancellation.failed, cancelRequested: cancellation.cancelRequested, body }, payloadHash: '' };
       }
       case 'cancel': {
         const p = CancelPayloadSchema.parse(payload);
@@ -411,42 +450,91 @@ export class ControlService {
       case 'quit': {
         this.abortActive(); this.quitting = true; this.stopping = true; this.paused = true; this.runtime.scheduler.close(); this.runtime.lifecycle.humanControl('quit');
         await this.settled([...this.activeRuns.values()]);
-        const canceled = await this.cancelActiveExecutions(); const body = await this.releaseBody();
-        this.runtime.session.events.publish('runtime.shutdown-requested', { canceled, body }, true);
-        // The quit decision is committed before close() so its receipt and control event stay
-        // durable; command() returns this same result without committing again.
-        const result: CommandResult = { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled, body, closed: true }, payloadHash: '' };
-        // The quit decision and its control event are durable before close so a replayed read
-        // after restart sees a terminal receipt, not a pending one.
+        const cancellation = await this.cancelActiveExecutions(); const body = await this.releaseBody(cancellation.attempted);
+        this.runtime.session.events.publish('runtime.shutdown-requested', { canceled: cancellation.canceled, failed: cancellation.failed, cancelRequested: cancellation.cancelRequested, body }, true);
+        // The shutdown decision is performed regardless of whether its receipt can be persisted,
+        // but `accepted` is only claimed after the durable write succeeds. The quit result is
+        // returned directly by command() so it is not committed a second time.
+        const shutdown = { stopping: true, canceled: cancellation.canceled, failed: cancellation.failed, cancelRequested: cancellation.cancelRequested, body };
         const scope = this.commandScope();
-        try { this.runtime.store.updateActionReceipt(scope, request.requestId, 'completed', result.result); } catch { /* store may already be unavailable */ }
-        this.runtime.session.events.publish('control.quit', { requestId: request.requestId, state: 'accepted', result: result.result }, true);
-        this.committedRequestId = request.requestId;
+        let state: CommandResult['state'] = 'accepted';
+        let code: string | undefined;
+        try {
+          this.runtime.store.updateActionReceipt(scope, request.requestId, 'completed', shutdown);
+          this.runtime.session.events.publish('control.quit', { requestId: request.requestId, state: 'accepted', result: shutdown }, true);
+          this.committedRequestId = request.requestId;
+        } catch (error) {
+          // The command already decided to shut down, but the durable receipt (or its control
+          // event) did not commit: report unknown with the write error, never accepted.
+          state = 'unknown';
+          code = error instanceof Error && error.message ? error.message : 'quit-receipt-write-failed';
+        }
         const closed = this.closeRuntime(); this.closed = true;
-        return { ...result, result: { stopping: true, canceled, body, closed } };
+        return { requestId: request.requestId, command: request.command, state, ...(code ? { code } : {}), result: { ...shutdown, closed }, payloadHash: '' };
       }
     }
   }
 
-  /** Best-effort release of held body inputs; failures are reported, not thrown. */
-  private async releaseBody(): Promise<{ released: boolean; error?: string }> {
+  /**
+   * Release held body input through every real channel that exists. The attached BodyAdapter is
+   * the authoritative owner of 3D input and is released with the lease owner tokens the Motor
+   * controller used; the bridge helper methods are the legacy/OS channel. With neither channel,
+   * release is explicitly unavailable instead of being reported as success.
+   */
+  private async releaseBody(ownerTokens: readonly string[] = []): Promise<{ released: boolean; error?: string }> {
+    const adapter = this.runtime.bodyAdapter;
     const bridge = this.runtime.bridge as { releaseOwnedInputs?: () => Promise<unknown> | unknown; stopBody?: () => Promise<unknown> | unknown };
-    try {
-      if (typeof bridge.releaseOwnedInputs === 'function') await bridge.releaseOwnedInputs();
-      else if (typeof bridge.stopBody === 'function') await bridge.stopBody();
-      return { released: true };
-    } catch (error) { return { released: false, error: error instanceof Error ? error.message : String(error) }; }
+    const errors: string[] = [];
+    let channels = 0;
+    if (adapter) {
+      channels += 1;
+      // Execution ids are the lease owner tokens submitted by the Motor controller; the runtime
+      // owner id is the process-level token. Release both so a held input cannot survive because
+      // the controller and the runtime name the same owner differently.
+      const tokens = [...new Set([...ownerTokens, this.runtime.ownerId])];
+      for (const token of tokens) {
+        try { await adapter.release(token); }
+        catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
+      }
+    }
+    if (typeof bridge.releaseOwnedInputs === 'function') {
+      channels += 1;
+      try { await bridge.releaseOwnedInputs(); }
+      catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
+    } else if (typeof bridge.stopBody === 'function') {
+      channels += 1;
+      try { await bridge.stopBody(); }
+      catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
+    }
+    if (channels === 0) return { released: false, error: 'release-channel-unavailable' };
+    return errors.length ? { released: false, error: errors.join('; ') } : { released: true };
   }
 
   /** Best-effort stop of every non-terminal execution this body scope owns; foreign rows stay untouched. */
-  private async cancelActiveExecutions(): Promise<string[]> {
+  private async cancelActiveExecutions(): Promise<CancelReport> {
     const canceled: string[] = [];
+    const failed: CancelFailure[] = [];
+    const cancelRequested: CancelFailure[] = [];
+    const attempted: string[] = [];
     for (const execution of this.runtime.store.listExecutionsForScope(this.runtime.memoryScope).items) {
       if (terminal.has(execution.status)) continue;
-      try { await this.runtime.router.invoke({ id: `stop-${execution.executionId}`, name: 'cancel_execution', arguments: JSON.stringify({ executionId: execution.executionId }) }); canceled.push(execution.executionId); }
-      catch { /* best-effort: continue stopping the remaining executions */ }
+      attempted.push(execution.executionId);
+      let error: string | undefined;
+      try {
+        const outcome = await this.runtime.router.invoke({ id: `stop-${execution.executionId}`, name: 'cancel_execution', arguments: JSON.stringify({ executionId: execution.executionId }) });
+        if (!outcome.ok) error = outcome.error ?? 'cancel-invoke-failed';
+      } catch (cause) {
+        error = cause instanceof Error ? cause.message : String(cause);
+      }
+      // Re-read the durable row: only an observed terminal state is reported as settled.
+      const status = this.runtime.store.getExecution(execution.executionId)?.status;
+      if (status === 'canceled') { canceled.push(execution.executionId); continue; }
+      if (error !== undefined) { failed.push({ executionId: execution.executionId, error }); continue; }
+      if (status && terminal.has(status)) { failed.push({ executionId: execution.executionId, error: `terminal:${status}` }); continue; }
+      // Still stopping/running/queued: a request was accepted but cancellation is not confirmed.
+      cancelRequested.push({ executionId: execution.executionId, error: status ? `status:${status}` : 'status-unknown' });
     }
-    return canceled;
+    return { canceled, failed, cancelRequested, attempted };
   }
 }
 

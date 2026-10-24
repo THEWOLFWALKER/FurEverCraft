@@ -86,10 +86,23 @@ function runScenario(scenario: ScenarioName, db: string) {
     // the lock race must never have its files removed out from under it.
     for (const suffix of ['', '-wal', '-shm']) { try { rmSync(`${db}${suffix}`, { force: true }); } catch { /* best effort */ } }
     store = new SQLiteStore(db); const bridge = new FakeClientBridge(); const runtime = new SessionRuntime(bridge, store); runtime.start();
-    if (scenario === 'autonomous') { const first = navigate(bridge, {x:2,y:0}); store.saveGoal({goalId:'goal_autonomous',revision:1,status:'active',text:'autonomous navigation'}); const next = navigate(bridge,{x:3,y:0}); const completed = first.status === 'succeeded' && next.status === 'succeeded'; if (completed) store.saveGoal({goalId:'goal_autonomous',revision:2,status:'completed',text:'autonomous navigation'}); return {scenario,outcome:completed?'completed':'failed',phases:['observe','navigate','milestone','next-task'],executionIds:[first.executionId,next.executionId],goal:store.getGoal('goal_autonomous')?.status,position:bridge.position}; }
+    if (scenario === 'autonomous') { const first = navigate(bridge, {x:2,y:0}); store.saveGoal({goalId:'goal_autonomous',revision:1,status:'active',text:'autonomous navigation'}); const next = navigate(bridge,{x:3,y:0}); const completed = first.status === 'succeeded' && next.status === 'succeeded'; if (completed) store.saveGoal({goalId:'goal_autonomous',revision:2,status:'completed',text:'autonomous navigation'}); return {scenario,outcome:completed?'completed':'failed',expectedPhases:['observe','navigate','milestone','next-task'],executionIds:[first.executionId,next.executionId],goal:store.getGoal('goal_autonomous')?.status,position:bridge.position}; }
     if (scenario === 'obstruction') { bridge.block(1,0); bridge.setUnknown(1,1); const result=navigate(bridge,{x:3,y:1},2); return {scenario,outcome:result.status,dynamicObstacle:true,unknownCell:true,replanned:result.path.length>0,budget:2,pathLength:result.path.length}; }
-    if (scenario === 'human-steering') { const old=navigate(bridge,{x:4,y:0}); const revised=navigate(bridge,{x:0,y:2}); return {scenario,outcome:revised.status,oldExecution:old.executionId,oldResult:'superseded',steering:'target-revised',position:bridge.position}; }
-    if (scenario === 'chat-ui') { const moved=navigate(bridge,{x:1,y:0}); const chat=sendChat({bridge,lease:{leaseId:'demo',owner:'demo',resources:['ui','textEntry'],until:Date.now()+1000,generation:1,contextEpoch:''},report:()=>{}},'offline hello'); return {scenario,outcome:chat.outcome,navigation:moved.status,uiHandoff:['gameplay','chat','gameplay'],unknownMessageNotRetried:true}; }
+    // Navigation is synchronous here, so the first run has already finished when the revised
+    // target starts. Report its real result; never label it superseded without observing that.
+    if (scenario === 'human-steering') { const old=navigate(bridge,{x:4,y:0}); const revised=navigate(bridge,{x:0,y:2}); return {scenario,outcome:revised.status,oldExecution:old.executionId,oldResult:old.status,...(old.reason === undefined ? {} : {oldReason:old.reason}),steering:'target-revised',target:{x:0,y:2},position:bridge.position}; }
+    if (scenario === 'chat-ui') {
+      const moved=navigate(bridge,{x:1,y:0});
+      // Derive the UI handoff and retry claim from what the bridges actually did.
+      const uiHandoff: string[] = [bridge.ui];
+      const setUi = bridge.setUi.bind(bridge);
+      bridge.setUi = ui => { setUi(ui); if (uiHandoff.at(-1) !== ui) uiHandoff.push(ui); };
+      const dispatch = bridge.dispatchChat?.bind(bridge);
+      let dispatchAttempts = 0;
+      if (dispatch) bridge.dispatchChat = (text: string) => { dispatchAttempts += 1; return dispatch(text); };
+      const chat=sendChat({bridge,lease:{leaseId:'demo',owner:'demo',resources:['ui','textEntry'],until:Date.now()+1000,generation:1,contextEpoch:''},report:()=>{}},'offline hello');
+      return {scenario,outcome:chat.outcome,navigation:moved.status,uiHandoff,dispatchAttempts,messageRetried:dispatchAttempts>1,unknownMessageNotRetried:dispatchAttempts<=1,...(chat.reason === undefined ? {} : {reason:chat.reason}),scenarioAssertions:{unknownMessageNotRetried:true}};
+    }
     if (scenario === 'crash-recovery') {
       // A real execution row must exist before the effect FK; the crash window leaves the
       // effect pending and a rebuilt runtime must reconcile it from evidence.
@@ -99,9 +112,20 @@ function runScenario(scenario: ScenarioName, db: string) {
       const before = store.pendingEffects().length; store.close(); store = undefined;
       const reopened = new SQLiteStore(db); const restored = new SessionRuntime(new FakeClientBridge(), reopened).recover();
       const after = reopened.pendingEffects().length; reopened.close();
-      return { scenario, outcome: 'reconciled', pendingBefore: before, pendingAfter: after, reconciled: restored.reconciled };
+      // Derive the outcome from the recovery result; a reconciliation may settle to
+      // ambiguous (never promote an unknown effect to confirmed).
+      const reconciled = restored.reconciled ?? [];
+      const demo = reconciled.find(item => item.effectId === 'effect_demo');
+      return { scenario, outcome: demo ? 'reconciled' : 'not-reconciled', ...(demo ? { reconciledStatus: demo.status } : {}), pendingBefore: before, pendingAfter: after, reconciled, recovered: restored.recovered };
     }
-    const protocol=new ProtocolSession('fixture-session'); const observations:unknown[]=[]; const unsubscribe=protocol.subscribe(o=>observations.push(o)); protocol.transition('LOGIN'); protocol.transition('CONFIGURATION'); protocol.transition('PLAY'); protocol.observe('position','downstream',{x:1,y:0}); protocol.close(); unsubscribe(); return {scenario,outcome:'fixture-complete',phase:protocol.phase,observations:observations.length,syntheticCapture:true,input:'fake-transport',disconnectCleanup:true};
+    const protocol=new ProtocolSession('fixture-session'); const observations:unknown[]=[]; const unsubscribe=protocol.subscribe(o=>observations.push(o)); protocol.transition('LOGIN'); protocol.transition('CONFIGURATION'); protocol.transition('PLAY'); protocol.observe('position','downstream',{x:1,y:0}); protocol.close(); unsubscribe();
+    // Prove cleanup rather than asserting it: a late observation after close must not reach
+    // the removed subscriber.
+    const deliveredBeforeLate = observations.length;
+    protocol.observe('position','downstream',{x:2,y:0});
+    const lateObservationDelivered = observations.length > deliveredBeforeLate;
+    protocol.close();
+    return {scenario,outcome:protocol.phase === 'CLOSED' && !lateObservationDelivered ? 'fixture-complete' : 'fixture-incomplete',phase:protocol.phase,observations:deliveredBeforeLate,syntheticCapture:true,input:'fake-transport',disconnectCleanup:!lateObservationDelivered,lateObservationDelivered};
   } finally {
     if (store) store.close();
     ownership?.release();

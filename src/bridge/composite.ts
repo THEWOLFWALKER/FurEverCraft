@@ -63,6 +63,9 @@ export class CompositeClientBridge {
     const limitations: string[] = [];
     const addLimit = (limitation: string) => { if (!limitations.includes(limitation)) limitations.push(limitation); };
     if (!options.protocol) addLimit('protocol-observer-unavailable');
+    // This composite exposes protocol observations only; it has no forwarding method and no
+    // byte/packet transport, so an upstream gate must never make it advertise forwarding.
+    addLimit('protocol-forwarding-unavailable');
     if (!clientProfile) addLimit('offline-profile-required-for-real-client-actions');
     if (!clientProfile || !this.profile.allowOsInput || !options.windows) addLimit('native-input-disabled');
     if (!clientProfile || !this.profile.allowScreenCapture || !options.windows) addLimit('screen-capture-disabled');
@@ -86,7 +89,8 @@ export class CompositeClientBridge {
     if (!windowHealth && !helperDryRun) addLimit('window-health-disabled');
     this.capabilities = {
       profile: this.profile.profile, protocolObservation: Boolean(options.protocol),
-      protocolForwarding: Boolean(clientProfile && options.protocol && this.profile.allowMinecraftUpstream),
+      // No forwarding is implemented by this composite; never infer it from the upstream gate.
+      protocolForwarding: false,
       nativeInput, windowHealth,
       screenCapture,
       authentication: Boolean(clientProfile && this.profile.allowAuth && options.authExecutor && options.credentials),

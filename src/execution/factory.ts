@@ -21,7 +21,6 @@ import { ManualClock, SystemClock } from '../contracts/index.js';
 import { EventHub } from '../diagnostics/events.js';
 import { ControlService } from '../control/service.js';
 import { GoalManager, TaskScheduler } from '../autonomous/tasks.js';
-import { SessionSupervisor } from '../autonomous/session.js';
 import type { ProviderMetadata } from '../control/dto.js';
 import { navigate } from '../skills/navigation.js';
 import type { MotorFactory } from '../motor/controller.js';
@@ -100,7 +99,6 @@ export type RuntimeAssembly = {
   control: ControlService;
   goalManager: import('../autonomous/tasks.js').GoalManager;
   scheduler: import('../autonomous/tasks.js').TaskScheduler;
-  sessionSupervisor: import('../autonomous/session.js').SessionSupervisor;
   /** Durable, scoped memory (places/episodes) consumed by router and control. */
   memory: MemoryService;
   memoryScope: MemoryScope;
@@ -362,7 +360,6 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
       if (!active) return;
       await loop.run([{ role: 'user', content: `Scheduler wake: ${reason}. Continue the active goal or report the next blocked step.` }], undefined, undefined, { goalId: active.goal_id, goalRevision: active.revision, store, owner: session.ownerId });
     }, 25);
-    const sessionSupervisor = new SessionSupervisor(session.events);
     // Wire the scheduler to the event stream so goal/execution/effect/session events coalesce
     // into a single wake instead of a per-tick model call.
     const unsubscribeScheduler = session.events.subscribe(event => scheduler.observe(event));
@@ -381,7 +378,7 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     let closed = false;
     const startBridgeService = bridgeService ? async () => { await bridgeService.start(); } : undefined;
     const assembly = {
-      bridge, runtimeProfile: profile, store, session, router, provider, providerMetadata, loop, clock, control, goalManager, scheduler, sessionSupervisor,
+      bridge, runtimeProfile: profile, store, session, router, provider, providerMetadata, loop, clock, control, goalManager, scheduler,
       memory, knowledge, lifecycle, ...(bodyAdapter ? { bodyAdapter } : {}),
       /** Recomputed on read so a dimension/world change closes the previous scope immediately. */
       get memoryScope() { return scopeOf(); },
@@ -394,7 +391,6 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
         unsubscribeScheduler();
         unsubscribeBridgeService?.();
         scheduler.close();
-        void sessionSupervisor.stop();
         if (bridgeService) void bridgeService.stop('runtime-close').catch(() => undefined);
         const shutdown = (bridge as { shutdown?: () => Promise<void> }).shutdown;
         if (typeof shutdown === 'function') void shutdown.call(bridge).catch(() => undefined);

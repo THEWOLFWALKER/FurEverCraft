@@ -3,7 +3,7 @@ import { FakeClientBridge } from '../../src/bridge/fake/index.js';
 import { ManualClock } from '../../src/contracts/index.js';
 import { Executor, InputArbiter } from '../../src/execution/runtime.js';
 import { SQLiteStore } from '../../src/persistence/store.js';
-import { navigateTo, observeUi, placeOne, sendChat, waitForCondition, lookAt, digOne, returnToPlace, collectNearby, gatherBlocks } from '../../src/skills/skills.js';
+import { navigateTo, observeUi, placeOne, sendChat, waitForCondition, lookAt, digOne, returnToPlace, collectNearby, gatherBlocks, exploreArea } from '../../src/skills/skills.js';
 
 describe('W05/W06 execution lifecycle and skills', () => {
   it('deduplicates proposals and reports lifecycle progress', async () => {
@@ -162,5 +162,32 @@ describe('audit regressions', () => {
     const bridge = new FakeClientBridge(); (bridge as unknown as { dispatchChat?: unknown }).dispatchChat = undefined;
     const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} };
     expect(sendChat(ctx, 'hello')).toMatchObject({ ok: false, outcome: 'failed', reason: 'chat-dispatch-unavailable' });
+  });
+  it('does not confirm an observation-only legacy explore_area as movement', async () => {
+    const bridge = new FakeClientBridge();
+    const progress: string[] = [];
+    const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: (p: { stage: string }) => progress.push(p.stage) };
+    const result = await exploreArea(ctx, 4);
+    expect(result).toMatchObject({ ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' });
+    // No dispatch was reported and no body movement happened: a snapshot is not exploration.
+    expect(progress).not.toContain('dispatch');
+    expect(bridge.position).toEqual({ x: 0, y: 0 });
+  });
+  it('fails a resolved 3D place target without an attached body instead of flattening z', async () => {
+    const bridge = new FakeClientBridge();
+    const ctx = {
+      bridge,
+      lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' },
+      report: () => {},
+      resolvePlace: () => ({ ok: true as const, target: { x: 2, y: 0, z: 3 } }),
+    };
+    const result = await returnToPlace(ctx, 'high-place');
+    expect(result).toMatchObject({ ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' });
+    expect(bridge.position).toEqual({ x: 0, y: 0 });
+
+    // A genuinely planar resolved target still uses the explicit legacy path.
+    const planar = await returnToPlace({ ...ctx, resolvePlace: () => ({ ok: true as const, target: { x: 2, y: 0 } }) }, 'planar-place');
+    expect(planar).toMatchObject({ ok: true, outcome: 'confirmed' });
+    expect(bridge.position).toEqual({ x: 2, y: 0 });
   });
 });

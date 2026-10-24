@@ -116,6 +116,8 @@ export type RelayObserverSupervisorState = {
   availability: 'degraded' | 'unknown';
   observerEpoch: string;
   sessions: Array<{ relaySessionEpoch: string; observerEpoch: string; state: unknown }>;
+  /** Number of relay sessions bound for observation (may exceed installed hosts on failure). */
+  boundSessions: number;
   [key: string]: unknown;
 };
 
@@ -192,21 +194,37 @@ export class RelayObserverSupervisor {
       availability,
       observerEpoch: this.epochValue,
       sessions,
+      boundSessions: this.sessions.size,
     };
   }
 
   /**
    * Recovery command: replace every host/worker with a fresh one (new epochs) and reset both
    * directions, so a globally parked/overflowed/backpressured observer can resume.
+   *
+   * `ensureHost` returns undefined when the worker cannot be created or started. Installing no
+   * worker for an active session is not a recovery: report it as a failure so the parent does
+   * not close admission on the strength of an observer that does not exist.
    */
-  async startObservation(): Promise<{ supported: boolean; recovered: boolean; reset: 'all-directions'; observerEpoch: string; observer: RelayObserverSupervisorState }> {
-    if (!this.enabled) return { supported: false, recovered: false, reset: 'all-directions', observerEpoch: this.epochValue, observer: this.state() };
+  async startObservation(): Promise<{ supported: boolean; recovered: boolean; reason?: string; installedHosts: number; expectedHosts: number; reset: 'all-directions'; observerEpoch: string; observer: RelayObserverSupervisorState }> {
+    if (!this.enabled) return { supported: false, recovered: false, installedHosts: 0, expectedHosts: this.sessions.size, reset: 'all-directions', observerEpoch: this.epochValue, observer: this.state() };
     this.stopped = false;
     this.paused = false;
     this.epochValue = `observer_supervisor_${randomUUID()}`;
     await this.resetHosts();
-    for (const relaySessionEpoch of this.sessions) this.ensureHost(relaySessionEpoch);
-    return { supported: true, recovered: true, reset: 'all-directions', observerEpoch: this.epochValue, observer: this.state() };
+    const expected = [...this.sessions];
+    let installed = 0;
+    for (const relaySessionEpoch of expected) if (this.ensureHost(relaySessionEpoch)) installed += 1;
+    // A partial install is also an incomplete recovery: every bound session must own a host,
+    // otherwise its observation state is silently absent.
+    if (installed < expected.length) {
+      return {
+        supported: true, recovered: false, reason: 'observer-recovery-failed',
+        installedHosts: installed, expectedHosts: expected.length,
+        reset: 'all-directions', observerEpoch: this.epochValue, observer: this.state(),
+      };
+    }
+    return { supported: true, recovered: true, installedHosts: installed, expectedHosts: expected.length, reset: 'all-directions', observerEpoch: this.epochValue, observer: this.state() };
   }
 
   /** Stop interpreting without killing the relay; `startObservation` creates fresh hosts. */
@@ -279,9 +297,12 @@ export async function runRelayEntry(config: RelayEntryConfig, ipc: RelayIpc): Pr
     session.onClose(() => observers.closeSession(session.sessionEpoch));
   });
   await relay.start();
+  // Advertise only commands this entry actually implements. `observe` is not an IPC command
+  // here (observation is passive); advertising it invites a caller to request an operation
+  // that can only fail with command-unsupported.
   ipc.send({
     type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch, bootEpoch: sessionEpoch,
-    capabilities: observers.enabled ? ['control', 'observe', 'observer'] : ['control', 'observe'],
+    capabilities: observers.enabled ? ['control', 'observer'] : ['control'],
   });
   const heartbeat = setInterval(() => {
     // Retry at most one coalesced observation gap per session per heartbeat; never queue
@@ -319,7 +340,9 @@ export async function runRelayEntry(config: RelayEntryConfig, ipc: RelayIpc): Pr
         return;
       }
       void observers.startObservation().then(
-        result => respond(request.requestId!, true, result),
+        result => result.recovered
+          ? respond(request.requestId!, true, result)
+          : respond(request.requestId!, false, result, { code: 'observer-recovery-failed', message: result.reason ?? 'observer recovery failed' }),
         () => respond(request.requestId!, false, undefined, { code: 'observer-recovery-failed', message: 'observer recovery failed' }),
       );
     } else if (request.command === 'stop-observer') {

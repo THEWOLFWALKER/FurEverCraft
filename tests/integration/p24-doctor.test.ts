@@ -117,7 +117,8 @@ describe('P24 authenticated doctor endpoint', { timeout: 20_000 }, () => {
 
 describe('P24 doctor/capabilities effective control state', { timeout: 20_000 }, () => {
   it('reports inputs disabled as control-revoked while the attached bridge service is unarmed', async () => {
-    const service = new BridgeService({});
+    const relay = { state: 'running', start: async () => undefined, stop: async () => undefined, onExit: () => () => undefined };
+    const service = new BridgeService({ relay });
     const runtime = createRuntime({ bridgeService: { service } });
     const server = createControlServer(runtime);
     const close = async () => { await server.close(); runtime.close(); };

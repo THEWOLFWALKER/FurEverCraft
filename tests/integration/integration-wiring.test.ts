@@ -416,7 +416,8 @@ describe('provider gate and canonical provider session', () => {
     expect(runtime.control.provider()).toMatchObject({ provider: 'openai', configured: false, networkEnabled: false, transport: 'unavailable' });
     expect(runtime.canonicalProviderPath).toBe(false);
     const result = await runtime.control.command({ requestId: 'msg-off', command: 'message', payload: { text: 'go' } });
-    expect(result.state).toBe('terminal');
+    // An unavailable provider produces no successful answer: the receipt is unknown, not terminal.
+    expect(result).toMatchObject({ state: 'unknown', code: 'provider-unavailable' });
     expect((result.result as { response?: { stopReason?: string } }).response?.stopReason).toBe('unavailable');
   });
 });
