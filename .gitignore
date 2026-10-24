@@ -5,3 +5,6 @@ dist/
 *.sqlite-shm
 *.sqlite-wal
 coverage/
+
+# agent isolation worktrees
+.claude/worktrees/
