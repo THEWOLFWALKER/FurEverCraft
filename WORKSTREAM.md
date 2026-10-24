@@ -4,8 +4,8 @@ Single maintenance ledger for the FurEverCraft P01–P24 batch. It records what 
 
 - Repository: `/home/orca/projects/furevercraft-phase2-handoff`
 - Remote: https://github.com/THEWOLFWALKER/FurEverCraft
-- P24 working branch/worktree: `worktree-agent-ab6f1d11a5e61d85a` (isolated worktree; not pushed)
-- Merged P01–P23 baseline: `a2d216e` (`p24-final`)
+- P24 working branch/worktree: `worktree-agent-ac78676f8446badb3` (isolated worktree; not pushed)
+- Merged P01–P23 baseline: `a2d216e`; current `p24-final` HEAD at review start: `ccb9f8e`
 - Scope sources: `NEXT_BATCH.md` (P01–P24), `REVIEW.md` (five rounds), `docs/design/*-v0.2.md`
 - Status vocabulary: `done-offline`, `done-limited`, `blocked-external`, `not-done` (in-progress is `not-done` until accepted)
 

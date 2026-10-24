@@ -12,7 +12,7 @@ The target game profile is Minecraft Java 26.3. Protocol/data/runtime values are
 
 ## Scope
 
-This development batch covers all 30 items F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. It closes the C1/C2/C3 convergence work and completes related prior-stage runtime gaps. Do not stop after one vertical chain or shrink the delivery to a demo-only slice.
+This development batch is **P01–P24** in `NEXT_BATCH.md`. The older F/B/U/M/A/V groups are historical traceability labels, not the current task numbering. The batch closes the C1/C2/C3 convergence work and related prior-stage runtime gaps; it is not a demo-only slice.
 
 The architecture is one real Java client body, original-player identity, raw TCP relay with read-only observer sidecar, Windows 10/11 input helper, one Runtime and shared ControlService for CLI/web. The v0.2 route is raw byte forwarding plus sidecar observation, not an application-level terminating proxy or second protocol bot.
 

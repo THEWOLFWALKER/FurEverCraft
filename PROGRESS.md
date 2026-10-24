@@ -6,7 +6,7 @@ Current authorization: `NEXT_BATCH.md` P01–P24, with the five-round review con
 
 ## Verification snapshot (2026-10-24)
 
-P01–P23 merged baseline: `a2d216e` (`p24-final`), with the built `dist/` present so conditional child-process tests execute.
+P01–P23 merged baseline: `ccb9f8e` (`p24-final`), with the built `dist/` present so conditional child-process tests execute.
 
 | Command | Actual result |
 |---|---|
