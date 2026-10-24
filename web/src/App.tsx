@@ -54,6 +54,7 @@ function Metric({ label, count, hint }: { label: string; count: number | undefin
 
 function ObservationPanel({ status }: { status?: Status }) {
   const observation = status?.observation;
+  const body = status?.body;
   const fields = Object.entries(observation?.fields ?? {});
   return (
     <section className="panel">
@@ -63,10 +64,19 @@ function ObservationPanel({ status }: { status?: Status }) {
           <div className="kv">
             <div className="kv-row"><span className="kv-key">Source</span><span className="kv-value">{value(observation.source)}</span></div>
             <div className="kv-row"><span className="kv-key">Freshness</span><span className="kv-value"><Tag status={observation.freshness} /></span></div>
+            <div className="kv-row"><span className="kv-key">Body contract</span><span className="kv-value">{body ? <Tag status={body.threeDimensional ? 'current' : 'stale'} /> : '--'} {value(body?.mode)}</span></div>
+            {body?.threeDimensional ? (
+              <>
+                <div className="kv-row"><span className="kv-key">World pose x / y / z</span><span className="kv-value">{value(body.x)}, {value(body.y)}, {value(body.z)}</span></div>
+                <div className="kv-row"><span className="kv-key">Yaw / pitch</span><span className="kv-value">{value(body.yaw)} / {value(body.pitch)}</span></div>
+                <div className="kv-row"><span className="kv-key">Dimension</span><span className="kv-value">{value(body.dimension)}</span></div>
+              </>
+            ) : (
+              <div className="kv-row"><span className="kv-key">Legacy planar position</span><span className="kv-value">{status?.position ? `${value(status.position.x)}, ${value(status.position.y)} (2D, no z)` : '--'}</span></div>
+            )}
             <div className="kv-row"><span className="kv-key">Gap</span><span className="kv-value">{observation.gap === undefined ? '--' : observation.gap ? 'gap reported' : 'none'}</span></div>
-            <div className="kv-row"><span className="kv-key">Revision</span><span className="kv-value">{value(observation.revision)}</span></div>
+            <div className="kv-row"><span className="kv-key">Revision</span><span className="kv-value">{value(body?.revision ?? observation.revision)}</span></div>
             <div className="kv-row"><span className="kv-key">Unknown cells</span><span className="kv-value">{value(observation.unknownCells)}</span></div>
-            <div className="kv-row"><span className="kv-key">Position</span><span className="kv-value">{status?.position ? `${value(status.position.x)}, ${value(status.position.y)}` : '--'}</span></div>
             <div className="kv-row"><span className="kv-key">UI / inventory</span><span className="kv-value">{value(status?.ui)} / {value(status?.inventory)}</span></div>
           </div>
           {observation.error && <p className="notice">Observation unavailable: {value(observation.error)}</p>}
@@ -386,12 +396,12 @@ export default function App() {
             <h2>Places</h2>
             <div className="list">
               {places.length === 0 ? <div className="empty">No places remembered in this scope. Locations are not inferred.</div> : places.slice(0, 20).map(place => (
-                <div className="row" key={`${place.place_id}-${String(place.context ?? '')}`}>
+                <div className="row" key={`${place.placeId ?? place.place_id}-${String(place.context ?? '')}`}>
                   <div className="row-main">
-                    <span className="row-id">{place.place_id}</span>
-                    <span className="row-meta">verified {place.last_verified_at ? time(place.last_verified_at) : 'never (unknown)'} · payload {jsonSnippet(place.payload, 80)}</span>
+                    <span className="row-id">{value(place.placeId ?? place.place_id)}</span>
+                    <span className="row-meta">freshness {value(place.freshness)} · verified {place.lastVerifiedAt ?? place.last_verified_at ? time(place.lastVerifiedAt ?? place.last_verified_at) : 'never (unknown)'} · payload {jsonSnippet(place.payload, 80)}</span>
                   </div>
-                  <Tag status={place.status} />
+                  <Tag status={place.freshness ?? place.status} />
                 </div>
               ))}
             </div>

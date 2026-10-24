@@ -87,11 +87,11 @@ describe('P18 skill lifecycle', () => {
     await expect(lifecycle.run('observe_ui', () => ({ ok: true, outcome: 'confirmed' }), { generation: before, preconditions: { 'ui-observation': true } })).resolves.toMatchObject({ state: 'failed', reason: 'stale-generation' });
   });
 
-  it('never reports a short gather as goal completion and never treats a free cell alone as causality', () => {
+  it('never reports a short gather as goal completion and never treats a free cell alone as causality', async () => {
     const bridge = new FakeClientBridge();
     bridge.block(1, 0, 'stone');
     const ctx = ctxFor(bridge);
-    const short = gatherBlocks(ctx, 'stone', 3);
+    const short = await gatherBlocks(ctx, 'stone', 3);
     expect(short.outcome).toBe('partial');
     expect(short.value).toMatchObject({ gathered: 1, requested: 3 });
     expect(short.ok).toBe(false);

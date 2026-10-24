@@ -9,12 +9,11 @@ import { poseBlock } from '../../src/motor/route.js';
 import { SimulatedBody, SIMULATOR_ASSUMPTIONS } from '../../src/fixtures/simulated-body.js';
 import { SimulatedBodyAdapter, Legacy2DBodyAdapter } from '../../src/fixtures/body-adapter.js';
 import { VoxelFixtureWorld } from '../../src/fixtures/voxel-world.js';
-import { gatherBody, navigateToBody, returnToPlaceBody, exploreBody, selectExploreTarget, toSkillResult, navigateToSkill } from '../../src/skills/navigation.js';
+import { gatherBody, navigateToBody, returnToPlaceBody, exploreBody, selectExploreTarget, toSkillResult } from '../../src/skills/navigation.js';
 import { Executor, InputArbiter } from '../../src/execution/runtime.js';
 import { SQLiteStore } from '../../src/persistence/store.js';
 import { FakeClientBridge } from '../../src/bridge/fake/index.js';
 import { ToolRouter } from '../../src/agent/router.js';
-import { skillImplementations } from '../../src/skills/skills.js';
 import { attachBodyAdapter, getAttachedBodyAdapter } from '../../src/motor/contracts.js';
 
 const context: BodyContext = { serverProfileId: 'simulated', worldGenerationId: 'p10-p13-world', connectionEpoch: '1', bodyEpoch: '1', dimension: 'overworld' };
@@ -145,27 +144,22 @@ describe('P11 navigation → Motor → sink chain', () => {
     }
   });
 
-  it('reaches the same chain from the public start_skill tool once the one-line skill wiring is applied', async () => {
+  it('reaches the same chain from the public start_skill tool through the production skills wiring', async () => {
     const { adapter, body, clock } = makeHarness();
     const bridge = new FakeClientBridge(12, { context });
     attachBodyAdapter(bridge, adapter);
     const store = new SQLiteStore(':memory:');
     const router = new ToolRouter(bridge, store);
-    // Production `skills.ts` does not yet consult an attached BodyAdapter. This
-    // in-test override mirrors the exact required patch (reported separately):
-    // when an adapter is attached, call navigateToBody instead of legacy 2D walk.
-    const mutable = skillImplementations as unknown as Record<string, unknown>;
-    const original = mutable.navigate_to;
-    mutable.navigate_to = (ctx: Parameters<typeof navigateToSkill>[0], args: { x: number; y: number }) => navigateToSkill(ctx, { x: args.x, y: args.y });
     try {
-      const result = await router.invoke({ id: 'call-1', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 3, y: 2 }) });
+      const result = await router.invoke({ id: 'call-1', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 3, y: 0, z: 2 }) });
       expect(result.ok).toBe(true);
-      const execution = result.result as { status: string; outcome?: string };
+      const execution = result.result as { status: string; outcome?: string; skillVersion?: string };
       expect(execution.status).toBe('succeeded');
       expect(execution.outcome).toBe('confirmed');
+      // The public registry now advertises the 3D contract.
+      expect(execution.skillVersion).toBe('2.0.0');
       expect(poseBlock(body.currentPose)).toEqual({ x: 3, y: 0, z: 2 });
     } finally {
-      mutable.navigate_to = original;
       store.close();
     }
   });
