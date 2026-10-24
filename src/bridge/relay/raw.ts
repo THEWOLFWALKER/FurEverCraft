@@ -47,6 +47,7 @@ export type RelaySocket = {
 
 export type RelayServer = {
   once(event: 'error'|'listening', listener: (error?: Error) => void): unknown;
+  on(event: 'error', listener: (error?: Error) => void): unknown;
   listen(port: number, host: string, callback: () => void): unknown;
   address(): AddressInfo | string | null;
   close(callback?: (error?: Error) => void): unknown;
@@ -201,7 +202,8 @@ export function createRawTcpRelay(config:RelayConfig):RawTcpRelay {
   let address:AddressInfo={address:config.listenHost??'127.0.0.1',family:'IPv4',port:config.listenPort}; const budgets=mergeBudgets(config.budgets);
   const allowedNextStates=new Set(config.allowedNextStates??[...validNextStates]);
   const api:RawTcpRelay={get address(){return address;},async start(){if(server)return;stopping=false;const created=network.createServer({allowHalfOpen:true},client=>{ if(stopping){client.destroy();return;} const upstream=network.connect({host:config.targetHost,port:config.targetPort,allowHalfOpen:true});const session=new Session(client,upstream,{targetHost:config.targetHost,targetPort:config.targetPort,rewriteHandshake:config.rewriteHandshake??false,handshakeLimitBytes:config.handshakeLimitBytes??8192,handshakeTimeoutMs:config.handshakeTimeoutMs??5000,allowedNextStates,budgets,onChunk:config.onChunk},()=>sessions.delete(session));sessions.add(session);listeners.forEach(l=>l(session));});
-    await new Promise<void>((resolve,reject)=>{ created.once('error',reject); created.listen(config.listenPort,config.listenHost??'127.0.0.1',()=>{address=created.address() as AddressInfo;resolve();}); }).then(()=>{server=created;},error=>{created.close();throw error;});},
+    await new Promise<void>((resolve,reject)=>{ created.once('error',reject); created.listen(config.listenPort,config.listenHost??'127.0.0.1',()=>{address=created.address() as AddressInfo;resolve();}); }).then(()=>{server=created; // Post-bind listener errors must not crash the process; active sessions already surface their own errors.
+      created.on('error',()=>undefined);},error=>{created.close();throw error;});},
     async stop(){ stopping=true; const active=[...sessions].map(s=>s.close('relay-stop')); if(server){ const closing=server; server=undefined; await new Promise<void>(resolve=>closing.close(()=>resolve())); } await Promise.all(active); },
     sessions:()=>[...sessions],onSession(listener){listeners.add(listener);return()=>listeners.delete(listener);}};
   return api;
