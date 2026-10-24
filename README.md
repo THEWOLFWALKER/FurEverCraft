@@ -44,14 +44,20 @@ npm run test:soak:offline
 npm run test:web
 npm run test:web:e2e
 npm run demo:offline
-npm run demo:autonomy -- --scenario gather-return
+npm run demo:autonomy
 npm run doctor -- --profile simulated
+npm run doctor -- --profile simulated-3d
 npm run bridge:fixture
 npm run cli -- bridge --mode inspect --config configs/client-offline.example.json
 npm run serve -- --profile simulated
+npm run serve -- --profile simulated-3d
 npm run cli -- attach --url http://127.0.0.1:3000
 ```
 
+`simulated` is the explicit legacy planar profile. `simulated-3d` assembles the
+same ControlService/runtime and the simulated 3D BodyAdapter/Motor chain; it is
+simulated evidence, not a real 26.3 client.
+
 ## Evidence status
 
-Read `PROGRESS.md` and `DELIVERY_REPORT.md` for current implementation and verification states. Design documents are contracts, not implementation evidence. Local Node 20 verification is not Node 22 evidence; a CI workflow definition is not a passing CI run. Real client/server/Windows/API compatibility remains unverified until separately authorized testing.
+Read `PROGRESS.md` and `DELIVERY_REPORT.md` for current implementation and verification states. Design documents are contracts, not implementation evidence. Local Node 22 (`v22.23.4`) verification is not proof that cloud CI ran; a CI workflow definition is not a passing CI run. Real client/server/Windows/API compatibility remains unverified until separately authorized testing.

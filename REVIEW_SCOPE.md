@@ -32,8 +32,8 @@
 npm run typecheck        # pass
 npm run build            # pass
 npm run build:web        # pass
-npm run test:offline     # 45 files / 383 tests passed
-npm run test:v:offline   # integration 47, soak 2, diagnostics 15 passed
+npm run test:offline     # 46 files / 394 tests passed (after P24 Round 1)
+npm run test:v:offline   # integration 56, soak 2, diagnostics 15 passed
 npm run test:web:e2e     # 2 Playwright Chromium tests passed (~19s)
 npm run demo:offline     # 6 scenarios pass
 npm run doctor           # 真实 Runtime 状态，不是静态常量
@@ -48,7 +48,7 @@ E2E 使用 Playwright 1.64.1 + Chrome for Testing 156.0.8078.4（headless，无�
 - **用户入口**：`src/cli/main.ts`（attach / serve / demo / doctor / bridge / trace）、`src/server/index.ts`（Fastify + SSE）、`web/src/**`（React 控制台）
 - **单一控制面**：`src/control/service.ts` → 唯一的 `RuntimeAssembly`（`src/execution/factory.ts`）
 - **Agent 链路**：`ToolRouter.invoke` → `Executor` → `SkillLifecycle` / skills → `Memory` / `Motor` → `InputSink` → body
-- **桥链路**：loopback client → `src/bridge/relay/raw.ts` → upstream；旁路 `src/bridge/observer/**`（framing → bounded queue → projection pipeline）
+- **桥链路**：loopback client → `src/bridge/relay/raw.ts` → upstream；旁路 `src/bridge/observer/**` 目前只到 framing → bounded queue → 观察元数据事件。`src/bridge/protocol/projection-pipeline.ts` 的 synthetic projector 装配只在测试中验证；没有 26.3 解码后的 packet payload，因此它尚未、也不能诚实地接到 relay/observer 或 WorldState。真实 domain projection 仍为 `unavailable`。
 - **效果/恢复**：prepared → may-have-dispatched → confirmed/partial/ambiguous；`ownership` 跨进程锁、`SessionRuntime` 恢复预算、epoch/owner/revision fencing
 - **Provider 链路**：`createConfiguredProvider` gate → canonical session → injected/网络 transport
 - **知识与记忆**：`KnowledgeService` release/coverage/query；`MemoryService` scoped places/episodes/experiences
@@ -91,16 +91,16 @@ E2E 使用 Playwright 1.64.1 + Chrome for Testing 156.0.8078.4（headless，无�
 
 ## 5. 明确尚未完成的部分（请勿按缺陷计数，但可以指出实现上会 blocking 的点）
 
-1. **P24 与五轮 review 尚未执行**：本轮先把代码交给用户 review；`REVIEW.md` 规定的五轮全仓审查、最终一致性整理、文档最终更新还没做。
-2. **仓库进度文档尚未更新到 P23**：`PROGRESS.md`、`WORKSTREAM.md`、`DELIVERY_REPORT.md`、`CLAUDE.md` 仍反映较早状态；最终报告会在 P24 统一更新。
-3. **缺 `trace:export` / `trace:replay` npm scripts**：CLI 命令已实现（`node dist/cli/main.js trace:export|trace:replay`），但 `package.json` 只保留原有脚本，未加同义脚本。
-4. **未新增 `/api/v1/doctor`**：attach CLI 通过 `/status`、`/capabilities`、`/provider` 组合 doctor；server 端点未加。
+1. **P24 与五轮 review 进行中**：P24 的脚本/端点/文档已落地；Round 1（完整性与真实接线）已执行并修复发现，Round 2–5 尚未执行。
+2. **仓库进度文档已更新到 P24 Round 1**：`PROGRESS.md`、`WORKSTREAM.md`、`DELIVERY_REPORT.md`、`CLAUDE.md` 反映当前状态；最终一致性整理仍待 P24 收尾。
+3. **`trace:export` / `trace:replay` npm scripts 已在 P24 加入**，并有真实 CLI 调用记录。
+4. **`/api/v1/doctor` 已在 P24 加入**，复用 `ControlService.diagnostics()` 与同一条认证路径。
 5. **26.3 真实数据完全缺失**：已安装的 `minecraft-data@3.87.0` 没有 26.3 的 version/protocol 数据；所有 26.3 decoder/domain 保持 `unsupported`/`unavailable`，只做 fail-closed 与 synthetic 合同测试。没有伪字段、没有把最新依赖当成 26.3。
 6. **没有真实客户端/服务器/世界**：relay/observer 只在 loopback 无游戏引擎夹具上验证；没有任何 live compatibility 声明。
 7. **没有真实 Windows 输入/截图**：Windows helper 只有注入 transport 与静态/单元测试，不调用 SendInput。
 8. **没有真实模型 API**：OpenAI/Anthropic 只用注入 transport 与离线 fixture 验证，所有网络 gate 默认关闭。
-9. **Motor 只有模拟证据**：turn / 平地 walk / stop / 短跳；`stepUp`、`controlledDrop` 明确禁用；没有真实 26.3 物理/地形数据。E2E 的 body 也是模拟 body。
-10. **默认 simulated profile 仍是 legacy 2D**：只有显式注入 `bodyAdapter` 时才走 3D；“legacy-2d”是诚实标签，不是把 `{x,y}` 伪造成 `z=0`。
+9. **Motor 只有模拟证据**：turn / 平地 walk / stop / 短跳；`stepUp`、`controlledDrop` 明确禁用；没有真实 26.3 物理/地形数据。E2E 的 body 也是 fixture。
+10. **默认 `simulated` profile 仍是 legacy 2D**；公共入口 `serve --profile simulated-3d`（以及 doctor）现在会装配同一个 simulated 3D BodyAdapter/Motor 链。“legacy-2d”是诚实标签，不是把 `{x,y}` 伪造成 `z=0`。
 11. **P22 的 E2E 不覆盖真实 Minecraft**：覆盖真实 Fastify/ControlService/浏览器 DOM/CLI 共用同一 Runtime，但身体是模拟的。
 12. **P23 的 60 分钟是虚拟时间**：只证明预算/资源上界，不等于长期稳定性证明；另有短墙钟 smoke。
 13. **CI 未实际运行**：Node 22 本地通过，但云端 CI 结果未观察；HTTP/模型/输入/截图 gate 仍默认关闭。
@@ -111,7 +111,7 @@ E2E 使用 Playwright 1.64.1 + Chrome for Testing 156.0.8078.4（headless，无�
 
 - `unsupported` / `unavailable` / `legacy-2d` / `synthetic` / `fixture` 多数是**有意的 fail-closed 结果**，不是遗漏。尤其 26.3 数据缺失时不允许猜字段。
 - 某些工具仍只接受 2D（`place_one`、`look_at`、`dig_one`），这是 P10 明确保留的 legacy 边界；`navigate_to` 已要求 `x/y/z`。
-- 默认 demo 的 2D 行为是为保持 legacy simulated profile；生产 3D 路径需显式注入 `bodyAdapter`。
+- 默认 demo 的 2D 行为是为保持 legacy simulated profile；生产型 3D 装配通过 `--profile simulated-3d` 或注入 `bodyAdapter`，仍是模拟 body。
 - 测试中的 `synthetic` / `fixture` body/transport 是合同夹具，不应被当成“真实环境证据”；反过来，也不要求它们在离线环境产生真实客户端字节。
 - `bridge --mode live` 仍被 gate 阻断是预期行为（没有真实 body/服务器）。
 - doctor 输出中的 `degraded`/`unknown` 可能反映当前环境（如内存 DB、未启动 session、无知识 release），不一定是缺陷。
