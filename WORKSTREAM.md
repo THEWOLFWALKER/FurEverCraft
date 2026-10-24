@@ -14,6 +14,7 @@ Single maintenance ledger for the FurEverCraft P01–P24 batch. It records what 
 | Item | Value |
 |---|---|
 | Baseline commit | `a2d216e` (`p24-final`, contains merged P01–P23) |
+| P24 code commit on this branch | `0dd7bfc` (trace scripts + doctor endpoint/test); current docs are committed alongside it on this branch |
 | Worktree start | P24 branch was incorrectly created from `c27dcfa` (P01–P04 lineage); reset to `a2d216e` before changes |
 | Node (local, verified) | `v22.23.4` |
 | npm | `10.9.9` |

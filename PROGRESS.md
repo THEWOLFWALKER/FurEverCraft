@@ -19,7 +19,7 @@ P01–P23 merged baseline: `a2d216e` (`p24-final`), with the built `dist/` prese
 | `npm run demo:offline` | **6/6 scenarios** completed (`autonomous`, `obstruction`, `human-steering`, `chat-ui`, `crash-recovery`, `bridge-fixture`) |
 | `npm run doctor` | exited 0; truthful `status: "degraded"` for the default simulated/legacy-2D runtime; no live claims |
 
-P24 work in this worktree adds `tests/integration/p24-doctor.test.ts` and the authenticated doctor endpoint. After those additions the same commands report **46 files / 384 tests** offline and **10 files / 48 tests** integration; soak, diagnostics and E2E counts are unchanged. The P01–P23 counts above remain the evidence baseline for the merged branch.
+P24 work in this worktree adds `tests/integration/p24-doctor.test.ts` and the authenticated doctor endpoint (`0dd7bfc`; docs updated on this branch). After those additions the same commands report **46 files / 384 tests** offline and **10 files / 48 tests** integration; soak, diagnostics and E2E counts are unchanged. The P01–P23 counts above remain the evidence baseline for the merged branch.
 
 ## P01–P23 status
 

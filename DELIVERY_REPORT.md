@@ -31,9 +31,9 @@ npm run demo:offline         6/6 scenarios passed
 npm run doctor               exit 0; truthful "degraded" default report
 ```
 
-P24 work in this worktree adds `tests/integration/p24-doctor.test.ts`; current counts are **46 files / 384 tests** offline and **10 files / 48 tests** integration (soak/diagnostics/E2E unchanged). These are in-progress P24 results, not a completed P24.
+P24 work in this worktree adds `tests/integration/p24-doctor.test.ts` (`0dd7bfc`; docs updated on this branch); current counts are **46 files / 384 tests** offline and **10 files / 48 tests** integration (soak/diagnostics/E2E unchanged). These are in-progress P24 results, not a completed P24.
 
-Additional P24 checks: `npm run trace:export -- --db <tmp> --out <tmp>` and `npm run trace:replay -- --file <tmp>` were exercised against the real CLI subcommands (see commit evidence); the new doctor test proves unauthenticated access is denied and an authenticated CLI bearer receives the same truthful P21 report.
+Additional P24 checks: `npm run trace:export -- --db <tmp> --out <tmp>` exited 0 and wrote a bounded 0-record trace from a fresh DB; `npm run trace:replay -- --file <tmp>` exited 0 with `contiguous: true`, `input: disabled`, `network: disabled`, `paidApis: disabled`, `sideEffects: not-resent`. The new doctor test proves unauthenticated access is denied and an authenticated CLI bearer receives the same truthful P21 report.
 
 ## P01–P23 status summary
 
