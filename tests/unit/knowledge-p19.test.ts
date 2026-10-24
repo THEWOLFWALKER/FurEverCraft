@@ -5,13 +5,13 @@ import path from 'node:path';
 import { SQLiteStore } from '../../src/persistence/store.js';
 import {
   KnowledgeService, detectKnowledgeConflicts, knowledgeToolDefinitions, validateKnowledgeRelease,
-  type KnowledgeRelease, type KnowledgeRule, type KnowledgeSource,
+  type KnowledgeRelease, type KnowledgeFact, type KnowledgeSource,
 } from '../../src/autonomous/knowledge.js';
 
 const tempDb = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'furevercraft-knowledge-')), 'state.sqlite');
 const source = (sourceId: string, version: string, verified: boolean, covers: string[], kind: KnowledgeSource['kind'] = verified ? 'verified-rules' : 'examples'): KnowledgeSource =>
   ({ sourceId, version, verified, covers, kind, origin: `fixture://${sourceId}`, registeredAt: '2026-01-01T00:00:00.000Z' });
-const rule = (id: string, predicate: string, value: unknown, sourceId: string, sourceVersion: string, namespace: KnowledgeRule['namespace'] = 'rule', subject?: string): KnowledgeRule =>
+const rule = (id: string, predicate: string, value: unknown, sourceId: string, sourceVersion: string, namespace: KnowledgeFact['namespace'] = 'rule', subject?: string): KnowledgeFact =>
   ({ id, namespace, predicate, ...(subject ? { subject } : {}), value, sourceId, sourceVersion });
 
 function releaseOne(): KnowledgeRelease {

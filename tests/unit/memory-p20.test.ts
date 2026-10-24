@@ -122,6 +122,7 @@ describe('P20 execution experience', () => {
     expect(experience).toMatchObject({ kind: 'execution-experience', failureClass: 'precondition', authorizesAction: false, authorizesWorldRule: false });
     expect(memory.queryExperiences({ scope }).items).toMatchObject([{ episodeId: 'experience-1', premises: [{ name: 'target-cell', value: 'blocked' }, { name: 'tool', value: 'stone_pickaxe' }] }]);
     expect(() => memory.recordExecutionExperience({ episodeId: 'bad', scope, skillId: 'dig_one', outcome: 'failed', failureClass: 'x', premises: [], evidence: [] })).toThrow('experience-premises-required');
+    expect(() => memory.recordExecutionExperience({ episodeId: 'bad-2', scope, skillId: 'dig_one', outcome: 'confirmed', failureClass: 'precondition', premises: [{ name: 'target', value: 'stone' }], evidence: [{ kind: 'observation' }] })).toThrow('experience-failure-class-conflict');
     store.close();
   });
 

@@ -167,6 +167,10 @@ export class MemoryService {
     if (!Array.isArray(input.evidence) || input.evidence.length === 0) throw new Error('experience-evidence-required');
     if (input.premises.some(premise => !premise || typeof premise.name !== 'string' || !premise.name || !('value' in premise))) throw new Error('experience-premise-invalid');
     if (input.evidence.some(item => !item || typeof item.kind !== 'string' || !item.kind)) throw new Error('experience-evidence-invalid');
+    // A confirmed execution has no failure class; a failure must name one. This prevents a
+    // success from being stored as a reusable "rule" about a failure or vice versa.
+    if (input.outcome === 'confirmed' && input.failureClass !== 'none') throw new Error('experience-failure-class-conflict');
+    if (input.outcome !== 'confirmed' && input.failureClass === 'none') throw new Error('experience-failure-class-required');
     const scope = normalizeMemoryScope(input.scope);
     const summary = {
       kind: 'execution-experience', skillId: input.skillId, goalId: input.goalId, executionId: input.executionId,
