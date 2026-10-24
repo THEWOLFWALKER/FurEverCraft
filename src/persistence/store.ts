@@ -29,6 +29,15 @@ const receiptStatuses = ['pending', 'completed', 'unknown', 'sent', 'ambiguous',
 const receiptTerminal = new Set(['completed', 'unknown', 'sent', 'ambiguous', 'conflict', 'rejected']);
 const effectRank: Record<string, number> = { prepared: 0, 'may-have-dispatched': 1, verifying: 2, ambiguous: 3, partial: 4, confirmed: 5 };
 const executionTerminal = new Set(['succeeded', 'failed', 'canceled']);
+const MEMORY_SCOPE_KEYS = ['serverProfileId', 'accountId', 'worldGenerationId', 'dimensionId'] as const;
+const coreScope = (value: unknown): Partial<Record<(typeof MEMORY_SCOPE_KEYS)[number], string>> | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.serverProfileId !== 'string' || !record.serverProfileId) return undefined;
+  const scope: Partial<Record<(typeof MEMORY_SCOPE_KEYS)[number], string>> = {};
+  for (const key of MEMORY_SCOPE_KEYS) if (typeof record[key] === 'string' && record[key]) scope[key] = record[key] as string;
+  return scope;
+};
 
 export class SQLiteStore {
   readonly db: Database.Database;
@@ -57,9 +66,11 @@ export class SQLiteStore {
       CREATE TABLE IF NOT EXISTS checkpoints(checkpoint_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL,
         revision INTEGER NOT NULL, payload_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS places(place_id TEXT PRIMARY KEY, context TEXT NOT NULL, status TEXT NOT NULL,
-        last_verified_at TEXT, payload_json TEXT NOT NULL);
+        last_verified_at TEXT, payload_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
+        provenance_json TEXT, invalidated_reason TEXT, updated_at TEXT);
       CREATE TABLE IF NOT EXISTS episodes(episode_id TEXT PRIMARY KEY, context TEXT NOT NULL,
-        event_refs_json TEXT NOT NULL, summary_json TEXT NOT NULL);
+        event_refs_json TEXT NOT NULL, summary_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
+        provenance_json TEXT, updated_at TEXT);
       CREATE TABLE IF NOT EXISTS memory_scope(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS action_receipts(
         receipt_id TEXT PRIMARY KEY, scope TEXT NOT NULL, command_id TEXT NOT NULL, status TEXT NOT NULL,
@@ -80,7 +91,18 @@ export class SQLiteStore {
     this.db.transaction(() => {
       this.scopeMemoryKeys('places', 'place_id');
       this.scopeMemoryKeys('episodes', 'episode_id');
+      this.ensureMemoryColumns('places', ['revision INTEGER NOT NULL DEFAULT 0', 'provenance_json TEXT', 'invalidated_reason TEXT', 'updated_at TEXT']);
+      this.ensureMemoryColumns('episodes', ['revision INTEGER NOT NULL DEFAULT 0', 'provenance_json TEXT', 'updated_at TEXT']);
     })();
+  }
+
+  /** Additive columns keep existing databases readable; no data is rewritten or dropped. */
+  private ensureMemoryColumns(table: 'places' | 'episodes', definitions: string[]) {
+    const existing = new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(column => column.name));
+    for (const definition of definitions) {
+      const name = definition.split(' ')[0]!;
+      if (!existing.has(name)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+    }
   }
 
   close() { this.db.close(); }
@@ -300,18 +322,49 @@ export class SQLiteStore {
     return row ? { ...row, payload: parse(row.payload_json) } : undefined;
   }
 
-  savePlace(place: { placeId: string; context: unknown; status: string; lastVerifiedAt?: string; payload: unknown }) {
+  savePlace(place: { placeId: string; context: unknown; status: string; lastVerifiedAt?: string; payload: unknown; provenance?: unknown; revision?: number; expectedRevision?: number; invalidatedReason?: string }) {
     // A place id is only unique inside its scope: the same place in another world must not
     // overwrite this one. Legacy single-column layouts are widened to (place_id, context).
-    const reuse = place.context === undefined ? undefined : this.db.prepare('SELECT rowid FROM places WHERE place_id=? AND context=?').get(place.placeId, json(place.context)) as { rowid: number } | undefined;
+    const reuse = place.context === undefined ? undefined : this.findPlaceByScope(place.placeId, place.context) as { rowid: number; revision: number; provenance?: unknown } | undefined;
+    const timestamp = now();
     if (reuse) {
-      this.db.prepare(`UPDATE places SET status=?, last_verified_at=?, payload_json=? WHERE rowid=?`)
-        .run(place.status, place.lastVerifiedAt ?? null, json(place.payload), reuse.rowid);
+      if (place.expectedRevision !== undefined && Number(reuse.revision ?? 0) !== place.expectedRevision) throw new Error(`place-revision-conflict:${Number(reuse.revision ?? 0)}`);
+      const revision = Number(reuse.revision ?? 0) + 1;
+      const provenance = place.provenance === undefined ? reuse.provenance ?? null : json(place.provenance);
+      this.db.prepare(`UPDATE places SET context=?, status=?, last_verified_at=?, payload_json=?, revision=?, provenance_json=?,
+        invalidated_reason=?, updated_at=? WHERE rowid=?`)
+        .run(json(place.context), place.status, place.lastVerifiedAt ?? null, json(place.payload), revision, provenance,
+          place.status === 'invalid' ? place.invalidatedReason ?? null : null, timestamp, reuse.rowid);
     } else {
-      this.db.prepare(`INSERT INTO places(place_id,context,status,last_verified_at,payload_json) VALUES (?,?,?,?,?)`)
-        .run(place.placeId, json(place.context), place.status, place.lastVerifiedAt ?? null, json(place.payload));
+      this.db.prepare(`INSERT INTO places(place_id,context,status,last_verified_at,payload_json,revision,provenance_json,invalidated_reason,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run(place.placeId, json(place.context), place.status, place.lastVerifiedAt ?? null, json(place.payload),
+          Math.max(0, place.revision ?? 0), place.provenance === undefined ? null : json(place.provenance),
+          place.status === 'invalid' ? place.invalidatedReason ?? null : null, timestamp);
     }
     this.touchScope(place.context);
+  }
+
+  /** Update an existing place with optional optimistic concurrency. Missing places are not created. */
+  updatePlace(place: { placeId: string; context: unknown; status?: string; lastVerifiedAt?: string; payload?: unknown; provenance?: unknown; expectedRevision?: number }) {
+    const existing = this.findPlaceByScope(place.placeId, place.context);
+    if (!existing) throw new Error('place-not-found');
+    return this.savePlace({
+      placeId: place.placeId, context: place.context, status: place.status ?? existing.status,
+      lastVerifiedAt: place.lastVerifiedAt ?? existing.lastVerifiedAt, payload: place.payload === undefined ? existing.payload : place.payload,
+      provenance: place.provenance ?? existing.provenance, expectedRevision: place.expectedRevision,
+    });
+  }
+
+  invalidatePlace(placeId: string, context: unknown, reason: string, expectedRevision?: number) {
+    const existing = this.findPlaceByScope(placeId, context);
+    if (!existing) throw new Error('place-not-found');
+    this.savePlace({
+      placeId, context, status: 'invalid', lastVerifiedAt: existing.lastVerifiedAt, payload: existing.payload,
+      provenance: { ...(existing.provenance as Record<string, unknown> | undefined), invalidatedAt: now(), reason },
+      expectedRevision, invalidatedReason: reason,
+    });
+    return this.findPlaceByScope(placeId, context);
   }
 
   /** Returns the record with this id: the one visible in the current scope when a scope is given. */
@@ -332,6 +385,55 @@ export class SQLiteStore {
     return rows.map(row => this.placeRow(row)).filter((row): row is NonNullable<typeof row> => Boolean(row));
   }
 
+  /**
+   * Resolve a place by its stable scope fields. Connection/body epochs are evidence fences, not
+   * place identity, so a reconnect to the same world still finds the same place.
+   */
+  findPlaceByScope(placeId: string, context?: unknown) {
+    if (context === undefined) return this.getPlace(placeId);
+    const core = coreScope(context);
+    if (!core) return this.getPlace(placeId, context);
+    const entries = Object.entries(core);
+    const where = entries.map(([key]) => `json_extract(context, '$.${key}')=?`).join(' AND ');
+    return this.placeRow(this.db.prepare(`SELECT rowid, * FROM places WHERE place_id=? AND ${where} ORDER BY rowid DESC LIMIT 1`).get(placeId, ...entries.map(([, value]) => value)) as any);
+  }
+
+  /** Bounded page over the stable scope fields (legacy string contexts still match exactly). */
+  listPlacesPageByScope(context: unknown, options: { status?: string; limit?: number; cursor?: string } = {}) {
+    const limit = Math.min(Math.max(Math.trunc(options.limit ?? 20), 1), 50);
+    const start = options.cursor === undefined ? 0 : Number(options.cursor);
+    if (!Number.isInteger(start) || start < 0) throw new Error('invalid-memory-cursor');
+    const core = context === undefined ? undefined : coreScope(context);
+    const values: unknown[] = [];
+    let where = '';
+    if (context !== undefined) {
+      if (core) {
+        where = Object.entries(core).map(([key]) => `json_extract(context, '$.${key}')=?`).join(' AND ');
+        values.push(...Object.values(core));
+      } else { where = 'context=?'; values.push(json(context)); }
+    }
+    if (options.status) { where = where ? `${where} AND status=?` : 'status=?'; values.push(options.status); }
+    values.push(limit + 1, start);
+    const rows = (this.db.prepare(`SELECT * FROM places ${where ? `WHERE ${where}` : ''} ORDER BY place_id, context LIMIT CAST(? AS INTEGER) OFFSET CAST(? AS INTEGER)`).all(...values) as any[]).map(row => this.placeRow(row)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+    const page = rows.slice(0, limit);
+    return { items: page, truncated: rows.length > limit, ...(rows.length > limit ? { nextCursor: String(start + limit) } : {}) };
+  }
+
+  /** Bounded page. `limit + 1` detects truncation without counting the whole table. */
+  listPlacesPage(context: unknown, options: { status?: string; limit?: number; cursor?: string } = {}) {
+    const limit = Math.min(Math.max(Math.trunc(options.limit ?? 20), 1), 50);
+    const start = options.cursor === undefined ? 0 : Number(options.cursor);
+    if (!Number.isInteger(start) || start < 0) throw new Error('invalid-memory-cursor');
+    const status = options.status ? ' AND status=?' : '';
+    const values: unknown[] = context === undefined ? [] : [json(context)];
+    if (options.status) values.push(options.status);
+    values.push(limit + 1, start);
+    const where = context === undefined ? (options.status ? 'WHERE status=?' : '') : `WHERE context=?${status}`;
+    const rows = (this.db.prepare(`SELECT * FROM places ${where} ORDER BY place_id, context LIMIT CAST(? AS INTEGER) OFFSET CAST(? AS INTEGER)`).all(...values) as any[]).map(row => this.placeRow(row)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+    const page = rows.slice(0, limit);
+    return { items: page, truncated: rows.length > limit, ...(rows.length > limit ? { nextCursor: String(start + limit) } : {}) };
+  }
+
   /** Persist a scoped place and return the row for that scope (never another world's row). */
   rememberPlace(place: { placeId: string; context: unknown; status: string; lastVerifiedAt?: string; payload: unknown }) {
     this.savePlace(place);
@@ -339,18 +441,29 @@ export class SQLiteStore {
   }
 
   private placeRow(row: any) {
-    return row ? { ...row, context: parse(row.context), payload: parse(row.payload_json) } : undefined;
+    return row ? {
+      ...row, context: parse(row.context), payload: parse(row.payload_json),
+      lastVerifiedAt: row.last_verified_at ?? undefined,
+      revision: Number(row.revision ?? 0),
+      provenance: row.provenance_json ? parse(row.provenance_json) : undefined,
+      invalidatedReason: row.invalidated_reason ?? undefined,
+      updatedAt: row.updated_at ?? undefined,
+    } : undefined;
   }
 
-  saveEpisode(episode: { episodeId: string; context: unknown; eventRefs: unknown; summary: unknown }) {
+  saveEpisode(episode: { episodeId: string; context: unknown; eventRefs: unknown; summary: unknown; provenance?: unknown; revision?: number }) {
     // Episodes are scoped like places so the same episode id in another world is a separate record.
-    const reuse = episode.context === undefined ? undefined : this.db.prepare('SELECT rowid FROM episodes WHERE episode_id=? AND context=?').get(episode.episodeId, json(episode.context)) as { rowid: number } | undefined;
+    const reuse = episode.context === undefined ? undefined : this.db.prepare('SELECT rowid, revision, provenance_json FROM episodes WHERE episode_id=? AND context=?').get(episode.episodeId, json(episode.context)) as { rowid: number; revision: number; provenance_json?: string } | undefined;
+    const timestamp = now();
     if (reuse) {
-      this.db.prepare('UPDATE episodes SET event_refs_json=?, summary_json=? WHERE rowid=?')
-        .run(json(episode.eventRefs), json(episode.summary), reuse.rowid);
+      const revision = Number(reuse.revision ?? 0) + 1;
+      const provenance = episode.provenance === undefined ? reuse.provenance_json ?? null : json(episode.provenance);
+      this.db.prepare('UPDATE episodes SET event_refs_json=?, summary_json=?, revision=?, provenance_json=?, updated_at=? WHERE rowid=?')
+        .run(json(episode.eventRefs), json(episode.summary), revision, provenance, timestamp, reuse.rowid);
     } else {
-      this.db.prepare(`INSERT INTO episodes(episode_id,context,event_refs_json,summary_json) VALUES (?,?,?,?)`)
-        .run(episode.episodeId, json(episode.context), json(episode.eventRefs), json(episode.summary));
+      this.db.prepare(`INSERT INTO episodes(episode_id,context,event_refs_json,summary_json,revision,provenance_json,updated_at) VALUES (?,?,?,?,?,?,?)`)
+        .run(episode.episodeId, json(episode.context), json(episode.eventRefs), json(episode.summary),
+          Math.max(0, episode.revision ?? 0), episode.provenance === undefined ? null : json(episode.provenance), timestamp);
     }
     this.touchScope(episode.context);
   }
@@ -373,6 +486,21 @@ export class SQLiteStore {
     return rows.map(row => this.episodeRow(row)).filter((row): row is NonNullable<typeof row> => Boolean(row));
   }
 
+  /** Bounded page, optionally restricted to a summary kind (e.g. execution-experience). */
+  listEpisodesPage(context: unknown, options: { limit?: number; cursor?: string; kind?: string } = {}) {
+    const limit = Math.min(Math.max(Math.trunc(options.limit ?? 20), 1), 50);
+    const start = options.cursor === undefined ? 0 : Number(options.cursor);
+    if (!Number.isInteger(start) || start < 0) throw new Error('invalid-memory-cursor');
+    const values: unknown[] = context === undefined ? [] : [json(context)];
+    const kind = options.kind ? ` AND json_extract(summary_json, '$.kind')=?` : '';
+    if (options.kind) values.push(options.kind);
+    const where = context === undefined ? (options.kind ? `WHERE json_extract(summary_json, '$.kind')=?` : '') : `WHERE context=?${kind}`;
+    values.push(limit + 1, start);
+    const rows = (this.db.prepare(`SELECT * FROM episodes ${where} ORDER BY episode_id, context LIMIT CAST(? AS INTEGER) OFFSET CAST(? AS INTEGER)`).all(...values) as any[]).map(row => this.episodeRow(row)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+    const page = rows.slice(0, limit);
+    return { items: page, truncated: rows.length > limit, ...(rows.length > limit ? { nextCursor: String(start + limit) } : {}) };
+  }
+
   /** Persist a scoped episode and return the row for that scope (never another world's row). */
   recordEpisode(episode: { episodeId: string; context: unknown; eventRefs: unknown; summary: unknown }) {
     this.saveEpisode(episode);
@@ -380,7 +508,12 @@ export class SQLiteStore {
   }
 
   private episodeRow(row: any) {
-    return row ? { ...row, context: parse(row.context), eventRefs: parse(row.event_refs_json), summary: parse(row.summary_json) } : undefined;
+    return row ? {
+      ...row, context: parse(row.context), eventRefs: parse(row.event_refs_json), summary: parse(row.summary_json),
+      revision: Number(row.revision ?? 0),
+      provenance: row.provenance_json ? parse(row.provenance_json) : undefined,
+      updatedAt: row.updated_at ?? undefined,
+    } : undefined;
   }
 
   /** The scope reported by this database's most recent scoped memory write, if any. */
@@ -451,8 +584,8 @@ export class SQLiteStore {
     if (keys.length !== 1 || keys[0] !== idColumn) throw new Error(`memory-schema-mismatch:${table}`);
     this.db.exec(`ALTER TABLE ${table} RENAME TO ${table}_legacy`);
     this.db.exec(`CREATE TABLE ${table}(${table === 'places'
-      ? 'place_id TEXT NOT NULL, context TEXT NOT NULL, status TEXT NOT NULL, last_verified_at TEXT, payload_json TEXT NOT NULL'
-      : 'episode_id TEXT NOT NULL, context TEXT NOT NULL, event_refs_json TEXT NOT NULL, summary_json TEXT NOT NULL'}, PRIMARY KEY(${idColumn}, context))`);
+      ? 'place_id TEXT NOT NULL, context TEXT NOT NULL, status TEXT NOT NULL, last_verified_at TEXT, payload_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, provenance_json TEXT, invalidated_reason TEXT, updated_at TEXT'
+      : 'episode_id TEXT NOT NULL, context TEXT NOT NULL, event_refs_json TEXT NOT NULL, summary_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, provenance_json TEXT, updated_at TEXT'}, PRIMARY KEY(${idColumn}, context))`);
     const target = table === 'places' ? 'place_id,context,status,last_verified_at,payload_json' : 'episode_id,context,event_refs_json,summary_json';
     this.db.exec(`INSERT INTO ${table}(${target}) SELECT ${target} FROM ${table}_legacy`);
     this.db.exec(`DROP TABLE ${table}_legacy`);
