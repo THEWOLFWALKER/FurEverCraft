@@ -14,6 +14,7 @@ import type { HttpTransport } from '../providers/shared.js';
 import type { ProviderSession } from '../providers/session.js';
 import { SkillLifecycle } from '../skills/lifecycle.js';
 import { attachBodyAdapter, type BodyAdapter } from '../motor/contracts.js';
+import { createSimulatedBodyAdapter } from '../fixtures/body-adapter.js';
 import type { BridgeService } from '../bridge/service/orchestrator.js';
 import type { Clock } from '../contracts/index.js';
 import { ManualClock, SystemClock } from '../contracts/index.js';
@@ -23,11 +24,11 @@ import { GoalManager, TaskScheduler } from '../autonomous/tasks.js';
 import { SessionSupervisor } from '../autonomous/session.js';
 import type { ProviderMetadata } from '../control/dto.js';
 import { navigate } from '../skills/navigation.js';
-import type { Motor } from '../motor/primitives.js';
+import type { MotorFactory } from '../motor/controller.js';
 
-export type RuntimeProfile = 'simulated' | 'client-offline' | 'unsupported';
+export type RuntimeProfile = 'simulated' | 'simulated-3d' | 'client-offline' | 'unsupported';
 export type RuntimeNavPort = { navigate: typeof navigate };
-export type RuntimeMotorPort = Pick<Motor, 'orientTo' | 'walkCorridor' | 'stepUp' | 'jumpShort' | 'controlledDrop'>;
+export type RuntimeMotorPort = MotorFactory;
 
 /** The explicit dependency container every profile is assembled from. */
 export type RuntimeDependencies = {
@@ -196,17 +197,27 @@ function resolveProvider(options: RuntimeFactoryOptions): ResolvedProvider {
 
 export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssembly {
   const profile = options.profile ?? 'simulated';
+  if (!['simulated', 'simulated-3d', 'client-offline', 'unsupported'].includes(profile)) throw new Error(`unknown-profile:${profile}`);
   if (profile === 'unsupported') throw new Error('unsupported-profile');
   const providedBody = options.body ?? options.bridge;
   if (profile === 'client-offline') {
     if (!providedBody) throw new Error('client-offline-body-unavailable');
     assertRealBody(providedBody);
   }
+  if (profile === 'simulated-3d' && providedBody && !(providedBody instanceof FakeClientBridge)) {
+    // The 3D profile is an explicit simulation. It must never attach a simulated
+    // fixture adapter to a real client-shaped body.
+    throw new Error('simulated-3d-requires-simulated-body');
+  }
   const bridge = providedBody ?? new FakeClientBridge();
-  const bodyAdapter = options.bodyAdapter;
+  const simulatedProfile = profile === 'simulated' || profile === 'simulated-3d';
+  const clock = options.clock ?? (simulatedProfile ? new ManualClock() : new SystemClock());
+  const bodyAdapter = options.bodyAdapter ?? (profile === 'simulated-3d' ? createSimulatedBodyAdapter(bridge.context, clock) : undefined);
   if (bodyAdapter) {
     // A simulated/fixture adapter is never a substitute for a missing real client body.
     if (profile === 'client-offline' && bodyAdapter.source !== 'observed-server') throw new Error('client-offline-requires-real-body');
+    // The explicit 3D simulation profile must not silently attach a real-body adapter.
+    if (profile === 'simulated-3d' && bodyAdapter.source !== 'simulated') throw new Error('simulated-3d-requires-simulated-adapter');
     assertBodyAdapterContext(bridge, bodyAdapter);
     // Attach before the router/skills are constructed: there is only one body path.
     attachBodyAdapter(bridge, bodyAdapter);
@@ -228,9 +239,8 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     throw error;
   }
   try {
-    const clock = options.clock ?? (profile === 'simulated' ? new ManualClock() : new SystemClock());
     const events = options.events ?? new EventHub(1024, store, bridge.context);
-    const inputsEnabled = options.inputsEnabled ?? profile === 'simulated';
+    const inputsEnabled = options.inputsEnabled ?? simulatedProfile;
     const session = new SessionRuntime(bridge, store, { events, maxRecoveryAttempts: options.maxRecoveryAttempts });
     const arbiter = new InputArbiter(() => clock.now(), () => `${bridge.context.connectionEpoch}:${bridge.context.bodyEpoch}:${bridge.context.worldGenerationId}`);
     // A 3D navigation skill advances virtual time while it plans/executes bounded steps; the
@@ -246,10 +256,10 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     const memoryScope = memoryScopeOf(bridge.context);
     const knowledge = new KnowledgeService({ store });
     const lifecycle = new SkillLifecycle(undefined, { now: () => clock.now() });
-    const router = new ToolRouter(bridge, store, session.events, executor, memory, () => clock.now(), admission, { knowledge, lifecycle, memoryScope });
-    const loop = new AgentLoop(provider, router, 8, { canonical: resolvedProvider.canonical, providerName: resolvedProvider.providerName });
     const nav: RuntimeNavPort = options.nav ?? { navigate };
     const motor = options.motor;
+    const router = new ToolRouter(bridge, store, session.events, executor, memory, () => clock.now(), admission, { knowledge, lifecycle, memoryScope, nav, ...(motor ? { motor } : {}) });
+    const loop = new AgentLoop(provider, router, 8, { canonical: resolvedProvider.canonical, providerName: resolvedProvider.providerName });
     const providerMetadata = resolvedProvider.metadata;
     const control = new ControlService(undefined, providerMetadata);
     const goalManager = new GoalManager(store, session.events);

@@ -11,6 +11,8 @@ import { SimulatedBody } from '../../src/fixtures/simulated-body.js';
 import { SimulatedBodyAdapter } from '../../src/fixtures/body-adapter.js';
 import type { BodyAdapter, WorldObservation } from '../../src/motor/contracts.js';
 import { poseBlock } from '../../src/motor/route.js';
+import { Motor3D } from '../../src/motor/primitives.js';
+import { navigate } from '../../src/skills/navigation.js';
 import type { KnowledgeRelease } from '../../src/autonomous/knowledge.js';
 import type { HttpTransport } from '../../src/providers/shared.js';
 import { BridgeService } from '../../src/bridge/service/orchestrator.js';
@@ -161,7 +163,11 @@ describe('production integration: 3D tool → executor → skill → Motor → s
     expect(status.body).toMatchObject({ mode: '3d', threeDimensional: true, legacy2d: false, x: 1.25, y: 0, z: 2.5, dimension: 'overworld', source: 'simulated' });
     expect(status.body && 'z' in status.body).toBe(true);
     expect(status.position).toBeUndefined();
-    expect(status.observation).toMatchObject({ threeDimensional: true, mode: '3d' });
+    expect(status.observation).toMatchObject({ threeDimensional: true, mode: '3d', source: 'simulated' });
+    // The legacy bridge's inventory/cells/UI must not be presented as the 3D body's state.
+    expect(status.inventory).toBe(adapter.inventory);
+    expect(status.ui).toBeUndefined();
+    expect((status.context as { cells?: unknown }).cells).toBeUndefined();
 
     const state = await runtime.router.invoke({ id: 'state', name: 'get_state', arguments: '{}' });
     expect(state.ok).toBe(true);
@@ -177,6 +183,17 @@ describe('production integration: 3D tool → executor → skill → Motor → s
     // A 3D target is not silently padded away on the legacy path.
     const missingZ = await legacy.router.invoke({ id: 'legacy-nav', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 1, y: 0 }) });
     expect(missingZ).toMatchObject({ ok: false, error: 'invalid-tool-arguments' });
+  });
+
+  it('reports 3D status even when the legacy bridge snapshot is unavailable', () => {
+    const { clock, adapter } = make3D({ start: { x: 2, y: 0, z: 3 } });
+    const bridge = new FakeClientBridge(16, { context });
+    (bridge as unknown as { snapshot: () => never }).snapshot = () => { throw new Error('legacy-bridge-unavailable'); };
+    const runtime = track(createRuntime({ profile: 'simulated', bridge, clock, bodyAdapter: adapter }));
+    const status = runtime.control.status();
+    expect(status.body).toMatchObject({ mode: '3d', threeDimensional: true, z: 3 });
+    expect(status.observation).toMatchObject({ source: 'simulated', threeDimensional: true, mode: '3d' });
+    expect((status.observation as { error?: string }).error).toBeUndefined();
   });
 
   it('routes gather_blocks count and explore_area through the 3D skill adapters', async () => {
@@ -196,6 +213,130 @@ describe('production integration: 3D tool → executor → skill → Motor → s
     const explored = await runtime.router.invoke({ id: 'explore-1', name: 'start_skill', arguments: JSON.stringify({ skill: 'explore_area', radius: 4 }) });
     expect(explored.ok).toBe(true);
     expect((explored.result as { outcome?: string }).outcome).toBe('confirmed');
+  });
+
+  it('serves 3D navigation/gather/return when the bridge lacks legacy planar methods', async () => {
+    const { clock, world, body, adapter } = make3D();
+    const bridge = new FakeClientBridge(16, { context });
+    // A real client bridge will not expose the 2D walk/digBlock/findPlace surface.
+    const legacy = bridge as unknown as Record<string, unknown>;
+    for (const method of ['walk', 'digBlock', 'adjacentBlock', 'findPlace', 'dig', 'lookAt']) legacy[method] = undefined;
+    world.setBlock({ x: 1, y: 0, z: 3 }, 'full_cube', 'coal_ore');
+    const runtime = track(createRuntime({ profile: 'simulated', bridge, clock, bodyAdapter: adapter }));
+
+    const skills = runtime.router.availableSkills();
+    expect(skills).toEqual(expect.arrayContaining(['navigate_to', 'gather_blocks', 'return_to_place']));
+    expect(skills).not.toContain('look_at');
+    const catalog = await runtime.router.invoke({ id: 'find-3d', name: 'find_skills', arguments: '{}' });
+    expect((catalog.result as Array<{ id?: string }>).map(skill => skill.id)).toContain('navigate_to');
+
+    const navigated = await runtime.router.invoke({ id: 'nav-no-legacy', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 1, y: 0, z: 1 }) });
+    expect(navigated.ok).toBe(true);
+    expect((navigated.result as { outcome?: string }).outcome).toBe('confirmed');
+
+    const gathered = await runtime.router.invoke({ id: 'gather-no-legacy', name: 'start_skill', arguments: JSON.stringify({ skill: 'gather_blocks', block: 'coal_ore' }) });
+    expect(gathered.ok).toBe(true);
+    expect((gathered.result as { outcome?: string }).outcome).toBe('confirmed');
+    expect(world.get({ x: 1, y: 0, z: 3 }).cell).toBe('free');
+
+    const inventory = await runtime.router.invoke({ id: 'inv-3d', name: 'get_inventory', arguments: '{}' });
+    expect(inventory.result).toMatchObject({ count: 1, source: 'simulated' });
+    // The legacy bridge inventory was never used as the 3D body's inventory.
+    expect(bridge.inventory).toBe(8);
+
+    await runtime.router.invoke({ id: 'remember-3d', name: 'remember_place', arguments: JSON.stringify({ placeId: 'deep', payload: { x: 0, y: 0, z: 4 } }) });
+    const returned = await runtime.router.invoke({ id: 'return-3d', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'deep' }) });
+    expect(returned.ok).toBe(true);
+    expect(poseBlock(body.currentPose)).toEqual({ x: 0, y: 0, z: 4 });
+  });
+
+  it('does not advertise navigate_to on the legacy profile because the public tool requires x/y/z', async () => {
+    const runtime = track(createRuntime({ clock: new ManualClock() }));
+    expect(runtime.router.availableSkills()).not.toContain('navigate_to');
+    const catalog = await runtime.router.invoke({ id: 'find-legacy', name: 'find_skills', arguments: JSON.stringify({ query: 'navigate' }) });
+    expect(catalog.result).toEqual([]);
+  });
+
+  it('persists a durable dispatch barrier for collect_nearby', async () => {
+    const bridge = new FakeClientBridge(16);
+    bridge.seedDrop(0, 0, 'stone');
+    const runtime = track(createRuntime({ bridge, clock: new ManualClock() }));
+    const collected = await runtime.router.invoke({ id: 'collect-effect', name: 'start_skill', arguments: JSON.stringify({ skill: 'collect_nearby' }) });
+    expect(collected.ok).toBe(true);
+    const effects = runtime.store.listEffects();
+    expect(effects).toHaveLength(1);
+    expect(effects[0]).toMatchObject({
+      status: 'confirmed',
+      intent: { kind: 'collect' },
+      evidence: { barrier: 'pre-dispatch' },
+    });
+    const execution = runtime.store.getExecution((collected.result as { executionId: string }).executionId);
+    expect(execution).toMatchObject({ status: 'succeeded', outcome: 'confirmed' });
+  });
+
+  it('does not confirm a 3D dig without collection evidence', async () => {
+    const { clock, world, adapter } = make3D();
+    world.setBlock({ x: 1, y: 0, z: 3 }, 'full_cube', 'coal_ore');
+    const noDrop: BodyAdapter = {
+      context: adapter.context, capabilities: adapter.capabilities, source: adapter.source, clock: adapter.clock,
+      inventory: adapter.inventory,
+      observe: () => adapter.observe(), peek: () => adapter.peek(), advance: ticks => adapter.advance!(ticks),
+      submit: plan => adapter.submit(plan), release: owner => adapter.release(owner),
+      findBlock: block => adapter.findBlock!(block), findPlace: placeId => adapter.findPlace!(placeId),
+      digBlock: async (pos, block) => {
+        const result = await adapter.digBlock!(pos, block);
+        // The block disappears, but this body has no evidence that it received the item.
+        return { ...result, collected: 0, items: [] };
+      },
+    };
+    const runtime = track(createRuntime({ profile: 'simulated', bridge: new FakeClientBridge(16, { context }), clock, bodyAdapter: noDrop }));
+    const result = await runtime.router.invoke({ id: 'gather-no-drop', name: 'start_skill', arguments: JSON.stringify({ skill: 'gather_blocks', block: 'coal_ore' }) });
+    expect(result.ok).toBe(false);
+    expect(result.result).toMatchObject({ outcome: 'partial', reason: 'collection-not-observed' });
+    expect(world.get({ x: 1, y: 0, z: 3 }).cell).toBe('free');
+    expect(runtime.store.listEffects()).toEqual([expect.objectContaining({ status: 'partial' })]);
+  });
+
+  it('uses the injected Motor writer factory in the public 3D chain', async () => {
+    const { clock, adapter } = make3D();
+    let created = 0;
+    const runtime = track(createRuntime({
+      profile: 'simulated',
+      bridge: new FakeClientBridge(16, { context }),
+      clock,
+      bodyAdapter: adapter,
+      motor: deps => { created += 1; return new Motor3D(deps); },
+    }));
+    const result = await runtime.router.invoke({ id: 'injected-motor', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 1, y: 0, z: 1 }) });
+    expect(result.ok).toBe(true);
+    expect(created).toBeGreaterThan(0);
+  });
+
+  it('uses the injected legacy navigation port for planar return_to_place', async () => {
+    const bridge = new FakeClientBridge(16);
+    const calls: Array<{ x: number; y: number }> = [];
+    const runtime = track(createRuntime({
+      bridge,
+      clock: new ManualClock(),
+      nav: { navigate: (targetBridge, target, budget) => { calls.push({ ...target }); return navigate(targetBridge, target, budget); } },
+    }));
+    await runtime.router.invoke({ id: 'remember-planar', name: 'remember_place', arguments: JSON.stringify({ placeId: 'planar', payload: { x: 2, y: 0 } }) });
+    const result = await runtime.router.invoke({ id: 'return-planar', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'planar' }) });
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual([{ x: 2, y: 0 }]);
+    expect(bridge.position).toEqual({ x: 2, y: 0 });
+  });
+
+  it('assembles the public simulated-3d profile with one shared 3D body', async () => {
+    const runtime = track(createRuntime({ profile: 'simulated-3d', clock: new ManualClock() }));
+    expect(runtime.bodyAdapter).toBeDefined();
+    expect(runtime.bodyAdapter?.source).toBe('simulated');
+    expect(runtime.control.status().body).toMatchObject({ mode: '3d', threeDimensional: true, legacy2d: false });
+    const result = await runtime.router.invoke({ id: 'public-3d', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 2, y: 0, z: 2 }) });
+    expect(result.ok).toBe(true);
+    expect(poseBlock(runtime.bodyAdapter!.peek!().pose)).toEqual({ x: 2, y: 0, z: 2 });
+    expect(runtime.bridge.position).toEqual({ x: 0, y: 0 });
+    expect(() => createRuntime({ profile: 'not-a-profile' as never })).toThrow('unknown-profile');
   });
 
   it('rejects an adapter whose context does not match the bridge', () => {

@@ -141,14 +141,17 @@ export class MemoryService {
    * The only place-derived value return_to_place may use. A stale, invalid or cross-scope place
    * yields no target; execution history is never consulted as a substitute.
    */
-  returnToPlaceTarget(placeId: string, scopeValue: unknown, options: { now?: number } = {}): { x: number; y: number; placeId: string; revision: number; freshness: 'current'; scope: MemoryScope } | undefined {
+  returnToPlaceTarget(placeId: string, scopeValue: unknown, options: { now?: number } = {}): { x: number; y: number; z?: number; placeId: string; revision: number; freshness: 'current'; scope: MemoryScope } | undefined {
     const view = this.resolvePlace(placeId, scopeValue);
     if (!view) return undefined;
     const freshness = this.freshnessOf(view, options.now);
     if (freshness !== 'current') return undefined;
-    const payload = view.payload as { x?: unknown; y?: unknown } | undefined;
+    const payload = view.payload as { x?: unknown; y?: unknown; z?: unknown } | undefined;
     if (!payload || typeof payload.x !== 'number' || typeof payload.y !== 'number' || !Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return undefined;
-    return { x: payload.x, y: payload.y, placeId, revision: view.revision, freshness: 'current', scope: view.scope };
+    // A stored z is used only when it is finite. Absence stays explicit and is
+    // mapped by the caller's coordinate contract, never silently written as z=0.
+    const z = typeof payload.z === 'number' && Number.isFinite(payload.z) ? payload.z : undefined;
+    return { x: payload.x, y: payload.y, ...(z === undefined ? {} : { z }), placeId, revision: view.revision, freshness: 'current', scope: view.scope };
   }
 
   resolveReturnToPlace(placeId: string, scopeValue: unknown, options: { now?: number } = {}): { ok: true; target: NonNullable<ReturnType<MemoryService['returnToPlaceTarget']>> } | { ok: false; reason: string } {
@@ -245,9 +248,9 @@ function scopeMatches(value: MemoryScope, wanted?: MemoryScope) { return !wanted
  * bridge.findPlace, so stale/invalid/cross-scope places never become navigation targets.
  */
 export function createPlaceResolver(memory: MemoryService, scope: unknown, options: { now?: number } = {}) {
-  return (placeId: string): { x: number; y: number } | undefined => {
+  return (placeId: string): { x: number; y: number; z?: number } | undefined => {
     const target = memory.returnToPlaceTarget(placeId, scope, options);
-    return target ? { x: target.x, y: target.y } : undefined;
+    return target ? { x: target.x, y: target.y, ...(target.z === undefined ? {} : { z: target.z }) } : undefined;
   };
 }
 /** Legacy fixtures stored a plain string context; read them without weakening new write validation. */

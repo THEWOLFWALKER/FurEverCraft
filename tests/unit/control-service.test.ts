@@ -67,6 +67,43 @@ describe('U01 ControlService', () => {
     } finally { runtime.close(); }
   });
 
+  it('never reports a command accepted when its durable receipt cannot be written', async () => {
+    const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
+    const store = runtime.store as unknown as { addActionReceipt: (...args: unknown[]) => unknown };
+    const original = store.addActionReceipt.bind(runtime.store);
+    let fail = true;
+    store.addActionReceipt = (...args: unknown[]) => {
+      if (fail) { fail = false; throw new Error('receipt-disk-full'); }
+      return original(...args as Parameters<typeof original>);
+    };
+    try {
+      const result = await runtime.control.command({ requestId: 'receipt-unavailable', command: 'goal.set', payload: { goalId: 'g-receipt', text: 'must not start' } });
+      expect(result).toMatchObject({ state: 'unknown', code: 'receipt-unavailable' });
+      // No durable receipt means no execution: the goal write must not have happened.
+      expect(runtime.store.getGoal('g-receipt')).toBeUndefined();
+      const receipt = runtime.store.getActionReceipt('control:simulated', 'receipt-unavailable');
+      expect(receipt).toBeUndefined();
+    } finally { runtime.close(); }
+  });
+
+  it('reports unknown when the completion receipt write fails after execution', async () => {
+    const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
+    const store = runtime.store as unknown as { updateActionReceipt: (...args: unknown[]) => unknown };
+    const original = store.updateActionReceipt.bind(runtime.store);
+    let fail = true;
+    store.updateActionReceipt = (...args: unknown[]) => {
+      if (fail) { fail = false; throw new Error('receipt-write-failed'); }
+      return original(...args as Parameters<typeof original>);
+    };
+    try {
+      const result = await runtime.control.command({ requestId: 'receipt-commit-fail', command: 'goal.set', payload: { goalId: 'g-commit', text: 'applied but unrecorded' } });
+      expect(result).toMatchObject({ state: 'unknown', code: 'receipt-write-failed' });
+      // The command may have taken effect; the response must not claim a durable terminal.
+      expect(runtime.store.getGoal('g-commit')?.revision).toBe(1);
+      expect(runtime.store.getActionReceipt('control:simulated', 'receipt-commit-fail')?.status).toBe('pending');
+    } finally { runtime.close(); }
+  });
+
   it('returns CAS conflict and does not claim accepted chat is succeeded', async () => {
     const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
     try {

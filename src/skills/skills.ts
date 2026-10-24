@@ -2,6 +2,7 @@ import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { Lease, Progress } from '../execution/runtime.js';
 import { getAttachedBodyAdapter } from '../motor/contracts.js';
 import { navigate, navigateToSkill, returnToPlaceSkill, exploreAreaSkill, gatherBlocksSkill } from './navigation.js';
+import type { MotorFactory } from '../motor/controller.js';
 
 export type PlaceResolution = { ok: true; target: { x: number; y: number; z?: number } } | { ok: false; reason: string };
 export type SkillContext = {
@@ -18,6 +19,10 @@ export type SkillContext = {
    * closed instead of falling back to `bridge.findPlace`.
    */
   resolvePlace?: (placeId: string) => PlaceResolution | Promise<PlaceResolution>;
+  /** Injected legacy navigation implementation; only the explicit planar path consults it. */
+  nav?: { navigate: typeof navigate };
+  /** Injected Motor writer factory for the 3D control loop. */
+  motor?: MotorFactory;
 };
 export type SkillResult = { ok: boolean; outcome: 'confirmed' | 'partial' | 'ambiguous' | 'failed' | 'canceled'; value?: unknown; reason?: string };
 const canceled = (ctx: SkillContext) => { if (ctx.isCanceled?.()) return true; return false; };
@@ -40,7 +45,7 @@ export function navigateTo(ctx: SkillContext, target: { x: number; y: number; z?
     return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   }
   ctx.report({ stage: 'dispatch', completed: 0, message: 'planning' });
-  const result = navigate(ctx.bridge, { x: target.x, y: target.y }, budget);
+  const result = (ctx.nav?.navigate ?? navigate)(ctx.bridge, { x: target.x, y: target.y }, budget);
   ctx.report({ stage: 'dispatch', completed: result.path.length, total: result.path.length, message: result.status });
   return result.status === 'succeeded' ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'failed', reason: result.reason, value: result };
 }
@@ -194,16 +199,19 @@ async function gatherBlocks3D(ctx: SkillContext, block: string, requested: numbe
     const result = await gatherBlocksSkill(ctx, block);
     const value = result.value as { collected?: unknown; items?: unknown } | undefined;
     if (result.outcome !== 'confirmed') {
-      const partial = gathered + Math.max(0, Number(value?.collected ?? 0));
       return {
         ok: false,
-        outcome: partial > 0 ? 'partial' : 'failed',
+        // A partial 3D dig means the block may have been removed without proof of
+        // pickup; preserve that partial effect even when zero items were gathered.
+        outcome: gathered > 0 || result.outcome === 'partial' ? 'partial' : 'failed',
         reason: result.reason ?? 'gather-not-confirmed',
-        value: { gathered: partial, requested, items },
+        value: { gathered, requested, items, ...(value?.collected === undefined ? {} : { collected: value.collected }) },
       };
     }
-    const collected = Math.max(0, Number(value?.collected ?? 1));
-    gathered += collected;
+    // One confirmed block per loop iteration. A confirmed 3D gather must carry
+    // positive collection evidence; a free cell alone is not proof this body
+    // received the block (enforced in gatherBody).
+    gathered += 1;
     if (Array.isArray(value?.items)) items.push(...value.items.map(String));
   }
   return { ok: true, outcome: 'confirmed', value: { gathered, requested, items } };

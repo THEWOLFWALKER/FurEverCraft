@@ -12,6 +12,7 @@ import { redactError } from '../diagnostics/redaction.js';
 import { MemoryService, createPlaceResolver, type MemoryScope } from '../autonomous/memory.js';
 import { KnowledgeService, knowledgeToolDefinitions } from '../autonomous/knowledge.js';
 import { getAttachedBodyAdapter, bodyStateFromObservation } from '../motor/contracts.js';
+import type { MotorFactory } from '../motor/controller.js';
 import type { SkillLifecycle } from '../skills/lifecycle.js';
 import { syntheticCapture } from '../autonomous/bounds.js';
 
@@ -77,6 +78,10 @@ export type ToolRouterExtras = {
   knowledge?: KnowledgeService;
   lifecycle?: SkillLifecycle;
   memoryScope?: MemoryScope;
+  /** Injected legacy navigation port used only by the explicit planar path. */
+  nav?: { navigate: typeof import('../skills/navigation.js').navigate };
+  /** Injected Motor writer factory used by the 3D control loop. */
+  motor?: MotorFactory;
 };
 
 export class ToolRouter {
@@ -85,10 +90,14 @@ export class ToolRouter {
   private readonly knowledge?: KnowledgeService;
   private readonly lifecycle?: SkillLifecycle;
   private readonly memoryScope: MemoryScope;
+  private readonly nav?: ToolRouterExtras['nav'];
+  private readonly motor?: MotorFactory;
   constructor(private readonly bridge: ClientBridgeCapabilities, private readonly store?: SQLiteStore, private readonly events?: EventHub, executor?: Executor, memory?: MemoryService, private readonly clockNow: () => number = () => Date.now(), private readonly admission?: ExecutionAdmission, extras: ToolRouterExtras = {}) {
     if (store) { this.executor = executor ?? new Executor(bridge, store); this.memory = memory ?? new MemoryService(store); }
     this.knowledge = extras.knowledge;
     this.lifecycle = extras.lifecycle;
+    this.nav = extras.nav;
+    this.motor = extras.motor;
     this.memoryScope = extras.memoryScope ?? memoryScopeOf(bridge.context);
   }
   /** Skills the current body can actually run, derived from capability presence rather than a hard-coded list. */
@@ -96,13 +105,21 @@ export class ToolRouter {
     const all = skillManifests.map(manifest => manifest.id as string);
     const body = getAttachedBodyAdapter(this.bridge);
     return all.filter(id => {
-      // A 3D body adapter supplies these paths; the legacy bridge capabilities are irrelevant.
-      if (body && (id === 'navigate_to' || id === 'explore_area' || id === 'gather_blocks' || id === 'return_to_place')) return true;
+      // A 3D adapter is the body for movement/exploration/gather skills. Only the
+      // methods and capabilities it actually declares make a skill available.
+      if (body) {
+        const movement = body.capabilities.threeDimensional && body.capabilities.walk;
+        if (id === 'navigate_to' || id === 'explore_area' || id === 'return_to_place') return movement;
+        if (id === 'gather_blocks') return movement && Boolean(body.findBlock && body.digBlock);
+      }
       if (id === 'look_at') return Boolean(this.bridge.lookAt);
       if (id === 'dig_one') return Boolean(this.bridge.dig);
       if (id === 'gather_blocks') return Boolean(this.bridge.digBlock && this.bridge.adjacentBlock);
       if (id === 'collect_nearby') return Boolean(this.bridge.collectNearby);
       if (id === 'return_to_place') return Boolean(this.memory || this.bridge.findPlace);
+      // navigate_to requires x/y/z and is served only by the 3D adapter path.
+      if (id === 'navigate_to') return false;
+      if (id === 'send_chat') return Boolean(this.bridge.dispatchChat);
       return true;
     });
   }
@@ -132,7 +149,21 @@ export class ToolRouter {
           };
           break;
         }
-        case 'get_inventory': result = { count: this.bridge.inventory, source: 'simulated' }; break;
+        case 'get_inventory': {
+          const body = getAttachedBodyAdapter(this.bridge);
+          if (body) {
+            // The adapter owns 3D-body inventory evidence. A legacy bridge read here
+            // would silently answer from a different (planar) body.
+            if (typeof body.inventory !== 'number' || !Number.isInteger(body.inventory) || body.inventory < 0) {
+              return { callId: call.id, name: call.name, ok: false, error: 'inventory-unavailable' };
+            }
+            result = { count: body.inventory, source: body.source, ...(body.peek ? { revision: body.peek().revision } : {}) };
+            break;
+          }
+          const snapshot = this.bridge.snapshot();
+          result = { count: snapshot.inventory, source: snapshot.source, revision: snapshot.revision, freshness: snapshot.freshness };
+          break;
+        }
         case 'query_local_world': {
           const body = getAttachedBodyAdapter(this.bridge);
           if (body) {
@@ -150,8 +181,25 @@ export class ToolRouter {
           result = { mode: 'legacy-2d', threeDimensional: false, legacy2d: true, source: snapshot.source, freshness: snapshot.freshness, revision: snapshot.revision, gap: snapshot.gap, cells: snapshot.cells };
           break;
         }
-        case 'capture_view': result = syntheticCapture('tool-request', Date.now(), this.bridge.snapshot().revision); break;
-        case 'find_skills': result = findSkills(args.query as string | undefined); break;
+        case 'capture_view': {
+          // Capture is explicitly synthetic in this batch. Even so, a 3D body's
+          // revision must come from its own observation, not the legacy bridge.
+          const body = getAttachedBodyAdapter(this.bridge);
+          if (body) {
+            try { result = syntheticCapture('tool-request', this.clockNow(), (await body.observe()).revision); }
+            catch (error) { return { callId: call.id, name: call.name, ok: false, error: redactError(error) }; }
+            break;
+          }
+          result = syntheticCapture('tool-request', this.clockNow(), this.bridge.snapshot().revision);
+          break;
+        }
+        case 'find_skills': {
+          // "Find available skills" must reflect the attached body, not the whole
+          // registry: a listed skill is one the model can actually start.
+          const available = new Set(this.availableSkills());
+          result = findSkills(args.query as string | undefined).filter(skill => available.has(skill.id));
+          break;
+        }
         // A missing backing service must report failure, not a successful undefined.
         case 'get_execution': if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' }; result = this.store.getExecution(String(args.executionId)); if (!result) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' }; break;
         case 'read_events': if (!this.events) return { callId: call.id, name: call.name, ok: false, error: 'events-unavailable' }; result = this.events.read(String(args.cursor ?? '0'), Number(args.limit ?? 100), args.filter as string | undefined); break;
@@ -181,7 +229,8 @@ export class ToolRouter {
             : skill === 'return_to_place' ? String(args.placeId) : undefined;
           // The effect row references the execution, so it is written by the executor hook once the
           // execution exists. Prepared intent is persisted before dispatch; only a confirmed outcome settles it.
-          const sideEffect = skill === 'place_one' || skill === 'send_chat' || skill === 'dig_one' || skill === 'gather_blocks';
+          // collect_nearby mutates inventory and therefore needs the same durable barrier as dig/chat/place.
+          const sideEffect = skill === 'place_one' || skill === 'send_chat' || skill === 'dig_one' || skill === 'gather_blocks' || skill === 'collect_nearby';
           const run = await this.runWriteSkill(call, skill, args, executeArgs, sideEffect, admissionContext);
           if (!run.ok) {
             this.events?.publish(`tool.${call.name}`, { callId: call.id, result: run.result }, false);
@@ -265,7 +314,7 @@ export class ToolRouter {
           context: this.bridge.context,
           status: 'prepared',
           intent: {
-            kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : 'dig',
+            kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : skill === 'collect_nearby' ? 'collect' : 'dig',
             x: typeof executeArgs === 'object' && executeArgs !== null ? (executeArgs as { x?: number }).x : undefined,
             y: typeof executeArgs === 'object' && executeArgs !== null ? (executeArgs as { y?: number }).y : undefined,
             text: skill === 'send_chat' ? String(executeArgs) : undefined,
@@ -297,7 +346,7 @@ export class ToolRouter {
       const invokeSkill = async (lifeSignal?: AbortSignal) => {
         const current = () => signal.aborted || Boolean(lifeSignal?.aborted);
         const result = (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)(
-          { bridge: this.bridge, lease, report: guardedReport, isCanceled: current, ...(lifeSignal ? { isPaused: current } : {}), ...(resolvePlace ? { resolvePlace } : {}), clock: skillClock },
+          { bridge: this.bridge, lease, report: guardedReport, isCanceled: current, ...(lifeSignal ? { isPaused: current } : {}), ...(resolvePlace ? { resolvePlace } : {}), ...(this.nav ? { nav: this.nav } : {}), ...(this.motor ? { motor: this.motor } : {}), clock: skillClock },
           executeArgs,
         );
         return result instanceof Promise ? await result : result;
@@ -321,7 +370,7 @@ export class ToolRouter {
       const current = effect?.status;
       // Keep the pre-dispatch barrier evidence: settlement must not erase the audit trail that
       // proves the durable barrier was crossed before any world action.
-      const evidence = { ...(effect?.evidence as Record<string, unknown> | undefined), executionId: execution.executionId, outcome: execution.outcome };
+      const evidence = { ...(effect?.evidence as Record<string, unknown> | undefined), executionId: execution.executionId, outcome: execution.outcome, ...(execution.reason ? { reason: execution.reason } : {}) };
       // Only an explicitly confirmed skill settles the effect. A prepared-but-never-dispatched
       // effect stays distinguishable from one that may have reached the body.
       if (execution.outcome === 'confirmed') this.store.updateEffect(effectId, 'confirmed', evidence);
@@ -329,7 +378,10 @@ export class ToolRouter {
       else if (current === 'prepared') this.store.updateEffect(effectId, 'prepared', { ...evidence, dispatched: false });
       else this.store.updateEffect(effectId, 'ambiguous', evidence);
     }
-    if (execution.outcome === 'ambiguous' || execution.status === 'failed' || execution.status === 'canceled') {
+    // Only an explicitly confirmed execution is a successful tool call. Partial,
+    // ambiguous, failed and canceled outcomes are reported as failures; a partial
+    // effect may still have changed the world and must not look complete.
+    if (execution.status !== 'succeeded' || execution.outcome !== 'confirmed') {
       return { ok: false, result: execution, error: execution.reason ?? execution.outcome ?? execution.status };
     }
     return { ok: true, result: execution };

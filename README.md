@@ -12,7 +12,7 @@ The target game profile is Minecraft Java 26.3. Protocol/data/runtime values are
 
 ## Scope
 
-This development batch covers all 30 items F01-F06, B01-B06, U01-U04, M01-M05, A01-A05, V01-V04. It closes the C1/C2/C3 convergence work and completes related prior-stage runtime gaps. Do not stop after one vertical chain or shrink the delivery to a demo-only slice.
+This development batch is **P01–P24** in `NEXT_BATCH.md`. The older F/B/U/M/A/V groups are historical traceability labels, not the current task numbering. The batch closes the C1/C2/C3 convergence work and related prior-stage runtime gaps; it is not a demo-only slice.
 
 The architecture is one real Java client body, original-player identity, raw TCP relay with read-only observer sidecar, Windows 10/11 input helper, one Runtime and shared ControlService for CLI/web. The v0.2 route is raw byte forwarding plus sidecar observation, not an application-level terminating proxy or second protocol bot.
 
@@ -44,14 +44,20 @@ npm run test:soak:offline
 npm run test:web
 npm run test:web:e2e
 npm run demo:offline
-npm run demo:autonomy -- --scenario gather-return
+npm run demo:autonomy
 npm run doctor -- --profile simulated
+npm run doctor -- --profile simulated-3d
 npm run bridge:fixture
 npm run cli -- bridge --mode inspect --config configs/client-offline.example.json
 npm run serve -- --profile simulated
+npm run serve -- --profile simulated-3d
 npm run cli -- attach --url http://127.0.0.1:3000
 ```
 
+`simulated` is the explicit legacy planar profile. `simulated-3d` assembles the
+same ControlService/runtime and the simulated 3D BodyAdapter/Motor chain; it is
+simulated evidence, not a real 26.3 client.
+
 ## Evidence status
 
-Read `PROGRESS.md` and `DELIVERY_REPORT.md` for current implementation and verification states. Design documents are contracts, not implementation evidence. Local Node 20 verification is not Node 22 evidence; a CI workflow definition is not a passing CI run. Real client/server/Windows/API compatibility remains unverified until separately authorized testing.
+Read `PROGRESS.md` and `DELIVERY_REPORT.md` for current implementation and verification states. Design documents are contracts, not implementation evidence. Local Node 22 (`v22.23.4`) verification is not proof that cloud CI ran; a CI workflow definition is not a passing CI run. Real client/server/Windows/API compatibility remains unverified until separately authorized testing.
