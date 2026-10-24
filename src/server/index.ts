@@ -202,6 +202,9 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
   app.get('/api/v1/places', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.places(); });
   app.get('/api/v1/memories', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return { places: control.places(), episodes: runtime?.store.listEpisodes() ?? [] }; });
   app.get('/api/v1/provider', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.provider(); });
+  // The P21 doctor report is a read-only view over the same attached Runtime. It goes through
+  // the same pairing/bearer/Origin policy as every other read and is redacted before transmission.
+  app.get('/api/v1/doctor', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact(control.diagnostics()); });
   app.get('/api/v1/config', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact({ provider: control.provider(), profile: control.capabilities().profile, pairing: Boolean(pairing), cliAccess: options.cliBearer ? 'configured' : 'not-configured' }); });
   app.get('/api/v1/events', async (request, reply) => {
     if (!authorizeRequest(request, reply)) return reply;
