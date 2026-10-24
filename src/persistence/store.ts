@@ -65,12 +65,16 @@ export class SQLiteStore {
         receipt_id TEXT PRIMARY KEY, scope TEXT NOT NULL, command_id TEXT NOT NULL, status TEXT NOT NULL,
         result_json TEXT, context_json TEXT, payload_hash TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         UNIQUE(scope, command_id));
+      CREATE TABLE IF NOT EXISTS knowledge_releases(
+        release_id TEXT PRIMARY KEY, version TEXT NOT NULL, release_json TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS knowledge_active(release_id TEXT PRIMARY KEY, activated_at TEXT NOT NULL);
     `);
     const receiptColumns = this.db.prepare('PRAGMA table_info(action_receipts)').all() as Array<{ name: string }>;
     if (!receiptColumns.some(column => column.name === 'payload_hash')) this.db.exec('ALTER TABLE action_receipts ADD COLUMN payload_hash TEXT');
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)').run(now());
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(now());
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(now());
+    this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)').run(now());
     })();
     // Widening primary keys rebuilds tables, so it runs outside the schema DDL transaction.
     this.db.transaction(() => {
@@ -388,6 +392,52 @@ export class SQLiteStore {
   private touchScope(context: unknown) {
     if (context === undefined) return;
     this.db.prepare("INSERT INTO memory_scope(key,value) VALUES ('current',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(json(context));
+  }
+
+  /**
+   * Publish a fully validated knowledge release and, atomically, make it active. A partial
+   * failure rolls back both writes; release ids are immutable once published.
+   */
+  publishKnowledgeRelease(release: { releaseId: string; version: string; payload: unknown; createdAt?: string }, activate = true) {
+    return this.transaction(() => {
+      const existing = this.db.prepare('SELECT * FROM knowledge_releases WHERE release_id=?').get(release.releaseId) as any;
+      if (existing) {
+        if (existing.version !== release.version || !sameJson(parse(existing.release_json), release.payload)) throw new Error('knowledge-release-conflict');
+      } else {
+        this.db.prepare('INSERT INTO knowledge_releases(release_id,version,release_json,created_at) VALUES (?,?,?,?)')
+          .run(release.releaseId, release.version, json(release.payload), release.createdAt ?? now());
+      }
+      if (activate) {
+        this.db.prepare('DELETE FROM knowledge_active').run();
+        this.db.prepare('INSERT INTO knowledge_active(release_id,activated_at) VALUES (?,?)').run(release.releaseId, now());
+      }
+      return this.getKnowledgeRelease(release.releaseId)!;
+    });
+  }
+
+  activateKnowledgeRelease(releaseId: string) {
+    return this.transaction(() => {
+      const existing = this.db.prepare('SELECT release_id FROM knowledge_releases WHERE release_id=?').get(releaseId);
+      if (!existing) throw new Error('knowledge-release-missing');
+      this.db.prepare('DELETE FROM knowledge_active').run();
+      this.db.prepare('INSERT INTO knowledge_active(release_id,activated_at) VALUES (?,?)').run(releaseId, now());
+      return this.getKnowledgeRelease(releaseId)!;
+    });
+  }
+
+  getKnowledgeRelease(releaseId: string) {
+    const row = this.db.prepare('SELECT * FROM knowledge_releases WHERE release_id=?').get(releaseId) as any;
+    return row ? { releaseId: row.release_id, version: row.version, payload: parse(row.release_json), createdAt: row.created_at } : undefined;
+  }
+
+  getActiveKnowledgeRelease() {
+    const row = this.db.prepare('SELECT r.* FROM knowledge_active a JOIN knowledge_releases r ON r.release_id=a.release_id LIMIT 1').get() as any;
+    return row ? { releaseId: row.release_id, version: row.version, payload: parse(row.release_json), createdAt: row.created_at } : undefined;
+  }
+
+  listKnowledgeReleases() {
+    return (this.db.prepare('SELECT * FROM knowledge_releases ORDER BY created_at, release_id').all() as any[])
+      .map(row => ({ releaseId: row.release_id, version: row.version, payload: parse(row.release_json), createdAt: row.created_at }));
   }
 
   /**
