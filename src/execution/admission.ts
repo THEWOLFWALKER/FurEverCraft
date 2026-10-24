@@ -1,5 +1,6 @@
 import type { BodyContext } from '../contracts/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
+import { getAttachedBodyAdapter } from '../motor/contracts.js';
 import type { SQLiteStore } from '../persistence/store.js';
 
 /** Skills that submit input to the body. Read-only observation skills are not listed. */
@@ -33,6 +34,22 @@ export const sameBodyContext = (left: BodyContext, right: BodyContext) =>
 
 /** Missing capability of the concrete body for a skill, if any. */
 export function missingSkillCapability(body: ClientBridgeCapabilities, skillId: string): string | undefined {
+  // When a 3D adapter is attached it is the body for movement/gather skills. The
+  // legacy bridge methods must not gate those skills: a real production bridge
+  // does not implement the planar walk/digBlock/findPlace surface.
+  const adapter = getAttachedBodyAdapter(body);
+  if (adapter) {
+    const movement = adapter.capabilities.threeDimensional && adapter.capabilities.walk ? undefined : 'movement-unavailable';
+    switch (skillId) {
+      case 'navigate_to':
+      case 'explore_area':
+      case 'return_to_place': return movement;
+      case 'gather_blocks':
+        if (movement) return movement;
+        return adapter.findBlock && adapter.digBlock ? undefined : 'gather-capability-unavailable';
+      default: break;
+    }
+  }
   switch (skillId) {
     case 'look_at': return body.lookAt ? undefined : 'orientation-unavailable';
     case 'dig_one': return body.dig ? undefined : 'dig-capability-unavailable';
@@ -40,7 +57,9 @@ export function missingSkillCapability(body: ClientBridgeCapabilities, skillId: 
     case 'collect_nearby': return body.collectNearby ? undefined : 'collection-capability-unavailable';
     case 'return_to_place': return body.findPlace ? undefined : 'place-navigation-capability-unavailable';
     case 'send_chat': return body.dispatchChat ? undefined : 'chat-dispatch-unavailable';
-    case 'navigate_to': return typeof body.walk === 'function' ? undefined : 'movement-unavailable';
+    // The public navigate_to tool requires world x/y/z, so it cannot fall back
+    // to the planar bridge. A legacy body therefore does not advertise it.
+    case 'navigate_to': return 'movement-unavailable';
     case 'place_one': return typeof body.place === 'function' ? undefined : 'place-unavailable';
     default: return undefined;
   }

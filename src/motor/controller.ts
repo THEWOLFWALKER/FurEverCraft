@@ -8,7 +8,7 @@ import {
   edgeProgress, horizontalDistance, observationUsable, poseBlock, preconditionKeys, stepDirection, stepLanded,
   stepTarget, worldFromObservation, yawDelta, type TemporaryFailure,
 } from './route.js';
-import type { ActionCapability, BlockPos, NavRoute, Pose3D, RouteStep } from './types.js';
+import type { ActionCapability, BlockPos, MotorAsyncDeps, NavRoute, Pose3D, RouteStep } from './types.js';
 
 export type ControlBudget = {
   maxTicks: number;
@@ -52,12 +52,17 @@ export type MotionControllerOptions = {
   budget?: Partial<ControlBudget>;
   planner?: ActionPlannerOptions;
   progress?: ProgressController;
+  /** Per-execution Motor writer factory; the default is Motor3D over the same body. */
+  motor?: MotorFactory;
   /** Called once when the run abandons its lease (pause, target change, disconnect, stale observation, focus loss). */
   onLeaseRevoke?: (reason: string) => void;
   /** Optional wall-clock wait used only when the body has no virtual advance hook. */
   waitTick?: () => Promise<void>;
   onProgress?: (stage: 'plan' | 'execute' | 'verify', completed: number, total: number, message: string) => void;
 };
+
+/** The production control loop can receive a different Motor writer through the same contract. */
+export type MotorFactory = (deps: MotorAsyncDeps) => Pick<Motor3D, 'orientTo' | 'walk' | 'jumpShort' | 'stop' | 'release'>;
 
 export type TargetRevision = { expected: number; current: () => number };
 
@@ -315,7 +320,8 @@ export class MotionController {
     stopReason: () => string | undefined,
     budgetExhausted: () => boolean,
   ): Promise<{ outcome: 'confirmed' | 'failed' | 'canceled' | 'replan'; pose?: Pose3D; reason?: string }> {
-    const motor = new Motor3D({ context: this.body.context, clock: this.clock, body: this.body, leaseId: request.leaseId, ownerToken: request.ownerToken });
+    const motor = this.options.motor?.({ context: this.body.context, clock: this.clock, body: this.body, leaseId: request.leaseId, ownerToken: request.ownerToken })
+      ?? new Motor3D({ context: this.body.context, clock: this.clock, body: this.body, leaseId: request.leaseId, ownerToken: request.ownerToken });
     const direction = stepDirection(step);
     const targetPose = stepTarget(step);
     let observation = await this.body.observe();

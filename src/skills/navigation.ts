@@ -3,7 +3,7 @@ import { nextId, type Clock } from '../contracts/index.js';
 import type { BodyAdapter, WorldObservation } from '../motor/contracts.js';
 import { getAttachedBodyAdapter, isReal3DObservation, resolveTarget3D } from '../motor/contracts.js';
 import type { BlockPos } from '../motor/types.js';
-import { MotionController, type ControlBudget, type NavigationResult as BodyControllerResult, type TargetRevision } from '../motor/controller.js';
+import { MotionController, type ControlBudget, type MotorFactory, type NavigationResult as BodyControllerResult, type TargetRevision } from '../motor/controller.js';
 import { observationUsable, poseBlock, poseDistance, worldFromObservation } from '../motor/route.js';
 
 export type NavigationResult = { executionId: string; status: 'succeeded' | 'failed'; path: string[]; reason?: string };
@@ -56,6 +56,8 @@ export type BodyNavigationOptions = {
   /** Local replan budget; defaults to the controller's bounded default. */
   maxReplans?: number;
   budget?: Partial<ControlBudget>;
+  /** Injected Motor writer factory for every executed edge. */
+  motor?: MotorFactory;
   signal?: AbortSignal;
   isPaused?: () => boolean;
   watch?: () => string | undefined;
@@ -83,6 +85,7 @@ export async function navigateBody(body: BodyAdapter, clock: Clock, target: Bloc
   const controller = new MotionController(body, clock, {
     ...(options.budget ? { budget: options.budget } : {}),
     ...(options.maxReplans !== undefined ? { budget: { ...(options.budget ?? {}), maxReplans: options.maxReplans } } : {}),
+    ...(options.motor ? { motor: options.motor } : {}),
     ...(options.onLeaseRevoke ? { onLeaseRevoke: options.onLeaseRevoke } : {}),
     ...(options.onProgress ? { onProgress: options.onProgress } : {}),
   });
@@ -236,13 +239,20 @@ export async function gatherBody(body: BodyAdapter, clock: Clock, block: string,
   const observed = after.cells.get(`${target.x},${target.y},${target.z}`);
   const observedFree = observed?.cell === 'free';
   if (!dig.accepted) return { executionId, status: dig.ambiguous ? 'partial' : 'failed', reason: dig.ambiguous ? 'dig-ambiguous' : 'dig-rejected', target, ...(navigation ? { navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path } } : {}), collected: dig.collected, items: dig.items, observedFree };
+  // An accepted dig and a now-free cell describe the block, not this body's pickup.
+  // Require positive, internally consistent collection evidence before claiming success.
+  const collected = Number.isInteger(dig.collected) && dig.collected > 0 ? dig.collected : 0;
+  const items = Array.isArray(dig.items) ? dig.items : [];
+  if (!observedFree) return { executionId, status: 'partial', reason: 'target-not-observed-free', target, ...(navigation ? { navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path } } : {}), collected, items, observedFree };
+  if (collected === 0 || items.length < collected) {
+    return { executionId, status: 'partial', reason: 'collection-not-observed', target, ...(navigation ? { navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path } } : {}), collected, items, observedFree };
+  }
   return {
     executionId,
-    status: observedFree ? 'confirmed' : 'partial',
-    ...(observedFree ? {} : { reason: 'target-not-observed-free' }),
+    status: 'confirmed',
     target,
     ...(navigation ? { navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path } } : {}),
-    collected: dig.collected, items: dig.items, observedFree,
+    collected, items, observedFree,
   };
 }
 
@@ -278,6 +288,7 @@ export type BodySkillContext = {
   isCanceled?: () => boolean;
   isPaused?: () => boolean;
   clock?: Clock;
+  motor?: MotorFactory;
 };
 
 /**
@@ -298,6 +309,7 @@ export async function navigateToSkill(ctx: BodySkillContext, target: { x: number
     leaseId: ctx.lease.leaseId,
     ownerToken: ctx.lease.owner,
     maxReplans: budget,
+    ...(ctx.motor ? { motor: ctx.motor } : {}),
     ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}),
     onProgress: (stage, completed, total, message) => ctx.report({ stage: stage === 'plan' ? 'dispatch' : 'verify', completed, total, message }),
   });
@@ -309,7 +321,7 @@ export async function returnToPlaceSkill(ctx: BodySkillContext, placeId: string,
   if (!body) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   const clock = body.clock ?? ctx.clock;
   if (!clock) return { ok: false, outcome: 'failed', reason: 'clock-required' };
-  const result = await returnToPlaceBody(body, clock, placeId, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
+  const result = await returnToPlaceBody(body, clock, placeId, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
   return toSkillResult(result);
 }
 
@@ -318,7 +330,7 @@ export async function exploreAreaSkill(ctx: BodySkillContext, radius: number, bu
   if (!body) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   const clock = body.clock ?? ctx.clock;
   if (!clock) return { ok: false, outcome: 'failed', reason: 'clock-required' };
-  const result = await exploreBody(body, clock, radius, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
+  const result = await exploreBody(body, clock, radius, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
   return toSkillResult(result);
 }
 
@@ -327,7 +339,7 @@ export async function gatherBlocksSkill(ctx: BodySkillContext, block: string, bu
   if (!body) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   const clock = body.clock ?? ctx.clock;
   if (!clock) return { ok: false, outcome: 'failed', reason: 'clock-required' };
-  const result = await gatherBody(body, clock, block, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}), onBeforeDig: () => ctx.report({ stage: 'dispatch', completed: 0, total: 1, message: 'dig' }) });
+  const result = await gatherBody(body, clock, block, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}), onBeforeDig: () => ctx.report({ stage: 'dispatch', completed: 0, total: 1, message: 'dig' }) });
   const outcome = result.status === 'confirmed' ? 'confirmed' : result.status === 'partial' ? 'partial' : result.status === 'canceled' ? 'canceled' : 'failed';
   return outcome === 'confirmed'
     ? { ok: true, outcome, value: result }

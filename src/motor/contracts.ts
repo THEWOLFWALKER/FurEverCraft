@@ -86,6 +86,12 @@ export interface BodyAdapter extends InputSink {
   readonly capabilities: BodyCapabilities;
   readonly source: BodySource;
   /**
+   * Current inventory count when the adapter has evidence for it. Real
+   * adapters omit this until an inventory projection exists; tools must then
+   * report inventory as unavailable instead of reading the legacy bridge.
+   */
+  readonly inventory?: number;
+  /**
    * Clock domain used by this body's observations. When present, controllers
    * and skills must use it rather than an unrelated wall clock, otherwise
    * observation age is meaningless. Real adapters may share the Runtime clock.

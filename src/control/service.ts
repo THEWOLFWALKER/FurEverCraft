@@ -108,14 +108,43 @@ export class ControlService {
       context: { ...this.runtime.bridge.context },
       session: { state: this.runtime.session.state, recoveryAttempts: this.runtime.session.recoveryAttempts, recoveryBudget: this.runtime.session.recoveryBudget },
     };
+    const adapter = this.runtime.bodyAdapter;
     let snapshot: ReturnType<typeof this.runtime.bridge.snapshot> | undefined;
     let observationError: string | undefined;
-    try { snapshot = this.runtime.bridge.snapshot(); }
-    catch (error) { observationError = error instanceof Error ? error.message : String(error); }
+    // A 3D body must not depend on the legacy bridge snapshot. Reading it in parallel
+    // could fail the whole status or leak a second (planar) world into the UI.
+    if (!adapter) {
+      try { snapshot = this.runtime.bridge.snapshot(); }
+      catch (error) { observationError = error instanceof Error ? error.message : String(error); }
+    }
     const body = this.bodyState(snapshot);
+    if (adapter) {
+      let observed;
+      try { observed = adapter.peek?.(); } catch { observed = undefined; }
+      const cells = observed?.cells;
+      return {
+        ...base,
+        body,
+        state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state,
+        // 3D cells have their own x/y/z contract; they are not relabelled into the
+        // legacy planar map. The web shows an explicit empty/unknown map instead.
+        context: { ...this.runtime.bridge.context },
+        position: undefined,
+        inventory: typeof adapter.inventory === 'number' && Number.isInteger(adapter.inventory) && adapter.inventory >= 0 ? adapter.inventory : undefined,
+        ui: undefined,
+        observation: {
+          source: adapter.source,
+          freshness: observed?.freshness ?? 'unknown',
+          gap: observed?.gap ?? true,
+          revision: observed?.revision ?? 'unknown',
+          unknownCells: cells ? [...cells.values()].filter(cell => cell.cell === 'unknown' || cell.cell === 'unsupported').length : undefined,
+          threeDimensional: true,
+          mode: '3d',
+        },
+      };
+    }
     if (!snapshot) {
       // A failed observation is unknown, not an empty world. Never turn a read error into cells={}.
-      // An attached 3D body is still reported from its own observation, not from the 2D bridge.
       return { ...base, body, state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state, observation: { source: 'unknown', freshness: 'unknown', gap: true, ...(observationError ? { error: redact(observationError) } : {}) }, position: undefined, inventory: undefined, ui: undefined };
     }
     // Expose the observed cells so the top-down view reads real state instead of an absent field.
@@ -124,8 +153,7 @@ export class ControlService {
       body,
       state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state,
       context: { ...this.runtime.bridge.context, cells: snapshot.cells },
-      // Legacy planar position is explicit 2D data; a 3D body reports its pose in `body`.
-      position: this.runtime.bodyAdapter ? undefined : snapshot.position,
+      position: snapshot.position,
       inventory: snapshot.inventory,
       ui: snapshot.ui,
       observation: {
@@ -135,8 +163,8 @@ export class ControlService {
         revision: snapshot.revision,
         unknownCells: Object.values(snapshot.cells).filter(cell => cell === 'unknown').length,
         fields: snapshot.fields,
-        threeDimensional: Boolean(this.runtime.bodyAdapter),
-        mode: this.runtime.bodyAdapter ? '3d' : 'legacy-2d',
+        threeDimensional: false,
+        mode: 'legacy-2d',
       },
     };
   }
@@ -198,7 +226,12 @@ export class ControlService {
       return { requestId: request.requestId, command: request.command, state: replayState, result: old.result, payloadHash };
     }
     try { this.runtime.store.addActionReceipt({ receiptId: request.requestId, scope, commandId: request.requestId, status: 'pending', payloadHash }); }
-    catch { this.inflight.delete(claimKey); return { requestId: request.requestId, command: request.command, state: 'accepted', code: 'in-flight', payloadHash }; }
+    catch {
+      // The command has not started. Reporting "accepted/in-flight" here would claim
+      // work that no durable receipt or execution exists for.
+      this.inflight.delete(claimKey);
+      return { requestId: request.requestId, command: request.command, state: 'unknown', code: 'receipt-unavailable', payloadHash };
+    }
     const execution = this.execute(request);
     const settledRun = execution.then(() => undefined, () => undefined);
     this.activeRuns.set(request.requestId, settledRun);
@@ -211,7 +244,11 @@ export class ControlService {
       // store is only closed here when that commit already happened.
       if (this.committedRequestId === request.requestId) return bare;
       try { this.runtime.store.updateActionReceipt(scope, request.requestId, receiptStatus, result.result); }
-      catch { return bare; /* runtime already closed: the close is the acknowledgement */ }
+      catch {
+        // The command may already have taken effect, but the durable receipt did not
+        // commit. Report uncertainty instead of a terminal success the store cannot replay.
+        return { ...bare, state: 'unknown' as const, code: result.code ?? 'receipt-write-failed' };
+      }
       this.runtime.session.events.publish(`control.${request.command}`, { requestId: request.requestId, state, result: result.result }, true);
       return bare;
     };

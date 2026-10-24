@@ -132,10 +132,15 @@ export class Executor {
       // Only a closed set of outcomes may settle an execution; an absent or unknown outcome is
       // not success and must not be promoted to confirmed.
       const outcome = skillResult && typeof skillResult === 'object' && 'outcome' in skillResult ? String((skillResult as { outcome: string }).outcome) : 'ambiguous';
+      const skillReason = skillResult && typeof skillResult === 'object' && typeof (skillResult as { reason?: unknown }).reason === 'string'
+        ? String((skillResult as { reason: string }).reason) : undefined;
       if (outcome === 'canceled') throw new Error('execution-canceled');
       if (outcome === 'failed') throw new Error(String((skillResult as { reason?: string }).reason ?? 'skill-failed'));
       if (!['confirmed', 'partial', 'ambiguous'].includes(outcome)) execution.outcome = 'ambiguous';
       else execution.outcome = outcome;
+      // Preserve why a non-confirmed result is suspended; otherwise the distinguishing
+      // evidence (e.g. collection-not-observed) exists only in an ephemeral skill object.
+      if (execution.reason === undefined && skillReason !== undefined) execution.reason = skillReason;
       this.assertLive(execution.executionId);
       execution.status = 'verifying'; this.store.saveExecution(execution); report({ stage: 'verify', completed: 1, total: 1 });
       if (execution.outcome === 'ambiguous' || execution.outcome === 'partial') {

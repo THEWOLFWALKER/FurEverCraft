@@ -313,7 +313,7 @@ async function listenServer(server: import('fastify').FastifyInstance, host: str
 }
 export async function runServe(options: { db?: string; host?: string; port?: string; profile?: string; pairing?: boolean; pairingCode?: string; cliBearer?: string; webRoot?: string; allowedOrigin?: string }) {
   const db = options.db ?? process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent.sqlite';
-  const runtime = createRuntime({ profile: (options.profile ?? 'simulated') as 'simulated' | 'client-offline', db });
+  const runtime = createRuntime({ profile: (options.profile ?? 'simulated') as 'simulated' | 'simulated-3d' | 'client-offline', db });
   const host = options.host ?? '127.0.0.1';
   const pairing = options.pairing ?? true;
   const explicitPairingCode = options.pairingCode ?? process.env.MINECRAFT_AGENT_PAIRING_CODE;
@@ -375,7 +375,7 @@ export function runDoctorCommand(options: DoctorCommandOptions = {}): DoctorRepo
   const profile = options.profile ?? 'simulated';
   let runtime: ReturnType<typeof createRuntime> | undefined;
   try {
-    runtime = createRuntime({ profile: profile as 'simulated' | 'client-offline', ...(options.db ? { db: options.db } : {}) });
+    runtime = createRuntime({ profile: profile as 'simulated' | 'simulated-3d' | 'client-offline', ...(options.db ? { db: options.db } : {}) });
     return collectDoctorReport(runtime, options.generatedAt === undefined ? {} : { generatedAt: options.generatedAt });
   } catch (error) {
     return unavailableDoctorReport({

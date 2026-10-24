@@ -3,9 +3,8 @@ import type { BodyAdapter, BodyCapabilities, GatherResult, MotionPlan, WorldObse
 import { LEGACY_2D_CAPABILITIES, SIMULATED_BODY_CAPABILITIES, FULL_BODY_HEIGHT } from '../motor/contracts.js';
 import type { BlockPos, InputPlan3D, InputReceipt } from '../motor/types.js';
 import { yawDelta } from '../motor/route.js';
-import type { SparseVoxelWorld } from '../motor/geometry.js';
-import { blockKey } from '../motor/geometry.js';
-import type { SimulatedBody } from './simulated-body.js';
+import { SparseVoxelWorld, blockKey } from '../motor/geometry.js';
+import { SimulatedBody } from './simulated-body.js';
 
 export type SimulatedBodyAdapterOptions = {
   /** Virtual milliseconds advanced per body tick (20 Hz by default). */
@@ -255,6 +254,24 @@ export class Legacy2DBodyAdapter implements BodyAdapter {
     const result = this.bridge.collectNearby();
     return { accepted: result.accepted, collected: result.collected, items: result.items };
   }
+}
+
+/**
+ * Build the explicit offline 3D body fixture: a flat supported area with a
+ * simulated body that supports non-zero z. This is simulated evidence only;
+ * it is never a client-offline body and never proves 26.3 physics.
+ */
+export function createSimulatedBodyAdapter(context: BodyContext, clock: Clock, options: { radius?: number; observationRadius?: number } = {}): SimulatedBodyAdapter {
+  const radius = Math.max(2, Math.floor(options.radius ?? 10));
+  const world = new SparseVoxelWorld(context, { id: 'simulated-3d-body', registryVersion: 'fixture-1', source: 'fixture', approximate: false });
+  for (let x = -radius; x <= radius; x += 1) {
+    for (let z = -radius; z <= radius; z += 1) {
+      world.setBlock({ x, y: -1, z }, 'full_cube', 'stone');
+      for (let y = 0; y <= 4; y += 1) world.setAir({ x, y, z });
+    }
+  }
+  const body = new SimulatedBody(context, world, clock, { start: { x: 0.5, y: 0, z: 0.5, yaw: 0, pitch: 0 } });
+  return new SimulatedBodyAdapter(body, world, clock, { tickMs: 20, observationRadius: options.observationRadius ?? Math.min(radius, 12) });
 }
 
 export { FULL_BODY_HEIGHT };
