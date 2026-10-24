@@ -49,7 +49,7 @@ export class SkillLifecycle {
     this.generation++;
     const interrupted: SkillRunSnapshot[] = [];
     for (const run of this.runs.values()) {
-      if (!active(run.snapshot.state)) continue;
+      if (!active(run.snapshot.state) && !(run.snapshot.state === 'suspended' && run.snapshot.outcome === 'paused')) continue;
       run.mode = 'cancel';
       run.controller.abort();
       run.snapshot.state = 'canceled';
@@ -63,7 +63,8 @@ export class SkillLifecycle {
 
   pause(runId: string): SkillRunSnapshot | undefined {
     const run = this.runs.get(runId);
-    if (!run || !run.manifest.suspendable || terminal.has(run.snapshot.state) || run.snapshot.state === 'suspended') return run?.snapshot;
+    if (!run) return undefined;
+    if (!run.manifest.suspendable || terminal.has(run.snapshot.state) || run.snapshot.state === 'suspended') return structuredClone(run.snapshot);
     run.mode = 'pause';
     run.controller.abort();
     run.snapshot.state = 'suspended';
