@@ -45,7 +45,12 @@ export class SimulatedBodyAdapter implements BodyAdapter {
   /** Inject a bounded observation defect for stale/gap/dimension tests. */
   setObservationOverride(override: Partial<SimulatedBodyAdapterOptions> | undefined): void { this.override = override; }
 
-  async observe(): Promise<WorldObservation> {
+  async observe(): Promise<WorldObservation> { return this.readObservation(); }
+
+  /** Synchronous counterpart used by control/status surfaces; same source of truth as observe(). */
+  peek(): WorldObservation { return this.readObservation(); }
+
+  private readObservation(): WorldObservation {
     const observation = this.body.read();
     const snapshot = this.world.snapshot();
     const pose = observation.pose;
@@ -186,7 +191,9 @@ export class Legacy2DBodyAdapter implements BodyAdapter {
   readonly context: BodyContext;
   constructor(readonly bridge: LegacyBridge, readonly clock?: Clock) { this.context = bridge.context; }
 
-  async observe(): Promise<WorldObservation> {
+  async observe(): Promise<WorldObservation> { return this.readObservation(); }
+  peek(): WorldObservation { return this.readObservation(); }
+  private readObservation(): WorldObservation {
     const snapshot = this.bridge.snapshot();
     const cells = new Map<string, { pos: BlockPos; cell: 'free' | 'blocked' | 'unknown' | 'unsupported'; shape: 'full_cube' | 'lower_slab' | 'upper_slab' | 'air' | 'unsupported'; revision: string }>();
     for (const [key, cell] of Object.entries(snapshot.cells)) {

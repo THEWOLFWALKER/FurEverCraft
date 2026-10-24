@@ -32,7 +32,7 @@ describe('W05/W06 execution lifecycle and skills', () => {
     const bridge = new FakeClientBridge();
     const progress: string[] = [];
     const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: (p: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number }) => progress.push(p.stage) };
-    expect(navigateTo(ctx, { x: 1, y: 0 }).outcome).toBe('confirmed');
+    expect((await navigateTo(ctx, { x: 1, y: 0 })).outcome).toBe('confirmed');
     expect(observeUi(ctx).outcome).toBe('confirmed');
     expect(sendChat(ctx, 'hello').outcome).toBe('confirmed');
     expect(placeOne({ ...ctx, bridge }, { x: 2, y: 0 }).outcome).toBe('confirmed');
@@ -52,25 +52,25 @@ describe('W05/W06 execution lifecycle and skills', () => {
     const noDig = new FakeClientBridge(); noDig.block(1, 0); (noDig as unknown as { dig?: unknown }).dig = undefined;
     expect(digOne({ ...ctx, bridge: noDig }, { x: 1, y: 0 }).reason).toBe('dig-capability-unavailable');
     const noPlace = new FakeClientBridge(); (noPlace as unknown as { findPlace?: unknown }).findPlace = undefined;
-    expect(returnToPlace({ ...ctx, bridge: noPlace }, 'home').reason).toBe('place-navigation-capability-unavailable');
+    expect((await returnToPlace({ ...ctx, bridge: noPlace }, 'home')).reason).toBe('place-navigation-capability-unavailable');
     const noCollect = new FakeClientBridge(); (noCollect as unknown as { collectNearby?: unknown }).collectNearby = undefined;
     expect(collectNearby({ ...ctx, bridge: noCollect }).outcome).toBe('failed');
     const noGather = new FakeClientBridge(); (noGather as unknown as { digBlock?: unknown }).digBlock = undefined;
-    expect(gatherBlocks({ ...ctx, bridge: noGather }, 'stone').outcome).toBe('failed');
+    expect((await gatherBlocks({ ...ctx, bridge: noGather }, 'stone')).outcome).toBe('failed');
   });
 
-  it('collects and gathers in the simulated body when the capability exists', () => {
+  it('collects and gathers in the simulated body when the capability exists', async () => {
     const bridge = new FakeClientBridge();
     const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} };
     bridge.seedDrop(1, 0, 'stone');
     expect(collectNearby(ctx)).toMatchObject({ ok: true, outcome: 'confirmed' });
     bridge.block(0, 1, 'stone');
-    expect(gatherBlocks(ctx, 'stone')).toMatchObject({ ok: true, outcome: 'confirmed' });
+    expect(await gatherBlocks(ctx, 'stone')).toMatchObject({ ok: true, outcome: 'confirmed' });
     expect(bridge.cell(0, 1)).toBe('free');
-    expect(gatherBlocks(ctx, 'stone').outcome).toBe('failed');
+    expect((await gatherBlocks(ctx, 'stone')).outcome).toBe('failed');
   });
 
-  it('supports look_at, dig_one and return_to_place against the simulated body', () => {
+  it('supports look_at, dig_one and return_to_place against the simulated body', async () => {
     const bridge = new FakeClientBridge();
     const progress: string[] = [];
     const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: (p: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number }) => progress.push(p.stage) };
@@ -79,9 +79,9 @@ describe('W05/W06 execution lifecycle and skills', () => {
     expect(digOne(ctx, { x: 1, y: 0 })).toMatchObject({ ok: true, outcome: 'confirmed' });
     expect(bridge.cell(1, 0)).toBe('free');
     bridge.rememberPlace('home', 2, 0);
-    expect(returnToPlace(ctx, 'home').outcome).toBe('confirmed');
+    expect((await returnToPlace(ctx, 'home')).outcome).toBe('confirmed');
     expect(bridge.position).toEqual({ x: 2, y: 0 });
-    expect(returnToPlace(ctx, 'missing').reason).toContain('unknown-place');
+    expect((await returnToPlace(ctx, 'missing')).reason).toContain('unknown-place');
   });
 
   it('does not complete wait_for_condition before the clock deadline', async () => {
@@ -147,16 +147,16 @@ describe('audit regressions', () => {
   it('navigation fails when a walk is silently dropped or the target is not reached', async () => {
     const bridge = new FakeClientBridge();
     bridge.configureFault('walk', { fault: 'drop' });
-    const result = navigateTo({ bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} }, { x: 1, y: 0 });
+    const result = await navigateTo({ bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} }, { x: 1, y: 0 });
     expect(result.ok).toBe(false);
     expect(result.outcome).toBe('failed');
   });
-  it('dig/gather never treat an unknown cell as cleared', () => {
+  it('dig/gather never treat an unknown cell as cleared', async () => {
     const bridge = new FakeClientBridge();
     bridge.setUnknown(1, 0);
     const ctx = { bridge, lease: { leaseId: 'l', owner: 'e', resources: [], until: 1, generation: 1, contextEpoch: '' }, report: () => {} };
     expect(digOne(ctx, { x: 1, y: 0 }).reason).toBe('target-not-observed-blocked');
-    expect(gatherBlocks(ctx, 'stone').outcome).toBe('failed');
+    expect((await gatherBlocks(ctx, 'stone')).outcome).toBe('failed');
   });
   it('send_chat fails closed when the bridge has no real dispatch path', () => {
     const bridge = new FakeClientBridge(); (bridge as unknown as { dispatchChat?: unknown }).dispatchChat = undefined;

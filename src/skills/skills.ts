@@ -1,8 +1,24 @@
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { Lease, Progress } from '../execution/runtime.js';
-import { navigate } from './navigation.js';
+import { getAttachedBodyAdapter } from '../motor/contracts.js';
+import { navigate, navigateToSkill, returnToPlaceSkill, exploreAreaSkill, gatherBlocksSkill } from './navigation.js';
 
-export type SkillContext = { bridge: ClientBridgeCapabilities; lease: Lease; report: (progress: Omit<Progress, 'at'>) => void; isCanceled?: () => boolean; clock?: import('../contracts/index.js').Clock };
+export type PlaceResolution = { ok: true; target: { x: number; y: number; z?: number } } | { ok: false; reason: string };
+export type SkillContext = {
+  bridge: ClientBridgeCapabilities;
+  lease: Lease;
+  report: (progress: Omit<Progress, 'at'>) => void;
+  isCanceled?: () => boolean;
+  clock?: import('../contracts/index.js').Clock;
+  /** Extra operator/human-control signal consulted by the 3D adapters. */
+  isPaused?: () => boolean;
+  /**
+   * Scoped, freshness-checked place resolution supplied by the router. When a
+   * resolver exists it is authoritative: a missing/stale/foreign place fails
+   * closed instead of falling back to `bridge.findPlace`.
+   */
+  resolvePlace?: (placeId: string) => PlaceResolution | Promise<PlaceResolution>;
+};
 export type SkillResult = { ok: boolean; outcome: 'confirmed' | 'partial' | 'ambiguous' | 'failed' | 'canceled'; value?: unknown; reason?: string };
 const canceled = (ctx: SkillContext) => { if (ctx.isCanceled?.()) return true; return false; };
 /** A receipt is evidence only when it is accepted, non-ambiguous, and carries a command id. */
@@ -12,10 +28,19 @@ const acceptedReceipt = (receipt: unknown): boolean => {
   return value.accepted === true && value.ambiguous !== true && typeof value.commandId === 'string' && value.commandId.length > 0;
 };
 
-export function navigateTo(ctx: SkillContext, target: { x: number; y: number }, budget = 3): SkillResult {
+export function navigateTo(ctx: SkillContext, target: { x: number; y: number; z?: number }, budget = 3): SkillResult | Promise<SkillResult> {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  // An attached BodyAdapter is the production path. The planar bridge walk below is the
+  // explicitly legacy path and must never run when a 3D body is attached.
+  if (getAttachedBodyAdapter(ctx.bridge)) {
+    return navigateToSkill({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, target, budget);
+  }
+  if (target.z !== undefined) {
+    // A 3D target cannot be executed by the legacy planar bridge; report the exact boundary.
+    return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
+  }
   ctx.report({ stage: 'dispatch', completed: 0, message: 'planning' });
-  const result = navigate(ctx.bridge, target, budget);
+  const result = navigate(ctx.bridge, { x: target.x, y: target.y }, budget);
   ctx.report({ stage: 'dispatch', completed: result.path.length, total: result.path.length, message: result.status });
   return result.status === 'succeeded' ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'failed', reason: result.reason, value: result };
 }
@@ -105,12 +130,15 @@ export function lookAt(ctx: SkillContext, target: { x: number; y: number }): Ski
     return { ok: result.accepted, outcome: result.accepted ? 'confirmed' : 'ambiguous', value: result };
   } catch (error) { return { ok: false, outcome: 'failed', reason: error instanceof Error ? error.message : String(error) }; }
 }
-export function exploreArea(ctx: SkillContext, radius: number): SkillResult {
+export function exploreArea(ctx: SkillContext, radius: number): SkillResult | Promise<SkillResult> {
   if (!Number.isInteger(radius) || radius < 0 || radius > 32) return { ok: false, outcome: 'failed', reason: 'invalid-radius' };
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  if (getAttachedBodyAdapter(ctx.bridge)) {
+    return exploreAreaSkill({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, radius);
+  }
   const snapshot = ctx.bridge.snapshot();
   ctx.report({ stage: 'dispatch', completed: 1, total: 1, message: 'observed-local-area' });
-  return { ok: true, outcome: 'confirmed', value: { radius, position: snapshot.position, observed: Object.keys(snapshot.cells).length, source: snapshot.source } };
+  return { ok: true, outcome: 'confirmed', value: { radius, position: snapshot.position, observed: Object.keys(snapshot.cells).length, source: snapshot.source, legacy2d: true } };
 }
 export function digOne(ctx: SkillContext, target: { x: number; y: number }): SkillResult {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
@@ -145,10 +173,44 @@ export function collectNearby(ctx: SkillContext): SkillResult {
     return { ok: true, outcome: 'confirmed', value: result };
   } catch (error) { return { ok: false, outcome: 'failed', reason: error instanceof Error ? error.message : String(error) }; }
 }
-export function gatherBlocks(ctx: SkillContext, block: string, count = 1): SkillResult {
+export function gatherBlocks(ctx: SkillContext, blockOrArgs: string | { block: string; count?: number }, count = 1): SkillResult | Promise<SkillResult> {
+  const requested = typeof blockOrArgs === 'string' ? count : blockOrArgs.count ?? 1;
+  const block = typeof blockOrArgs === 'string' ? blockOrArgs : blockOrArgs.block;
   if (!block) return { ok: false, outcome: 'failed', reason: 'block-required' };
-  if (!Number.isInteger(count) || count < 1 || count > 16) return { ok: false, outcome: 'failed', reason: 'invalid-gather-count' };
+  if (!Number.isInteger(requested) || requested < 1 || requested > 16) return { ok: false, outcome: 'failed', reason: 'invalid-gather-count' };
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  if (getAttachedBodyAdapter(ctx.bridge)) {
+    return gatherBlocks3D({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, block, requested);
+  }
+  return gatherBlocksLegacy(ctx, block, requested);
+}
+
+/** 3D gather delegates each dig to the production gather adapter, which navigates through Motor. */
+async function gatherBlocks3D(ctx: SkillContext, block: string, requested: number): Promise<SkillResult> {
+  let gathered = 0;
+  const items: string[] = [];
+  for (let index = 0; index < requested; index++) {
+    if (canceled(ctx)) return { ok: false, outcome: 'canceled', value: { gathered, requested } };
+    const result = await gatherBlocksSkill(ctx, block);
+    const value = result.value as { collected?: unknown; items?: unknown } | undefined;
+    if (result.outcome !== 'confirmed') {
+      const partial = gathered + Math.max(0, Number(value?.collected ?? 0));
+      return {
+        ok: false,
+        outcome: partial > 0 ? 'partial' : 'failed',
+        reason: result.reason ?? 'gather-not-confirmed',
+        value: { gathered: partial, requested, items },
+      };
+    }
+    const collected = Math.max(0, Number(value?.collected ?? 1));
+    gathered += collected;
+    if (Array.isArray(value?.items)) items.push(...value.items.map(String));
+  }
+  return { ok: true, outcome: 'confirmed', value: { gathered, requested, items } };
+}
+
+/** Explicitly legacy planar gather; only runs when no BodyAdapter is attached. */
+function gatherBlocksLegacy(ctx: SkillContext, block: string, count: number): SkillResult {
   if (!ctx.bridge.digBlock || !ctx.bridge.adjacentBlock) return { ok: false, outcome: 'failed', reason: 'gather-capability-unavailable' };
   ctx.report({ stage: 'dispatch', completed: 0, total: count });
   let gathered = 0;
@@ -189,13 +251,37 @@ export function gatherBlocks(ctx: SkillContext, block: string, count = 1): Skill
   if (gathered > 0) return { ok: false, outcome: 'partial', reason: 'gather-count-incomplete', value: { gathered, requested: count } };
   return { ok: false, outcome: 'failed', reason: 'gather-count-unmet', value: { gathered, requested: count } };
 }
-export function returnToPlace(ctx: SkillContext, placeId: string, budget = 3): SkillResult {
+export function returnToPlace(ctx: SkillContext, placeId: string, budget = 3): SkillResult | Promise<SkillResult> {
   if (!placeId) return { ok: false, outcome: 'failed', reason: 'place-required' };
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
+  const body = getAttachedBodyAdapter(ctx.bridge);
+  if (ctx.resolvePlace) {
+    // Scoped memory is authoritative. A missing/stale/foreign place fails closed and must not
+    // fall back to a legacy bridge lookup that knows nothing about scope or freshness.
+    const resolved = ctx.resolvePlace(placeId);
+    if (resolved instanceof Promise) return resolved.then(value => finishReturn(ctx, body, value, budget));
+    return finishReturn(ctx, body, resolved, budget);
+  }
+  if (body && body.findPlace) {
+    // Direct skill use (tests/embedding) without a memory resolver may use the adapter's
+    // own place store; this is not the production router path.
+    return returnToPlaceSkill({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, placeId, budget);
+  }
   if (!ctx.bridge.findPlace) return { ok: false, outcome: 'failed', reason: 'place-navigation-capability-unavailable' };
   const target = ctx.bridge.findPlace(placeId);
   if (!target) return { ok: false, outcome: 'failed', reason: `unknown-place:${placeId}` };
-  return navigateTo(ctx, target, budget);
+  return navigateTo(ctx, { x: target.x, y: target.y }, budget);
+}
+
+function finishReturn(
+  ctx: SkillContext,
+  body: ReturnType<typeof getAttachedBodyAdapter>,
+  resolved: PlaceResolution,
+  budget: number,
+): SkillResult | Promise<SkillResult> {
+  if (!resolved.ok) return { ok: false, outcome: 'failed', reason: resolved.reason };
+  if (body) return navigateToSkill({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, resolved.target, budget);
+  return navigateTo(ctx, { x: resolved.target.x, y: resolved.target.y }, budget);
 }
 
 export const skillImplementations = { navigate_to: navigateTo, observe_ui: observeUi, send_chat: sendChat, place_one: placeOne, wait_for_condition: waitForCondition, look_at: lookAt, explore_area: exploreArea, dig_one: digOne, collect_nearby: collectNearby, gather_blocks: gatherBlocks, return_to_place: returnToPlace } as const;

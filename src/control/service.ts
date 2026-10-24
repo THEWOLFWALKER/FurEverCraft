@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { RuntimeAssembly } from '../execution/factory.js';
+import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import { redact } from '../diagnostics/redaction.js';
+import { bodyStateView, legacyBodyStateView, type BodyStateView } from '../motor/contracts.js';
 import {
   CancelPayloadSchema, ChatPayloadSchema, CommandRequestSchema, GoalRevisePayloadSchema, GoalSetPayloadSchema,
   MessagePayloadSchema, type CommandRequest, type CommandResult, type ProviderMetadata,
@@ -72,10 +74,30 @@ export class ControlService {
     } catch { return false; }
   }
 
+  /**
+   * Public body state. An attached 3D adapter is authoritative; without one the
+   * state is explicitly legacy-2d and planar x/y is never promoted to a 3D pose.
+   */
+  private bodyState(snapshot?: ReturnType<ClientBridgeCapabilities['snapshot']>): BodyStateView | undefined {
+    const adapter = this.runtime.bodyAdapter;
+    if (adapter) {
+      const observed = bodyStateView(adapter);
+      if (observed) return observed;
+      // Attached but no synchronous view: report the boundary rather than a legacy fallback.
+      return {
+        mode: '3d', threeDimensional: true, legacy2d: false,
+        dimension: adapter.context.dimension, revision: 'unknown', freshness: 'unknown',
+        source: adapter.source, gap: true, context: { ...adapter.context },
+      };
+    }
+    try { return legacyBodyStateView(snapshot ?? this.runtime.bridge.snapshot()); }
+    catch { return undefined; }
+  }
+
   status() {
     // After a quit the store is closed; the control surface must still report the stopped state
     // instead of throwing on every status read until the caller shuts the server down.
-    if (this.closed) return { state: 'closed', paused: this.paused, stopping: true, closed: true, goal: null, executions: 0, context: { ...this.runtime.bridge.context }, observation: { source: 'unknown', freshness: 'unknown', gap: true, reason: 'runtime-closed' }, session: { state: 'closed', recoveryAttempts: 0, recoveryBudget: 0 }, position: undefined, inventory: undefined, ui: undefined };
+    if (this.closed) return { state: 'closed', paused: this.paused, stopping: true, closed: true, goal: null, executions: 0, context: { ...this.runtime.bridge.context }, body: this.bodyState(), observation: { source: 'unknown', freshness: 'unknown', gap: true, reason: 'runtime-closed' }, session: { state: 'closed', recoveryAttempts: 0, recoveryBudget: 0 }, position: undefined, inventory: undefined, ui: undefined };
     const goal = this.runtime.store.listGoals().find(item => item.status === 'active' || item.status === 'paused');
     const base = {
       paused: this.paused,
@@ -89,16 +111,20 @@ export class ControlService {
     let observationError: string | undefined;
     try { snapshot = this.runtime.bridge.snapshot(); }
     catch (error) { observationError = error instanceof Error ? error.message : String(error); }
+    const body = this.bodyState(snapshot);
     if (!snapshot) {
       // A failed observation is unknown, not an empty world. Never turn a read error into cells={}.
-      return { ...base, state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state, observation: { source: 'unknown', freshness: 'unknown', gap: true, error: redact(observationError) }, position: undefined, inventory: undefined, ui: undefined };
+      // An attached 3D body is still reported from its own observation, not from the 2D bridge.
+      return { ...base, body, state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state, observation: { source: 'unknown', freshness: 'unknown', gap: true, ...(observationError ? { error: redact(observationError) } : {}) }, position: undefined, inventory: undefined, ui: undefined };
     }
     // Expose the observed cells so the top-down view reads real state instead of an absent field.
     return {
       ...base,
+      body,
       state: this.stopping ? 'closing' : this.paused ? 'paused' : this.runtime.session.state,
       context: { ...this.runtime.bridge.context, cells: snapshot.cells },
-      position: snapshot.position,
+      // Legacy planar position is explicit 2D data; a 3D body reports its pose in `body`.
+      position: this.runtime.bodyAdapter ? undefined : snapshot.position,
       inventory: snapshot.inventory,
       ui: snapshot.ui,
       observation: {
@@ -108,29 +134,35 @@ export class ControlService {
         revision: snapshot.revision,
         unknownCells: Object.values(snapshot.cells).filter(cell => cell === 'unknown').length,
         fields: snapshot.fields,
+        threeDimensional: Boolean(this.runtime.bodyAdapter),
+        mode: this.runtime.bodyAdapter ? '3d' : 'legacy-2d',
       },
     };
   }
   capabilities() {
     const bridge = this.runtime.bridge as { capabilities?: unknown };
+    const body = this.bodyState();
     return {
       profile: this.runtime.bridge.context.serverProfileId,
       provider: this.providerMetadata,
       bridge: redact(bridge.capabilities ?? {}),
       skills: this.runtime.router.availableSkills?.() ?? [],
       inputsEnabled: this.runtime.inputsEnabled,
+      body: body ? { threeDimensional: body.threeDimensional, mode: body.mode, source: body.source, dimension: body.dimension } : { threeDimensional: false, mode: 'unknown', source: 'unknown', dimension: this.runtime.bridge.context.dimension },
       limitations: [
         ...(this.providerMetadata.transport === 'unavailable' ? ['provider-unavailable'] : []),
+        ...(this.runtime.bodyAdapter ? [] : ['legacy-2d-body']),
         ...(this.runtime.bridge.lookAt ? [] : ['look-at-unavailable']),
         ...(this.runtime.bridge.dig ? [] : ['dig-unavailable']),
-        ...(this.runtime.bridge.findPlace ? [] : ['place-navigation-unavailable']),
+        ...(this.runtime.bridge.findPlace || this.runtime.bodyAdapter ? [] : ['place-navigation-unavailable']),
       ],
     };
   }
   goals() { return this.runtime.store.listGoals(); }
   executions() { return this.runtime.store.listExecutions(); }
   effects(executionId?: string) { return this.runtime.store.listEffects(executionId); }
-  places() { return this.runtime.store.listPlaces(this.runtime.bridge.context); }
+  /** Scoped memory query (P20), not an unscoped table dump. */
+  places() { return this.runtime.memory.queryPlaces({ scope: this.runtime.memoryScope }).items; }
   events(cursor = '0', limit = 100, filter?: string) { return this.runtime.session.events.read(cursor, limit, filter); }
   /** Current event sequence head; SSE snapshots are labelled with it so snapshot and cursor agree. */
   eventsHead() { return this.runtime.session.events.head(); }
@@ -206,6 +238,9 @@ export class ControlService {
       case 'pause': {
         // Abort first so the pausing event precedes any command receipt that reflects the abort.
         this.abortActive(); this.paused = true; this.stopping = false; this.pausing = true;
+        // Pause reaches the real scheduler and skill lifecycle, not just a control flag.
+        try { this.runtime.scheduler.pause(); } catch { /* scheduler already stopped */ }
+        try { this.runtime.lifecycle.humanControl('pause'); } catch { /* lifecycle already terminal */ }
         try {
           // Abort the runs that already started and cancel their executions so paused means every
           // in-flight write has stopped, not merely that new ones are refused.
@@ -222,8 +257,9 @@ export class ControlService {
           try { this.runtime.session.recover(); }
           catch (error) { return { requestId: request.requestId, command: request.command, state: 'rejected', code: error instanceof Error ? error.message : String(error), result: { paused: true, session: this.runtime.session.state }, payloadHash: '' }; }
         }
+        this.runtime.scheduler.resume();
         this.paused = false; this.pausing = false;
-        return { requestId: request.requestId, command: request.command, state: 'terminal', result: { paused: false, session: this.runtime.session.state }, payloadHash: '' };
+        return { requestId: request.requestId, command: request.command, state: 'terminal', result: { paused: false, session: this.runtime.session.state, schedulerPaused: this.runtime.scheduler.pausedValue }, payloadHash: '' };
       }
       case 'recover': {
         if (this.closed || this.stopping || this.quitting) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', payloadHash: '' };
@@ -238,7 +274,7 @@ export class ControlService {
       }
       case 'stop': {
         if (this.stopping) { const canceled = await this.cancelActiveExecutions(); const body = await this.releaseBody(); return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled, body }, payloadHash: '' }; }
-        this.abortActive(); this.stopping = true; this.paused = true; this.runtime.scheduler.close();
+        this.abortActive(); this.stopping = true; this.paused = true; this.runtime.scheduler.close(); this.runtime.lifecycle.humanControl('stop');
         // Capture what was in flight: the aborted message receipt settles before the stop event is published.
         await this.settled([...this.activeRuns.values()]);
         const canceled = await this.cancelActiveExecutions(); const body = await this.releaseBody();
@@ -247,7 +283,7 @@ export class ControlService {
       case 'cancel': { const p = CancelPayloadSchema.parse(payload); const execution = this.runtime.store.getExecution(p.executionId); if (!execution) return { requestId: request.requestId, command: request.command, state: 'unknown', code: 'execution-not-found', payloadHash: '' }; const invoke = await this.runtime.router.invoke({ id: request.requestId, name: 'cancel_execution', arguments: JSON.stringify(p) }); const after = this.runtime.store.getExecution(p.executionId); return { requestId: request.requestId, command: request.command, state: terminal.has(after?.status ?? '') ? 'terminal' : invoke.ok ? 'accepted' : 'unknown', code: invoke.ok ? undefined : invoke.error, result: after, payloadHash: '' }; }
       case 'save': { const checkpoint = { checkpointId: `runtime-${this.runtime.clock.now()}`, executionId: 'runtime', revision: (this.runtime.store.getLatestCheckpoint('runtime')?.revision ?? 0) + 1, payload: this.status() }; this.runtime.store.saveCheckpoint(checkpoint); return { requestId: request.requestId, command: request.command, state: 'terminal', result: checkpoint, payloadHash: '' }; }
       case 'quit': {
-        this.abortActive(); this.quitting = true; this.stopping = true; this.paused = true; this.runtime.scheduler.close();
+        this.abortActive(); this.quitting = true; this.stopping = true; this.paused = true; this.runtime.scheduler.close(); this.runtime.lifecycle.humanControl('quit');
         await this.settled([...this.activeRuns.values()]);
         const canceled = await this.cancelActiveExecutions(); const body = await this.releaseBody();
         this.runtime.session.events.publish('runtime.shutdown-requested', { canceled, body }, true);

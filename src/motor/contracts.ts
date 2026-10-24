@@ -92,6 +92,12 @@ export interface BodyAdapter extends InputSink {
    */
   readonly clock?: import('../contracts/index.js').Clock;
   observe(): Promise<WorldObservation>;
+  /**
+   * Optional synchronous view of the same observation `observe()` returns.
+   * Control/status reads are synchronous; an adapter that can provide this
+   * lets them surface a real 3D pose instead of waiting or inventing one.
+   */
+  peek?(): WorldObservation;
   /** Simulated bodies advance virtual time explicitly; real adapters leave this absent. */
   advance?(ticks: number): void;
   findPlace?(placeId: string): Promise<BlockPos | undefined>;
@@ -115,6 +121,76 @@ export function isBodyAdapter(value: unknown): value is BodyAdapter {
 /** True only when a contract consumer may treat the observation as a real 3D volume. */
 export function isReal3DObservation(observation: WorldObservation): boolean {
   return observation.threeDimensional === true && observation.coordinateMapping === 'world-xyz';
+}
+
+/**
+ * Public state surface for tools/control/web. A 3D adapter contributes a real
+ * world pose including non-zero z; a legacy body never gets a fabricated z.
+ */
+export type BodyStateView = {
+  mode: '3d' | 'legacy-2d';
+  threeDimensional: boolean;
+  legacy2d: boolean;
+  x?: number;
+  y?: number;
+  z?: number;
+  yaw?: number;
+  pitch?: number;
+  pose?: Pose3D;
+  dimension: string;
+  revision: string;
+  freshness: 'current' | 'stale' | 'unknown';
+  source: BodySource | 'legacy-2d';
+  gap: boolean;
+  supported?: boolean;
+  observedAt?: number;
+  context: BodyContext;
+};
+
+/** Derive the public state shape from one observation without inventing fields. */
+export function bodyStateFromObservation(observation: WorldObservation): BodyStateView {
+  const threeDimensional = isReal3DObservation(observation);
+  const base = {
+    mode: threeDimensional ? '3d' as const : 'legacy-2d' as const,
+    threeDimensional,
+    legacy2d: !threeDimensional,
+    dimension: observation.dimension,
+    revision: observation.revision,
+    freshness: observation.freshness,
+    source: observation.source,
+    gap: observation.gap,
+    supported: observation.supported,
+    observedAt: observation.observedAt,
+    context: { ...observation.context },
+  };
+  if (!threeDimensional) return base;
+  return {
+    ...base,
+    x: observation.pose.x,
+    y: observation.pose.y,
+    z: observation.pose.z,
+    yaw: observation.pose.yaw,
+    pitch: observation.pose.pitch,
+    pose: { ...observation.pose },
+  };
+}
+
+/** Synchronous state when the adapter exposes `peek`; never blocks or guesses. */
+export function bodyStateView(adapter: BodyAdapter | undefined): BodyStateView | undefined {
+  const observation = adapter?.peek?.();
+  return observation ? bodyStateFromObservation(observation) : undefined;
+}
+
+/** A legacy snapshot is explicitly 2D; planar x/y is never promoted to a 3D pose. */
+export function legacyBodyStateView(snapshot: {
+  context: BodyContext; revision: string; freshness: 'current' | 'stale' | 'unknown'; source: string; gap: boolean;
+}): BodyStateView {
+  return {
+    mode: 'legacy-2d', threeDimensional: false, legacy2d: true,
+    dimension: snapshot.context.dimension, revision: snapshot.revision,
+    freshness: snapshot.freshness, source: 'legacy-2d', gap: snapshot.gap,
+    context: { ...snapshot.context },
+  };
 }
 
 /**

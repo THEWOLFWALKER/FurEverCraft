@@ -1,7 +1,14 @@
 export type FieldEvidence = { source?: string; observedAt?: number; expiresAt?: number; freshness?: string; available?: boolean; evidenceRef?: string };
 export type Observation = {
   source?: string; freshness?: string; gap?: boolean; revision?: string; unknownCells?: number;
-  fields?: Record<string, FieldEvidence>; error?: string; reason?: string;
+  fields?: Record<string, FieldEvidence>; error?: string; reason?: string; threeDimensional?: boolean; mode?: string;
+};
+export type BodyState = {
+  mode?: string; threeDimensional?: boolean; legacy2d?: boolean;
+  x?: number; y?: number; z?: number; yaw?: number; pitch?: number;
+  pose?: { x?: number; y?: number; z?: number; yaw?: number; pitch?: number };
+  dimension?: string; revision?: string; freshness?: string; source?: string;
+  gap?: boolean; supported?: boolean; observedAt?: number;
 };
 export type SessionInfo = { state?: string; recoveryAttempts?: number; recoveryBudget?: number };
 export type Status = {
@@ -10,6 +17,7 @@ export type Status = {
   executions?: number;
   context?: Record<string, unknown>;
   position?: { x?: number; y?: number } | null;
+  body?: BodyState;
   inventory?: number;
   ui?: string;
   observation?: Observation;
@@ -18,7 +26,11 @@ export type Status = {
 export type Goal = { goal_id: string; revision: number; status: string; text?: string; spec?: { text?: string }; updated_at?: string };
 export type Execution = { execution_id: string; skill_id: string; status: string; outcome?: string; reason?: string; goal_id?: string; proposal_id?: string };
 export type Effect = { effect_id: string; execution_id: string; status: string; intent?: unknown; evidence?: Record<string, unknown> };
-export type Place = { place_id: string; status: string; last_verified_at?: string; payload?: unknown; context?: unknown };
+export type Place = {
+  placeId?: string; place_id?: string; status: string;
+  lastVerifiedAt?: string; last_verified_at?: string;
+  payload?: unknown; context?: unknown; freshness?: string; fresh?: boolean; revision?: number;
+};
 export type Provider = { provider?: string; configured?: boolean; model?: string; networkEnabled?: boolean; transport?: string };
 export type Capabilities = {
   profile?: string; provider?: Provider;
