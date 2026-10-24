@@ -1,0 +1,18 @@
+{
+  "history": [
+    { "role": "system", "content": "fixture policy" },
+    { "role": "user", "content": "inspect the marker", "images": [{ "type": "image", "ref": "data:image/png;base64,iVBORw0KGgo=", "mediaType": "image/png", "detail": "low" }] }
+  ],
+  "openai": {
+    "messages": [
+      { "role": "system", "content": "fixture policy" },
+      { "role": "user", "content": [{ "type": "text", "text": "inspect the marker" }, { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgo=", "detail": "low" } }] }
+    ]
+  },
+  "anthropic": {
+    "system": "fixture policy",
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "inspect the marker" }, { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" } }] }
+    ]
+  }
+}

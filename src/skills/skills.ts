@@ -5,6 +5,12 @@ import { navigate } from './navigation.js';
 export type SkillContext = { bridge: ClientBridgeCapabilities; lease: Lease; report: (progress: Omit<Progress, 'at'>) => void; isCanceled?: () => boolean; clock?: import('../contracts/index.js').Clock };
 export type SkillResult = { ok: boolean; outcome: 'confirmed' | 'partial' | 'ambiguous' | 'failed' | 'canceled'; value?: unknown; reason?: string };
 const canceled = (ctx: SkillContext) => { if (ctx.isCanceled?.()) return true; return false; };
+/** A receipt is evidence only when it is accepted, non-ambiguous, and carries a command id. */
+const acceptedReceipt = (receipt: unknown): boolean => {
+  if (!receipt || typeof receipt !== 'object') return false;
+  const value = receipt as { accepted?: unknown; ambiguous?: unknown; commandId?: unknown };
+  return value.accepted === true && value.ambiguous !== true && typeof value.commandId === 'string' && value.commandId.length > 0;
+};
 
 export function navigateTo(ctx: SkillContext, target: { x: number; y: number }, budget = 3): SkillResult {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
@@ -36,7 +42,7 @@ export function sendChat(ctx: SkillContext, text: string): SkillResult {
     enteredChat = true;
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
     // Delivery acceptance is not world confirmation: only an explicit non-ambiguous receipt is confirmed.
-    if (receipt.accepted !== true || receipt.ambiguous) return { ok: false, outcome: 'ambiguous', reason: 'chat-delivery-unconfirmed', value: receipt };
+    if (!acceptedReceipt(receipt)) return { ok: false, outcome: 'ambiguous', reason: 'chat-delivery-unconfirmed', value: receipt };
     return { ok: true, outcome: 'confirmed', value: receipt };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
   finally { if (enteredChat) { try { ctx.bridge.setUi(previousUi); } catch { /* preserve ambiguous result */ } } }
@@ -52,7 +58,7 @@ export function placeOne(ctx: SkillContext, target: { x: number; y: number }): S
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
     // The bridge receipt only proves acceptance/injection; the world effect is verified by the
     // target cell changing, otherwise the outcome stays ambiguous.
-    if (receipt.accepted !== true || receipt.ambiguous) return { ok: false, outcome: 'ambiguous', reason: 'place-delivery-unconfirmed', value: receipt };
+    if (!acceptedReceipt(receipt)) return { ok: false, outcome: 'ambiguous', reason: 'place-delivery-unconfirmed', value: receipt };
     const placed = ctx.bridge.cell(target.x, target.y) === 'blocked';
     return placed ? { ok: true, outcome: 'confirmed', value: receipt } : { ok: false, outcome: 'ambiguous', reason: 'target-not-observed-blocked', value: receipt };
   } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
@@ -114,7 +120,7 @@ export function digOne(ctx: SkillContext, target: { x: number; y: number }): Ski
   try {
     const result = ctx.bridge.dig(target.x, target.y);
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
-    if (!result.accepted) return { ok: false, outcome: 'ambiguous', value: result };
+    if (!acceptedReceipt(result)) return { ok: false, outcome: 'ambiguous', value: result, reason: 'dig-delivery-unconfirmed' };
     // Only an observed free cell proves the dig; unknown is not cleared.
     const cleared = ctx.bridge.cell(target.x, target.y) === 'free';
     return cleared ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'ambiguous', value: result, reason: 'target-not-observed-free' };
@@ -123,27 +129,65 @@ export function digOne(ctx: SkillContext, target: { x: number; y: number }): Ski
 export function collectNearby(ctx: SkillContext): SkillResult {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
   if (!ctx.bridge.collectNearby) return { ok: false, outcome: 'failed', reason: 'collection-capability-unavailable' };
+  const inventoryBefore = ctx.bridge.inventory;
   ctx.report({ stage: 'dispatch', completed: 0, total: 1 });
   try {
     const result = ctx.bridge.collectNearby();
+    const inventoryAfter = ctx.bridge.inventory;
     ctx.report({ stage: 'verify', completed: 1, total: 1 });
-    return { ok: result.accepted, outcome: result.accepted ? (result.collected > 0 ? 'confirmed' : 'partial') : 'ambiguous', value: result };
+    if (!acceptedReceipt(result)) return { ok: false, outcome: 'ambiguous', reason: 'collection-delivery-unconfirmed', value: result };
+    // A disappeared entity is not proof that this body picked it up. Require a positive
+    // collected count, per-item evidence, and an inventory delta that accounts for it.
+    const collected = Number(result.collected);
+    if (!Number.isInteger(collected) || collected <= 0) return { ok: false, outcome: 'partial', reason: 'no-entities-observed', value: result };
+    if (!Array.isArray(result.items) || result.items.length !== collected) return { ok: false, outcome: 'ambiguous', reason: 'collection-items-unverified', value: result };
+    if (inventoryAfter - inventoryBefore < collected) return { ok: false, outcome: 'ambiguous', reason: 'inventory-delta-unconfirmed', value: result };
+    return { ok: true, outcome: 'confirmed', value: result };
   } catch (error) { return { ok: false, outcome: 'failed', reason: error instanceof Error ? error.message : String(error) }; }
 }
-export function gatherBlocks(ctx: SkillContext, block: string): SkillResult {
+export function gatherBlocks(ctx: SkillContext, block: string, count = 1): SkillResult {
   if (!block) return { ok: false, outcome: 'failed', reason: 'block-required' };
+  if (!Number.isInteger(count) || count < 1 || count > 16) return { ok: false, outcome: 'failed', reason: 'invalid-gather-count' };
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
   if (!ctx.bridge.digBlock || !ctx.bridge.adjacentBlock) return { ok: false, outcome: 'failed', reason: 'gather-capability-unavailable' };
-  ctx.report({ stage: 'dispatch', completed: 0, total: 1 });
-  const target = ctx.bridge.adjacentBlock(block);
-  if (!target) return { ok: false, outcome: 'failed', reason: `no-adjacent-block:${block}` };
-  try {
-    const result = ctx.bridge.digBlock(target.x, target.y, block);
-    ctx.report({ stage: 'verify', completed: 1, total: 1 });
-    // Only an observed free cell proves the dig; unknown is not cleared.
-    const cleared = ctx.bridge.cell(target.x, target.y) === 'free';
-    return cleared ? { ok: true, outcome: 'confirmed', value: result } : { ok: false, outcome: 'ambiguous', value: result, reason: 'target-not-observed-free' };
-  } catch (error) { return { ok: false, outcome: 'ambiguous', reason: error instanceof Error ? error.message : String(error) }; }
+  ctx.report({ stage: 'dispatch', completed: 0, total: count });
+  let gathered = 0;
+  let consecutiveFailures = 0;
+  const inventoryBefore = ctx.bridge.inventory;
+  for (let index = 0; index < count; index++) {
+    if (canceled(ctx)) return { ok: false, outcome: 'canceled', value: { gathered, requested: count } };
+    const target = ctx.bridge.adjacentBlock(block);
+    if (!target) {
+      if (gathered > 0) break;
+      return { ok: false, outcome: 'failed', reason: `no-adjacent-block:${block}` };
+    }
+    const wasBlocked = ctx.bridge.cell(target.x, target.y) === 'blocked';
+    if (!wasBlocked) { consecutiveFailures++; if (consecutiveFailures >= 3) return { ok: false, outcome: 'failed', reason: 'gather-budget-exhausted', value: { gathered, requested: count } }; continue; }
+    try {
+      const result = ctx.bridge.digBlock(target.x, target.y, block);
+      const cleared = ctx.bridge.cell(target.x, target.y) === 'free';
+      // A free cell alone is not causal evidence. The receipt must identify an accepted command;
+      // the pre-state must have been observed blocked; the post-state must be observed free.
+      if (!acceptedReceipt(result) || !cleared) {
+        consecutiveFailures++;
+        if (consecutiveFailures >= 3) return { ok: false, outcome: 'failed', reason: 'gather-budget-exhausted', value: { gathered, requested: count } };
+        continue;
+      }
+      gathered++;
+      ctx.report({ stage: 'verify', completed: gathered, total: count });
+    } catch (error) {
+      consecutiveFailures++;
+      if (consecutiveFailures >= 3) return { ok: false, outcome: 'ambiguous', reason: 'gather-budget-exhausted', value: { gathered, requested: count, error: error instanceof Error ? error.message : String(error) } };
+    }
+  }
+  if (gathered === count) {
+    // The inventory delta is secondary evidence that the material reached this body.
+    const delta = ctx.bridge.inventory - inventoryBefore;
+    if (delta < gathered) return { ok: false, outcome: 'ambiguous', reason: 'inventory-delta-unconfirmed', value: { gathered, requested: count } };
+    return { ok: true, outcome: 'confirmed', value: { gathered, requested: count } };
+  }
+  if (gathered > 0) return { ok: false, outcome: 'partial', reason: 'gather-count-incomplete', value: { gathered, requested: count } };
+  return { ok: false, outcome: 'failed', reason: 'gather-count-unmet', value: { gathered, requested: count } };
 }
 export function returnToPlace(ctx: SkillContext, placeId: string, budget = 3): SkillResult {
   if (!placeId) return { ok: false, outcome: 'failed', reason: 'place-required' };

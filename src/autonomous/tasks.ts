@@ -41,9 +41,50 @@ export class GoalManager {
 
 export class TaskScheduler {
   private pending = new Set<string>(); private timer?: ReturnType<typeof setTimeout>; private running = false;
-  constructor(private readonly events: EventHub, private readonly onWake: (reason: string) => Promise<void> | void, private readonly idleMs = 1000) {}
-  wake(reason: string) { this.pending.add(reason); if (this.running || this.timer) return; this.timer = setTimeout(() => { this.timer = undefined; void this.flush(); }, this.idleMs); }
-  async flush() { if (this.running || !this.pending.size) return; this.running = true; const reasons = [...this.pending]; this.pending.clear(); try { await this.onWake(reasons.join(',')); this.events.publish('scheduler.woke', { reasons }, false); } finally { this.running = false; if (this.pending.size) this.wake('coalesced'); } }
+  private paused = false; private stopped = false; private planGeneration = 0;
+  constructor(private readonly events: EventHub, private readonly onWake: (reason: string, generation: number) => Promise<void> | void, private readonly idleMs = 1000) {}
+  get generation() { return this.planGeneration; }
+  get pausedValue() { return this.paused; }
+  get stoppedValue() { return this.stopped; }
+  wake(reason: string) {
+    if (this.paused || this.stopped) return false;
+    this.pending.add(reason);
+    if (this.running || this.timer) return true;
+    this.timer = setTimeout(() => { this.timer = undefined; void this.flush(); }, this.idleMs);
+    return true;
+  }
+  /**
+   * Human control interrupts the old plan: queued wakeups are dropped and the generation is
+   * advanced so an in-flight wake cannot publish or reschedule as if it still owned the plan.
+   */
+  humanControl(reason = 'human-control') {
+    this.planGeneration++;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.pending.clear();
+    this.events.publish('scheduler.interrupted', { reason, generation: this.planGeneration }, true);
+    return this.planGeneration;
+  }
+  pause() { this.paused = true; return this.humanControl('pause'); }
+  resume() { if (this.stopped) return false; this.paused = false; this.planGeneration++; return true; }
+  async flush() {
+    if (this.running || !this.pending.size || this.paused || this.stopped) return;
+    this.running = true;
+    const reasons = [...this.pending]; this.pending.clear();
+    const generation = this.planGeneration;
+    try {
+      await this.onWake(reasons.join(','), generation);
+      // A pause/cancel/stop that landed while the model was running invalidates this wake.
+      if (generation !== this.planGeneration || this.paused || this.stopped) {
+        this.events.publish('scheduler.stale-wake', { generation, current: this.planGeneration, reasons }, false);
+        return;
+      }
+      this.events.publish('scheduler.woke', { reasons, generation }, false);
+    } finally {
+      this.running = false;
+      if (this.pending.size && !this.paused && !this.stopped) this.wake('coalesced');
+    }
+  }
   observe(event: Event) { if (/goal|execution|effect|session|observation|error/.test(event.kind)) this.wake(event.kind); }
-  close() { if (this.timer) clearTimeout(this.timer); this.timer = undefined; this.pending.clear(); }
+  close() { this.stopped = true; this.planGeneration++; if (this.timer) clearTimeout(this.timer); this.timer = undefined; this.pending.clear(); }
 }
