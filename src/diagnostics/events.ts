@@ -26,6 +26,8 @@ export class EventHub {
     return event;
   }
   subscribe(listener: (event: Event) => void) { this.subscribers.add(listener); return () => this.subscribers.delete(listener); }
+  /** Highest sequence assigned so far, including non-durable events. Used to build SSE snapshots. */
+  head(): string { return this.seq.toString(); }
   read(after = '0', limit = 100, filter?: string): EventRead {
     if (!/^\d+$/.test(after)) throw new Error('invalid-event-cursor');
     if (!Number.isInteger(limit) || limit < 1 || limit > 10000) throw new Error('invalid-event-limit');

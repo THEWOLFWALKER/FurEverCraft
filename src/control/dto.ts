@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 const JsonObject = z.record(z.unknown());
 export const CommandNameSchema = z.enum([
-  'goal.set', 'goal.revise', 'message', 'chat', 'pause', 'resume', 'stop', 'cancel', 'save', 'quit',
+  'goal.set', 'goal.revise', 'message', 'chat', 'pause', 'resume', 'recover', 'stop', 'cancel', 'save', 'quit',
 ]);
 export type CommandName = z.infer<typeof CommandNameSchema>;
 
