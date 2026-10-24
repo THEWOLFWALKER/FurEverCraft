@@ -1,112 +1,91 @@
-# FurEverCraft v0.2 Delivery Report
+# FurEverCraft v0.2 Delivery Report — P01–P23 merged, P24 in progress
 
 ## Status
 
-A substantial offline implementation of the v0.2 batch exists and is verified on loopback fixtures. It is not a claim of live Minecraft 26.3, Windows, or paid-API compatibility. Real servers/worlds, paid model APIs, actual SendInput and desktop capture were not used.
+The merged `p24-final` branch (`a2d216e`) contains an offline-verifiable implementation of P01–P23 on Linux. P24 is **in progress**: the documentation/consistency items in this worktree are done, but **none of the five full review rounds required by `REVIEW.md` has been completed**. Nothing here is a claim of live Minecraft 26.3, Windows, or paid-API compatibility.
 
-## What is implemented
+Real Minecraft servers/worlds, real Windows input/capture, game assets, and paid model APIs were not used. Local results use Node `v22.23.4` / npm `10.9.9`; cloud CI was not observed.
 
-### Foundation and providers (F)
-- One `createRuntime` assembly with a shared injected Clock, Store, Session, Executor, Router, provider, AgentLoop, ControlService, GoalManager and TaskScheduler.
-- Executor: owner token, AbortSignal, resource leases with per-resource generation, lease/watchdog renewal on progress, watchdog aborts in-flight work, terminal-state writes are guarded in the store, ambiguous/partial never promoted to confirmed.
-- Store: transactional migrations, effect state guards, action receipt lifecycle (`conflict`/`rejected` preserved), checkpoint persistence, terminal-safe execution writes.
-- WorldState: schema-validated updates, read-time TTL, sticky gap cleared only by a full baseline, prior cells preserved as `unknown` after a gap, immutable notifications.
-- EventHub: `bootEpoch` + sequence, validated cursors, filtered reads without manufactured gaps.
-- Providers: canonical history, OpenAI/Anthropic serializers with correct tool pairing, UTF-8 SSE across arbitrary byte chunks, record/response/tool-argument limits, truncation rejection, `Retry-After`-aware bounded retry, cancellation fence, `allowModelNetwork` gate, no-key unavailable provider.
-- Side-effect skills persist `prepared → may-have-dispatched` before dispatch and settle `confirmed/partial/ambiguous` by outcome; `place` is only confirmed when the target cell is observed blocked.
+## What is actually runnable
 
-### Bridge (B)
-- `version-profile.ts`: 26.3 / 777 / 5023 candidate metadata with explicit limitations; the legacy 1.20.4/765 codec is labelled as a fixture and never presented as 26.3 support.
-- Raw TCP relay: `allowHalfOpen`, validated handshake rewrite (protocol/nextState), declared-length limit, backpressure on `write=false` with drain resume, bounded close flush, half-close reply preservation, EOF session cleanup, retryable startup, deterministic stop.
-- Bounded observer: async bounded queue with concurrency/timeout, per-frame byte offsets, sequence advance on dropped frames, sticky global unknown, reset clears partial frames, worker_threads host with failure isolation.
-- IPC: versioned protocol, session-epoch fencing, bounded pending requests, listener cleanup.
-- Domain projection: position/chat/registry with explicit `unknown` for unsupported or malformed packets.
-- Windows driver/helper: 250 ms heartbeat default, PID/HWND confirmation on bind, identity required to permit input, request-ID matching, command-ID dedup, best-effort cleanup. Linux-tested only via `FakeHelperTransport`.
-- Supervisor: owner epoch, child session/boot fencing, hello-before-request, 3-per-60s restart budget, owner-loss revoke, explicit quit; relay child entry and fork spawner, verified end-to-end over loopback child IPC.
+- **CLI**: `demo`, `serve`, `attach`, `status`, `doctor`, `bridge` (fixture/inspect/service; live remains gated), `goal:revise`, `events`, `trace:export`, `trace:replay`.
+- **HTTP control plane**: Fastify `/api/v1` reads/writes, local pairing (one-time code, HttpOnly/SameSite session, CSRF), loopback/Host/Origin checks, CLI bearer, SSE snapshot/cursor/gap recovery. P24 adds authenticated `GET /api/v1/doctor`.
+- **Web console**: React/Vite five-area control UI (overview, conversation, tasks, world, settings/diagnostics) served from the same ControlService as the CLI.
+- **Runtime/bridge**: one RuntimeAssembly per storage path with cross-process owner lock; raw loopback TCP relay with read-only observer; framing/compression budgets; 3D Motor path with simulated body when explicitly injected; default simulated profile remains explicit legacy 2D.
+- **Diagnostics**: truthful doctor over the attached runtime/store; bounded trace export and side-effect-free replay.
 
-### Control surface (U)
-- Shared ControlService: canonical payload hash, atomic in-flight claim for concurrent requestId dedupe, durable receipts, CAS conflicts, pause blocks new admission, stop cancels non-terminal executions and releases body input, save persists a checkpoint, message goal-revision conflicts surface as `conflict`.
-- HTTP/SSE: JSON API, Zod DTOs, 400/409, SSE snapshot at a consistent watermark, gap re-sends a fresh snapshot, bounded events/bytes, heartbeats with backpressure checks, same-origin static hosting.
-- React + Vite console using the calm blue-white tokens, truthful `--` unknown states, live SSE feed, capability-aware panels, responsive breakpoints.
-- CLI: `serve` (default 127.0.0.1:3000), `attach`, `demo`, `status`, `doctor`, `bridge` fixture/inspect/live-gated.
+## Verified checks (offline Linux, 2026-10-24)
 
-### Motor / autonomy / verification (M/A/V)
-- Sparse 3D world with explicit unknown; action graph requires an actual support surface (air is not support); continuous simulated body with gravity, yaw-relative movement, jump and support checks; progress controller with correct cooldown reset.
-- GoalManager rejects cycles and unknown skills; TaskScheduler is subscribed to the EventHub and advances a real AgentLoop turn; knowledge rules load from a versioned JSON file; episodic memory can be recorded.
-- Eleven skills registered; `look_at`, `dig_one`, `return_to_place`, `collect_nearby`, `gather_blocks` run against simulated capabilities and fail closed when absent.
-- Soak: 60 virtual minutes, ≥50 command transitions, pause/resume cycles, 5 runtime/db rebuilds with receipt dedupe verified after restart.
-
-## Verified commands (local Linux, Node 20.19.5)
+P01–P23 merged baseline `a2d216e`, post-build so conditional child-process tests execute:
 
 ```text
 npm run typecheck            pass
 npm run build                pass
-npm run build:web            pass
-npm run test:offline         26 files / 192 tests pass
-npm run test:v:offline       integration (incl. forked relay child) + soak + trace pass
-npm run demo:offline         6 scenarios pass
-npm run demo:autonomy        pass
-npm run doctor -- --profile simulated   pass
-npm run bridge:protocol -- --config configs/simulated.json   pass (fixture, loopback)
-npm run test:web             web typecheck + vite build pass
+npm run build:web            pass (Vite 5.4.11, 32 modules)
+npm run test:offline         45 files / 383 tests passed, 0 skipped
+npm run test:v:offline       integration 9 files / 47 tests passed
+                             soak         2 files /  2 tests passed
+                             diagnostics  2 files / 15 tests passed
+npm run test:web:e2e         1 spec / 2 Chromium tests passed (~19 s)
+npm run demo:offline         6/6 scenarios passed
+npm run doctor               exit 0; truthful "degraded" default report
 ```
 
-Loopback smoke: `serve` served the built UI (200 text/html), `/api/v1/status` returned running, `goal.set` returned terminal, and the JS asset loaded (200).
+P24 work in this worktree adds `tests/integration/p24-doctor.test.ts` (`0dd7bfc`; docs updated on this branch); current counts are **46 files / 384 tests** offline and **10 files / 48 tests** integration (soak/diagnostics/E2E unchanged). These are in-progress P24 results, not a completed P24.
 
-## P01–P04 convergence (merged)
+Additional P24 checks: `npm run trace:export -- --db <tmp> --out <tmp>` exited 0 and wrote a bounded 0-record trace from a fresh DB; `npm run trace:replay -- --file <tmp>` exited 0 with `contiguous: true`, `input: disabled`, `network: disabled`, `paidApis: disabled`, `sideEffects: not-resent`. The new doctor test proves unauthenticated access is denied and an authenticated CLI bearer receives the same truthful P21 report.
 
-- `src/execution/factory.ts`: one explicit `RuntimeDependencies` container (Clock/Store/Events/Provider/Body/Nav/Motor); client-offline without a real body fails closed; simulated input defaults on, client input off.
-- `src/execution/admission.ts`: goal-revision, owner, epoch and capability checks before prepare and again before dispatch.
-- `src/execution/ownership.ts`: atomic cross-process lock; only verified-dead same-host owners are reclaimed; unknown/foreign locks are never deleted; only the owning record is released.
-- `src/execution/session.ts`: recovery budget, retry after recoverable failure, world/account isolation, cross-epoch reobservation without false confirmation.
-- `tests/unit/p01-p04.test.ts` adds regression coverage for the above.
+## P01–P23 status summary
 
-## Additional convergence work (post-review)
+Full evidence paths and test counts are in `PROGRESS.md`; implementation/test locations are summarized here.
 
-- Control server migrated to **Fastify** with one-time local pairing (5-minute code, single use), HttpOnly/SameSite session cookie, CSRF token, loopback/Host/Origin checks, and CLI bearer support.
-- Five-area React console: Overview, Conversation, Tasks, World (Canvas top-down view), Settings/Diagnostics, plus a live event stream.
-- Fail-closed 26.3 codec gate: `assertSupportedProfile` refuses when the pinned dependency lacks 26.3 data, and the summary reports `26.3-codec-data-unavailable`.
-- Trace export/replay CLI (`trace:export`, `trace:replay`).
-- S01–S14 acceptance-mapped integration suite and U04 concurrency tests (identical requestId once, stale CAS conflict).
-- Recovery now attributes a placement only when the effect had actually been dispatched; a blocked cell alone is ambiguous.
+| Area | Tasks | Status |
+|---|---|---|
+| Foundation | P01–P04 | done-offline — single Runtime assembly, execution/effect barrier, atomic ownership, recovery budget |
+| Bridge | P05–P09 | P05/P06/P09 done-offline; P07/P08 done-limited (26.3 data absent, synthetic projection only) |
+| Motion | P10–P13 | P10/P11 done-limited (3D contract + simulated Motor; some legacy 2D tools); P12/P13 done-offline (realtime control, simulated body) |
+| Control/Agent | P14–P18 | P14–P16 done-offline (CLI, web, security/SSE); P17/P18 done-limited (injected provider transport, limited skill lifecycle) |
+| Knowledge/Diagnostics | P19–P21 | P19/P20 done-limited (fixture knowledge, bounded scoped memory); P21 done-offline (doctor/trace/replay) |
+| Verification | P22/P23 | done-offline — real headless Playwright E2E with simulated body; combined faults + 60 virtual-minute soak + wall-clock smoke |
+| Finalization | P24 | **not-done / in progress** — docs, trace scripts and doctor endpoint done; five review rounds not started |
 
-## 500-issue audit remediation (2026-10-18)
+## Exact 26.3 data gaps
 
-Triage of the 500-item audit: ~143 real findings (70 deduplicated root causes), 142 false positives, 208 not-implemented-by-design (excluded by instruction), 7 unverifiable environment facts. Fixes were made only for bugs, with regression tests:
+The installed dependency tree does not provide verified Minecraft 26.3 codec/domain data. Concretely:
 
-- WorldState: deltas merge instead of replacing cells; default invalidate demotes every known cell; invalid sequence is a contract error.
-- Leases: epoch fencing and owner-checked release; progress renews lease/watchdog; watchdog aborts work.
-- Execution: unknown/absent outcome becomes ambiguous, never success; terminal states are write-protected.
-- Side effects: dispatch barrier must persist or the skill aborts; recovery only attributes a placement when it was actually dispatched and the snapshot is fresh and complete; effects/pending rows are scoped to the current world.
-- Control: pause/stop abort in-flight AgentLoops, quit closes the runtime and records a terminal receipt, resume cannot unpause after stop, commands rejected after close.
-- Server: Fastify migration with local pairing, HttpOnly session, CSRF, CLI bearer; static assets 404 instead of SPA HTML; SSE snapshot/watermark consistent.
-- Bridge: relay buffers client bytes until upstream connect; observer reports phase/compression as unsupported rather than fabricating; IPC close clears pending/listeners and backpressure tracks real queue.
-- Windows: watchdog keyed on heartbeat not release, bind identity verified, helper registers dedupe only after success.
-- Skills: navigation verifies actual position, dig/gather require observed free cells, chat fails closed without a dispatcher and restores the prior UI mode.
-- Clock: large timeouts no longer collapse to 1 ms.
+1. `minecraft-data@3.87.0` is installed, but `codecDataAvailable()` is false: there is no decodable `pc/26.3` version/protocol schema. No decoder was guessed or hand-written.
+2. `configs/adapters/target-26.3.candidate.json` is a **candidate/unsupported** manifest. Its schema, data and native provenance entries are explicitly `verified: false`; candidate commit references are recorded but do not constitute installed 26.3 data.
+3. Real 26.3 projectors are `unavailable` (`realProjectionAvailability()`); only synthetic contract projectors are assembled to verify the pipeline. There is no real 26.3 position/blocks/entities/inventory/chat/lifecycle decode.
+4. Capability matrix is per-domain, not one `supported` flag: framing `verified-fixture`; compression `experimental` (synthetic, no live 26.3 control anchor); position `verified-fixture` (legacy 2D); chat `verified-fixture`; blocks/entities/inventory `unsupported` (missing schema/unknown item components); lifecycle `experimental`/synthetic.
+5. Missing data includes item-component/void-codec semantics, chunk/light schemas, entityDelta/PositionPath real vectors, and verified 26.3 phase/compression transition anchors.
+6. The Windows native helper is an unverified candidate (no real Windows host, no SendInput/capture), so native input provenance remains unverified even if the file/hash is recorded.
+7. No vendor/codegen of the fixed candidate sources was performed; therefore no experimental real adapter was registered.
 
-## Review passes performed
+## External blocks (not code-completion substitutes)
 
-Two full read-only review passes covered every group without a finding cap:
-- F01–F06, B01–B06, U01–U04, M01–M05, A01–A05, V01–V04.
-- Each item is classified satisfied/partial/unmet with file:line evidence.
+- **No real Minecraft:** no real server, world, client login, or live interoperability. Relay/observer evidence is loopback-only, without a game engine.
+- **No Windows input/capture:** the helper/driver is tested through injected transport and static/unit checks only; no real SendInput, SDL3 calibration, or desktop capture.
+- **No paid model API:** OpenAI/Anthropic paths use injected transports/fixtures; all network/model gates default off. No real model request was made.
+- **Motor is simulated only:** the 3D path has simulated-body evidence (walk/turn/stop/short jump); `stepUp`/`controlledDrop` remain disabled and there is no real 26.3 physics/terrain evidence.
+- **E2E body is simulated:** P22 starts a real Fastify server, real Chromium and real CLI, but the body is the simulated adapter, not a Minecraft client.
+- **No screenshots:** E2E explicitly disables screenshots, video and traces; no visual evidence is claimed.
+- **CI unobserved:** Node 22 and Playwright pass locally; cloud CI results are not known.
 
-Fixes applied from those reviews include: relay stop deadlock and half-close reply loss, supervisor late-exit/hello/boot-epoch/owner-revoke, observer sequence/reset/concurrency, relay declared-length limit, Windows identity/heartbeat, atomic command claim, pause admission, stop body release, real capabilities, SSE watermark and gap recovery, motor support/cooldown/body physics, task cycles/unknown skills, scheduler wiring, knowledge loader, deterministic demo DBs, real autonomous demo path, and the missing `demo:autonomy`/`test:web:e2e` scripts.
+## What P24 and the five rounds still owe
 
-## Honest limits (explicitly not implemented or not verified)
+1. Execute the five full review rounds in `REVIEW.md`, one at a time, over the whole repository and assembly chains (not one module per round).
+2. For each round record start/end commit, coverage, findings with severity/trigger/file/impact, fixed / false-premise / blocked-external classification, targeted regression commands and remaining affected tasks.
+3. Fix findings before advancing; do not defer them to the end. Do not weaken tests or reclassify incomplete work to make a round pass.
+4. After round 5, perform the final consistency pass over docs/config/scripts/capability claims/node-22 CI, then rerun the affected standard checks.
+5. Only then mark P24 complete. The five rounds and P24 remain **not-done** at the time of this report.
 
-- **26.3 codec is absent**: the installed `minecraft-data` has no 26.3 data; the codec remains the 1.20.4/765 fixture. The 26.3 profile is candidate metadata only. This is a fail-closed boundary, not live support.
-- **Domain adapters are partial**: only position/chat/registry are projected; health/inventory/entity/chunk/light/respawn are explicit `unknown`. No coverage query or `CapabilityProvider`.
-- **Observer lacks decompression/compression-ratio enforcement** and phase progression; it frames bytes but does not decompress or type-parse 26.3 packets.
-- **Relay STATUS independent probe** has no explicit session classification; it relies on per-connection upstreams.
-- **CompositeClientBridge does not implement the Runtime capability interface**, so `client-offline` cannot be assembled as a production bridge.
-- **Windows**: no real SendInput/capture; no SDL3 mapping or calibration; helper restart control-uncertain is not implemented.
-- **Motor is not wired into the Runtime**: M01–M05 is a verified standalone module, not the production control path.
-- **React UI**: no Canvas top-down map, no Playwright browser E2E, no list pagination/cursor; `test:web` is typecheck+build.
-- **V01 has 2 integrated scenarios**, not the 14 named S01–S14; S12 entityDelta/PositionPath is absent.
-- **Node 22 CI is configured but unobserved**; Windows CI only statically parses the helper.
-- **No real Minecraft server/world, paid API, SendInput or screenshot verification.**
+## Honest limits that must not be misreported
+
+- A loopback fixture, synthetic projector, injected provider transport, or simulated body is **not** real-client/live evidence.
+- `done-limited` is not equivalent to complete support: the stated limits (26.3 data, provider transport, skill scope) still apply.
+- Local Node 22 passing does not mean CI ran; passing offline tests do not prove live Minecraft compatibility.
+- No feature was silently removed from the batch; unavailable capabilities are explicit fail-closed surfaces with reasons.
 
 ## Testing discipline
 
-Assertions are grounded in contracts or observable behavior. Fixture provenance stays `fixture`/`simulated`. Async tests use `await`/`rejects`. Databases use isolated temp paths. Unknown/ambiguous/failure/cleanup paths are asserted. Tests corrected during review had wrong premises (e.g. missing full baseline, incomplete helper identity, snapshot watermark semantics); no assertion was weakened to force green.
+Assertions target contracts or observable behavior; fixture provenance stays labelled. Async behavior is awaited, test databases use isolated temporary paths, and process/port/browser resources are cleaned up. Negative cases (auth denial, Origin rejection, cursor gaps, crash windows, ambiguous outcomes) are asserted. No assertion was weakened to force a green result. The P24 doctor test initially asserted that the pairing response itself never contains its CSRF token; that premise was wrong (the pairing response is designed to return it), so the assertion was corrected to scope secret checks to the doctor responses rather than weakening the implementation.
