@@ -3,7 +3,7 @@ import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import { SQLiteStore } from '../persistence/store.js';
 import { SessionRuntime } from './session.js';
 import { ToolRouter, AgentLoop, memoryScopeOf } from '../agent/router.js';
-import { Executor, InputArbiter } from './runtime.js';
+import { Executor, InputArbiter, leaseContextEpoch } from './runtime.js';
 import { ExecutionAdmission } from './admission.js';
 import { RuntimeOwnershipLock, type OwnershipLockOptions } from './ownership.js';
 import { MemoryService, type MemoryScope } from '../autonomous/memory.js';
@@ -133,6 +133,7 @@ function assertBodyAdapterContext(bridge: ClientBridgeCapabilities, adapter: Bod
   const actual = adapter.context;
   const mismatch = (field: string) => new Error(`body-adapter-context-mismatch:${field}`);
   if (actual.serverProfileId !== expected.serverProfileId) throw mismatch('serverProfileId');
+  if ((actual.accountId ?? undefined) !== (expected.accountId ?? undefined)) throw mismatch('accountId');
   if ((actual.worldGenerationId ?? undefined) !== (expected.worldGenerationId ?? undefined)) throw mismatch('worldGenerationId');
   if (actual.dimension !== expected.dimension) throw mismatch('dimension');
 }
@@ -239,17 +240,27 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     throw error;
   }
   try {
+    // A fresh owner is the only process allowed on this store. Any receipt still pending was
+    // written by a dead process, so settle it as unknown before commands can be replayed.
+    // A failure here must fail construction (and release ownership) rather than replay accepted.
+    store.recoverPendingReceipts();
     const events = options.events ?? new EventHub(1024, store, bridge.context);
     const inputsEnabled = options.inputsEnabled ?? simulatedProfile;
-    const session = new SessionRuntime(bridge, store, { events, maxRecoveryAttempts: options.maxRecoveryAttempts });
-    const arbiter = new InputArbiter(() => clock.now(), () => `${bridge.context.connectionEpoch}:${bridge.context.bodyEpoch}:${bridge.context.worldGenerationId}`);
+    const bridgeService = options.bridgeService?.service;
+    // An attached bridge service owns relay/observer/helper control. Its admission gate starts
+    // closed and a failure re-closes it; the runtime must enforce that state instead of only
+    // reporting it. Without an attached service the runtime's own inputs setting is authoritative.
+    const controlOpen = () => !bridgeService || bridgeService.status().admissionOpen;
+    const arbiter = new InputArbiter(() => clock.now(), () => leaseContextEpoch(bridge.context));
     // A 3D navigation skill advances virtual time while it plans/executes bounded steps; the
     // legacy 1s default would abort legitimate routes. Progress still renews the watchdog, and
     // the controller's own maxTicks/maxWallClock budget remains the hard bound.
     const leaseTtl = options.leaseTtl ?? (bodyAdapter ? 300_000 : undefined);
     const watchdogTtl = options.watchdogTtl ?? (bodyAdapter ? 300_000 : undefined);
-    const executor = new Executor(bridge, store, arbiter, { clock, inputsEnabled: () => inputsEnabled, ...(leaseTtl !== undefined ? { leaseTtl } : {}), ...(watchdogTtl !== undefined ? { watchdogTtl } : {}) });
-    const admission = new ExecutionAdmission(store, bridge, session.ownerId, () => inputsEnabled);
+    const executor = new Executor(bridge, store, arbiter, { clock, inputsEnabled: () => inputsEnabled && controlOpen(), ...(leaseTtl !== undefined ? { leaseTtl } : {}), ...(watchdogTtl !== undefined ? { watchdogTtl } : {}) });
+    // Recovery may only suspend executions that are not actively owned by this process.
+    const session = new SessionRuntime(bridge, store, { events, maxRecoveryAttempts: options.maxRecoveryAttempts, isExecutionActive: executionId => executor.isActive(executionId) });
+    const admission = new ExecutionAdmission(store, bridge, session.ownerId, () => inputsEnabled, controlOpen);
     const resolvedProvider = resolveProvider(options);
     const provider = resolvedProvider.provider;
     const memory = new MemoryService(store, [], { now: () => clock.now() });
@@ -276,9 +287,19 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     // Wire the scheduler to the event stream so goal/execution/effect/session events coalesce
     // into a single wake instead of a per-tick model call.
     const unsubscribeScheduler = session.events.subscribe(event => scheduler.observe(event));
+    // Control loss in the bridge service (relay/observer/helper death, IPC control loss) must
+    // reach the execution layer: admission closes and every active write is aborted, not just
+    // reported in the service status. A later explicit armControl is required before new input.
+    const unsubscribeBridgeService = bridgeService?.on?.(event => {
+      const controlLost = event.type === 'control-revoked' || event.type === 'helper-exit'
+        || event.type === 'relay-exit' || event.type === 'observer-failure' || event.type === 'fatal'
+        || (event.type === 'ipc-overflow' && (event.controlLost === true || event.globalUnknown === true));
+      if (!controlLost) return;
+      try { executor.cancelAll(`bridge:${event.type}`); } catch { /* cancellation is best effort */ }
+      try { lifecycle.humanControl(`bridge:${event.type}`); } catch { /* lifecycle may already be closed */ }
+    });
     const dependencies: RuntimeDependencies = { clock, store, events: session.events, provider, body: bridge, nav, motor, ...(bodyAdapter ? { bodyAdapter } : {}) };
     let closed = false;
-    const bridgeService = options.bridgeService?.service;
     const startBridgeService = bridgeService ? async () => { await bridgeService.start(); } : undefined;
     const assembly = {
       bridge, store, session, router, provider, providerMetadata, loop, clock, control, goalManager, scheduler, sessionSupervisor,
@@ -290,6 +311,7 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
         if (closed) return;
         closed = true;
         unsubscribeScheduler();
+        unsubscribeBridgeService?.();
         scheduler.close();
         void sessionSupervisor.stop();
         if (bridgeService) void bridgeService.stop('runtime-close').catch(() => undefined);

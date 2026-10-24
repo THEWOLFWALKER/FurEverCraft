@@ -14,6 +14,7 @@ export type AdmissionCode =
   | 'epoch-changed'
   | 'capability-unavailable'
   | 'input-disabled'
+  | 'control-revoked'
   | 'aborted';
 export type AdmissionDecision = { ok: true } | { ok: false; code: AdmissionCode; message: string };
 export type AdmissionRequest = {
@@ -27,6 +28,7 @@ export type AdmissionRequest = {
 
 export const sameBodyContext = (left: BodyContext, right: BodyContext) =>
   left.serverProfileId === right.serverProfileId &&
+  left.accountId === right.accountId &&
   left.worldGenerationId === right.worldGenerationId &&
   left.connectionEpoch === right.connectionEpoch &&
   left.bodyEpoch === right.bodyEpoch &&
@@ -75,6 +77,8 @@ export class ExecutionAdmission {
     private readonly body: ClientBridgeCapabilities,
     readonly ownerId: string,
     private readonly inputsEnabled: () => boolean,
+    /** Optional external control gate (for example the bridge service owner state). */
+    private readonly controlOpen: () => boolean = () => true,
   ) {}
 
   check(request: AdmissionRequest): AdmissionDecision {
@@ -96,6 +100,9 @@ export class ExecutionAdmission {
     }
     const missing = missingSkillCapability(this.body, request.skillId);
     if (missing) return { ok: false, code: 'capability-unavailable', message: missing };
+    // Control lost (relay/observer/helper failure, IPC control loss) is a hard admission gate.
+    // It is re-evaluated immediately before the dispatch barrier, not only at plan time.
+    if (!this.controlOpen()) return { ok: false, code: 'control-revoked', message: 'bridge-control-revoked' };
     if (INPUT_SKILLS.has(request.skillId) && !this.inputsEnabled()) {
       return { ok: false, code: 'input-disabled', message: 'input-disabled' };
     }

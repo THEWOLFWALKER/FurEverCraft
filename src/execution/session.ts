@@ -5,6 +5,7 @@ import { EventHub } from '../diagnostics/events.js';
 
 const sameContext = (left: BodyContext, right: BodyContext) =>
   left.serverProfileId === right.serverProfileId &&
+  left.accountId === right.accountId &&
   left.worldGenerationId === right.worldGenerationId &&
   left.connectionEpoch === right.connectionEpoch &&
   left.bodyEpoch === right.bodyEpoch &&
@@ -12,10 +13,11 @@ const sameContext = (left: BodyContext, right: BodyContext) =>
 
 /**
  * World/account identity that survives a reconnect. Connection and body epochs are allowed to
- * change during recovery; server profile, world generation and dimension are not.
+ * change during recovery; server profile, account, world generation and dimension are not.
  */
 const sameWorldScope = (left: BodyContext, right: BodyContext) =>
   left.serverProfileId === right.serverProfileId &&
+  left.accountId === right.accountId &&
   left.worldGenerationId === right.worldGenerationId &&
   left.dimension === right.dimension;
 
@@ -33,6 +35,8 @@ export type RecoveryResult = {
   recovered: boolean;
   context: BodyContext;
   reconciled: Array<{ effectId: string; status: string }>;
+  /** Executions left in flight by a previous process and suspended by this recovery. */
+  suspendedExecutions?: string[];
   attempts: number;
   budget: number;
 };
@@ -42,6 +46,8 @@ export type SessionRuntimeOptions = {
   events?: EventHub;
   /** Consecutive failed recovery attempts allowed before the session stays suspended. */
   maxRecoveryAttempts?: number;
+  /** Lets recovery avoid suspending an execution that this process is still driving. */
+  isExecutionActive?: (executionId: string) => boolean;
 };
 
 export class SessionRuntime {
@@ -51,10 +57,12 @@ export class SessionRuntime {
   private _state: SessionState = 'idle';
   private _attempts = 0;
   private readonly maxRecoveryAttempts: number;
+  private readonly isExecutionActive: (executionId: string) => boolean;
   constructor(readonly bridge: ClientBridgeCapabilities, readonly store: SQLiteStore, options: SessionRuntimeOptions = {}) {
     this.events = options.events ?? new EventHub(options.eventCapacity ?? 1024, store, bridge.context);
     this.ownerId = this.events.bootEpoch;
     this.maxRecoveryAttempts = Math.max(1, options.maxRecoveryAttempts ?? 3);
+    this.isExecutionActive = options.isExecutionActive ?? (() => false);
   }
   get state(): SessionState { return this._state; }
   get recoveryAttempts(): number { return this._attempts; }
@@ -75,11 +83,13 @@ export class SessionRuntime {
       // other worlds/accounts are left untouched for their own session to resolve.
       const stable = { ...this.bridge.context };
       const foreign: Array<{ effectId: string; status: string }> = [];
+      const foreignExecutions = new Set<string>();
       for (const effect of this.store.pendingEffects()) {
         const effectId = effect.effect_id ?? effect.effectId;
         const effectContext = effect.context as BodyContext;
         if (!sameWorldScope(effectContext, stable)) {
           foreign.push({ effectId, status: String(effect.status) });
+          if (typeof effect.execution_id === 'string') foreignExecutions.add(effect.execution_id);
           continue;
         }
         // A reconnect changes connection/body epoch but not the world. Those effects are
@@ -118,13 +128,26 @@ export class SessionRuntime {
         }
         reconciled.push({ effectId, status });
       }
+      // A process crash leaves executions in an in-flight state forever: the proposal-id
+      // dedupe then returns that stale "running" row on any retry. Only this recovery may
+      // settle them, and only when they are not actively driven by this process. They become
+      // suspended/ambiguous (never succeeded) so the operator or a new explicit run can act.
+      const inFlight = new Set(['queued', 'running', 'stopping', 'verifying']);
+      const suspendedExecutions: string[] = [];
+      for (const execution of this.store.listExecutions()) {
+        const executionId = execution.executionId;
+        if (!inFlight.has(String(execution.status))) continue;
+        if (foreignExecutions.has(executionId) || this.isExecutionActive(executionId)) continue;
+        const updated = this.store.updateExecutionStatus(executionId, 'suspended', 'recovered-after-restart', 'ambiguous');
+        if (updated && updated.status === 'suspended') suspendedExecutions.push(executionId);
+      }
       this.started = true;
       this._state = 'running';
       const attempts = this._attempts;
       // A completed recovery clears the consecutive-failure budget.
       this._attempts = 0;
-      this.events.publish('runtime.recovered', { executions: this.store.listExecutions().length, effects: reconciled.length, foreignEffects: foreign.length, ownerId: this.ownerId, recoveryAttempts: attempts }, true);
-      return { recovered: true, context: this.bridge.context, reconciled, attempts, budget: this.maxRecoveryAttempts };
+      this.events.publish('runtime.recovered', { executions: this.store.listExecutions().length, effects: reconciled.length, foreignEffects: foreign.length, suspendedExecutions, ownerId: this.ownerId, recoveryAttempts: attempts }, true);
+      return { recovered: true, context: this.bridge.context, reconciled, suspendedExecutions, attempts, budget: this.maxRecoveryAttempts };
     } catch (error) {
       this.started = false;
       this._state = this._attempts >= this.maxRecoveryAttempts ? 'suspended' : 'recoverable-failure';

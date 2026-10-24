@@ -1,8 +1,8 @@
-# FurEverCraft v0.2 Delivery Report — P01–P23 merged, P24 Round 1 complete
+# FurEverCraft v0.2 Delivery Report — P01–P23 merged, P24 Rounds 1–2 complete
 
 ## Status
 
-The merged `p24-final` branch contains an offline-verifiable implementation of P01–P23 on Linux. P24 is **in progress**: the documentation/consistency items are in place, Round 1 of the five required review rounds is complete, and Rounds 2–5 remain. Nothing here is a claim of live Minecraft 26.3, Windows, or paid-API compatibility.
+The merged `p24-final` branch contains an offline-verifiable implementation of P01–P23 on Linux. P24 is **in progress**: the documentation/consistency items are in place, Rounds 1–2 of the five required review rounds are complete, and Rounds 3–5 remain. Nothing here is a claim of live Minecraft 26.3, Windows, or paid-API compatibility.
 
 Real Minecraft servers/worlds, real Windows input/capture, game assets, and paid model APIs were not used. Local results use Node `v22.23.4` / npm `10.9.9`; cloud CI was not observed.
 
@@ -16,13 +16,13 @@ Real Minecraft servers/worlds, real Windows input/capture, game assets, and paid
 
 ## Verified checks (offline Linux, 2026-10-24)
 
-Merged baseline `ccb9f8e` (`p24-final`), post-build so conditional child-process tests execute. Round 1 used Node `v22.23.4` / npm `10.9.9`.
+Merged baseline `ccb9f8e` (`p24-final`), post-build so conditional child-process tests execute. Round 2 started at `033f29a`; its code/tests are `b6d7f42`. Node `v22.23.4` / npm `10.9.9`.
 
 ```text
 npm run typecheck            pass
 npm run build                pass
 npm run build:web            pass
-npm run test:offline         46 files / 394 tests passed, 0 skipped
+npm run test:offline         47 files / 409 tests passed, 0 skipped
 npm run test:v:offline       integration 10 files / 56 tests passed
                              soak         2 files /  2 tests passed
                              diagnostics  2 files / 15 tests passed
@@ -47,7 +47,7 @@ Full evidence paths and test counts are in `PROGRESS.md`; implementation/test lo
 | Control/Agent | P14–P18 | P14–P16 done-offline (CLI, web, security/SSE); P17/P18 done-limited (injected provider transport, limited skill lifecycle) |
 | Knowledge/Diagnostics | P19–P21 | P19/P20 done-limited (fixture knowledge, bounded scoped memory with optional z); P21 done-offline (doctor/trace/replay) |
 | Verification | P22/P23 | done-offline — real headless Playwright E2E with fixture body; combined faults + 60 virtual-minute soak + wall-clock smoke |
-| Finalization | P24 | **not-done / in progress** — docs, trace scripts, doctor endpoint and Round 1 complete; Rounds 2–5 not started |
+| Finalization | P24 | **not-done / in progress** — docs, trace scripts, doctor endpoint, Round 1 and Round 2 complete; Rounds 3–5 not started |
 
 ## Exact 26.3 data gaps
 
@@ -73,10 +73,10 @@ The installed dependency tree does not provide verified Minecraft 26.3 codec/dom
 
 ## What P24 and the remaining rounds owe
 
-1. Rounds 2–5 of `REVIEW.md` are still owed; Round 1 is complete and recorded below.
-2. Round 2 (concurrency/crash/lifecycle), Round 3 (protocol/data/permissions), Round 4 (user flows/test credibility) and Round 5 (independent reread/regression) each still need the same start/end commit, coverage, finding and regression evidence.
+1. Rounds 3–5 of `REVIEW.md` are still owed; Rounds 1–2 are complete and recorded below.
+2. Round 3 (protocol/data/permissions), Round 4 (user flows/test credibility) and Round 5 (independent reread/regression) each still need the same start/end commit, coverage, finding and regression evidence.
 3. After round 5, perform the final consistency pass over docs/config/scripts/capability claims/Node-22 CI, then rerun the standard checks.
-4. Only then mark P24 complete. P24 and Rounds 2–5 remain **not-done** at the time of this report.
+4. Only then mark P24 complete. P24 and Rounds 3–5 remain **not-done** at the time of this report.
 5. The real 26.3 relay→decoder→projector→WorldState chain remains blocked on 26.3 schema/native/data; the current observer emits frame metadata only.
 
 ## Honest limits that must not be misreported
@@ -140,3 +140,57 @@ No finding was dismissed as false-premise. The only external block remains the r
 - P08 remains **done-limited / externally blocked** for real 26.3 projection; the observer emits no typed packet payload, and synthetic projectors are not a production substitute.
 - P02/P03/P11/P13/P20 moved from the previously limited/injected-only state to an explicit public `simulated-3d` assembly; they remain simulated evidence, not real-client validation.
 - The `simulated-3d` fixture body and the legacy fake bridge can still carry separate state for legacy-only tools (place/look/chat); this is documented as a fixture limitation, not production capability.
+
+## Review Round 2
+
+### State and coverage
+
+- Start: `033f29a` (`p24-final`, Round 1 merged), Worktree `agent-a19cecd12f9b7c9d1`, clean.
+- Round 2 code/tests: `b6d7f42`.
+- End state: this documentation commit (P24 remains in progress; Rounds 3–5 not started).
+- Environment: Linux x86_64, Node `v22.23.4`, npm `10.9.9`, offline only. No real Minecraft, Windows input/capture or model API was used.
+
+Whole-repo review, with the following chains re-traced and fault-injected:
+
+1. **Control command → durable receipt → execution → skill/body.** Claim/replay races, pause/resume/stop/quit, abort propagation, lifecycle generations, lease release, held-input release, terminal-state protection.
+2. **Crash/restart recovery.** Ownership lock acquisition/reclaim, pending receipts, prepared/may-have-dispatched/ambiguous effects, incomplete snapshots, execution settlement, recovery budget and scope isolation.
+3. **Bridge service → relay/observer/helper.** IPC backpressure/overflow, worker failure, helper exit, relay restart budget, admission/control revocation and its effect on the Runtime.
+4. **Supervisor → child lifecycle.** IPC shutdown, SIGTERM graceful stop, bounded exit grace, force-kill escalation and shutdown deadlines.
+5. **Cancellation paths.** `wait_for_condition` timers, 3D route pause/disconnect/target-revision CAS, watchdog double-settlement and stale owner/release fencing.
+6. **Persistence boundaries.** Prepared-write failure vs may-have-dispatched, barrier writes, receipt vs observation confirmation, `unknown` preservation and no implicit rollback.
+7. **World/account/dimension fencing.** Recovery scope matching, memory scope, lease context key and body-adapter context validation.
+
+### Findings and decisions
+
+| ID | Severity | Trigger / location | Actual impact | Decision and fix |
+|---|---|---|---|---|
+| R2-1 | High | Operator sends `stop`, then `pause`, then a replayed `resume`. `src/control/service.ts:285` | `pause` cleared `stopping`, so `resume` passed the "stopped wins" guard and cleared `paused`; the already-closed scheduler could then admit model/tool work again and body writes were no longer gated by the stopped state. | **fixed** — `pause` no longer clears `stopping`; stop/quit remain terminal. Regression in `tests/unit/p24-round2.test.ts` asserts stopping/paused stay set and resume/message stay rejected. |
+| R2-2 | High | Relay/observer/helper failure or IPC control loss with a `BridgeService` attached. `src/execution/factory.ts`, `src/execution/admission.ts`, `src/bridge/service/orchestrator.ts` | The service set `admissionOpen=false`/`controlRevoked=true`, but the Runtime never consulted that state: new writes were admitted and in-flight skills kept driving the body after control was lost. | **fixed** — bridge-service events now reach the Runtime (`BridgeService.on`); `ExecutionAdmission` rejects with `control-revoked`, `Executor` inputs close, `executor.cancelAll` aborts active work and `SkillLifecycle.humanControl` advances the generation. Regression: unarmed service blocks a place, armed service allows it, helper crash cancels a long wait and blocks the next write. |
+| R2-3 | Medium | Process dies with an execution in `queued`/`running`/`stopping`/`verifying`; the database is reopened. `src/execution/session.ts` | Executions stayed "running" forever after recovery; proposal-id dedupe returned the stale row, the UI/doctor reported live work, and only an explicit cancel could settle it. | **fixed** — recovery suspends non-terminal executions as `suspended`/`ambiguous` with `recovered-after-restart`, never `succeeded`. The current executor's active set is excluded via `isExecutionActive`, so a live run is not clobbered. Regressions cover both cases. |
+| R2-4 | Medium | Process dies after writing a `pending` command receipt but before committing its result. `src/persistence/store.ts`, `src/execution/factory.ts` | A replay after restart returned `accepted` for work no process was doing, and the receipt stayed pending forever. | **fixed** — a new owner settles all leftover pending receipts as `unknown` before commands can be replayed; failures fail runtime construction rather than replaying accepted. Regression seeds a pending receipt, reopens the runtime and asserts `unknown` with no re-execution. |
+| R2-5 | Medium | Same server/world/dimension, different account. `src/contracts/index.ts`, `src/execution/session.ts`, `src/execution/admission.ts`, `src/agent/router.ts`, `src/control/service.ts` | `BodyContext` had no account identity, so recovery could treat another account's pending effect as its own; memory scope and command receipts also omitted the account. | **fixed** — optional `accountId` is part of the context schema, same-context/world-scope comparisons, admission, body-adapter validation, memory scope and command receipt scope. Regression proves a foreign-account effect is neither reconciled nor suspended and that memory scope carries the account. |
+| R2-6 | Medium | Dimension/server change while a lease is held. `src/execution/runtime.ts`, `src/execution/factory.ts` | The arbiter's context epoch omitted dimension, server profile and account, so a dimension switch did not invalidate the lease at the arbiter boundary (only the per-dispatch admission check caught it). | **fixed** — `leaseContextEpoch` includes server, account, world, dimension and both epochs; regression exercises a dimension change and the fencing key. |
+| R2-7 | Medium | `start_skill wait_for_condition` with a long deadline, then pause/stop/cancel. `src/skills/skills.ts`, `src/agent/router.ts` | The wait was a bare scheduled timer: abort only flipped predicates, so the execution stayed non-terminal until the deadline, the timer kept the process alive after quit, and the closed store could be written later. | **fixed** — skill context carries an abort signal (executor + lifecycle combined); the wait resolves `canceled` on abort, cancels its timer, and the router removes fired/canceled timer entries. Regressions cover skill-level abort and a long wait canceled by pause. |
+| R2-8 | Medium | Graceful shutdown exceeds the deadline; relay child receives shutdown. `src/bridge/service/orchestrator.ts`, `src/bridge/supervisor.ts`, `src/bridge/relay/entry.ts` | The service reported `stopped` without escalating, so a hung child could be orphaned; the supervisor sent an IPC shutdown and immediately killed the relay child, so in-flight relay flush/close did not run; the relay entry had no SIGTERM graceful path. | **fixed** — deadline now invokes optional `forceStop` escalation; the supervisor waits a bounded exit grace before killing; the relay entry handles SIGINT/SIGTERM by running its graceful stop. Regressions cover responsive-exit (no kill), ignored-shutdown (kill after grace) and deadline escalation. |
+| R2-9 | Low | Long uptime with many skill runs/executions. `src/skills/lifecycle.ts`, `src/execution/runtime.ts` | Finished skill-run snapshots and per-execution progress maps grew without bound. | **fixed** — bounded retention (256 terminal runs, 512 progress entries, active entries never evicted); regression drives 300 runs/520 executions and checks the bounds. |
+| R2-10 | Low | Crash between creating the lock path and writing its record. `src/execution/ownership.ts` | With an exclusive create + write, a crash in that window could leave an empty lock that the safety rule (never delete an unknown lock) makes unreclaimable, blocking all future owners. | **fixed** — the complete record is written/fsynced to a private temp file and published with an atomic hard link; `EEXIST` still refuses, unknown/foreign locks are still never deleted, and no partial lock path is observable. Regression checks complete contents and no temp residue. |
+
+No finding was dismissed as false-premise. One behavior was deliberately retained: a pre-existing **external** empty/unknown lock file is still refused rather than deleted, because it cannot be positively identified as a dead same-host owner's record; an operator must remove it. PID reuse on the same host is likewise not detectable from a PID alone, so a recycled PID can conservatively block an owner until the stale file is removed.
+
+### Targeted verification
+
+- `npx vitest run --config vitest.config.ts tests/unit/p24-round2.test.ts tests/unit/p01-p04.test.ts tests/unit/supervisor.test.ts` — 44 tests pass (Round 2 regressions + ownership/supervisor).
+- `npm run typecheck` — pass.
+- `npm run build` — pass (dist rebuilt so child-process tests execute).
+- `npm run build:web` — pass (Vite 5.4.11).
+- `npm run test:offline` — **47 files / 409 tests pass**, 0 skipped.
+- `npm run test:v:offline` — integration **10 files / 56 tests**, soak **2 files / 2 tests**, diagnostics **2 files / 15 tests** pass.
+- `npm run test:web:e2e` — 2 Chromium tests pass (headless, no screenshots/video/trace).
+- `npm run demo:offline` — 6/6 scenarios pass; crash-recovery still leaves the ambiguous effect pending rather than promoting it.
+- `npm run doctor` — exit 0, truthful `degraded`; `npm run doctor -- --profile simulated-3d` — exit 0, simulated 3D body, no live claim.
+
+### Remaining affected tasks
+
+- P24 remains **in progress**: Rounds 3–5 and the final consistency pass are still owed.
+- P08/P10/P11/P17/P18/P19/P20 remain `done-limited`/externally blocked exactly as recorded above; Round 2 changed lifecycle/fencing behavior but did not create 26.3 decode or live evidence.
+- No new external block was introduced. The bridge-service control gate is test-verified; a production attachment still needs its operator/observation arming step, which is the existing P09 contract.

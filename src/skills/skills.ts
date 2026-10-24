@@ -10,6 +10,8 @@ export type SkillContext = {
   lease: Lease;
   report: (progress: Omit<Progress, 'at'>) => void;
   isCanceled?: () => boolean;
+  /** Abort signal covering executor cancel/watchdog and lifecycle pause/stop, when available. */
+  signal?: AbortSignal;
   clock?: import('../contracts/index.js').Clock;
   /** Extra operator/human-control signal consulted by the 3D adapters. */
   isPaused?: () => boolean;
@@ -99,15 +101,29 @@ export function waitForCondition(ctx: SkillContext, ms: number, wait?: (ms: numb
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
   ctx.report({ stage: 'dispatch', completed: 0, total: ms });
   // With an injected clock the wait must span the requested deadline; resolve it asynchronously
-  // instead of pretending the condition was met immediately.
+  // instead of pretending the condition was met immediately. The wait is abort-aware: pause,
+  // stop, cancel and watchdog must not leave a scheduled timer (and a live execution) behind.
   if (!wait && ctx.clock) {
+    const clock = ctx.clock;
     return new Promise<SkillResult>(resolve => {
-      const timer = ctx.clock!.schedule(ctx.clock!.now() + ms, () => {
-        if (canceled(ctx)) { resolve({ ok: false, outcome: 'canceled' }); return; }
+      let settled = false;
+      let timer: string | undefined;
+      const finish = (result: SkillResult) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clock.cancel(timer);
+        ctx.signal?.removeEventListener('abort', onAbort);
+        resolve(result);
+      };
+      const onAbort = () => finish({ ok: false, outcome: 'canceled', reason: 'canceled' });
+      if (ctx.signal?.aborted) { onAbort(); return; }
+      ctx.signal?.addEventListener('abort', onAbort, { once: true });
+      timer = clock.schedule(clock.now() + ms, () => {
+        if (settled) return;
+        if (canceled(ctx)) { finish({ ok: false, outcome: 'canceled' }); return; }
         ctx.report({ stage: 'verify', completed: ms, total: ms });
-        resolve({ ok: true, outcome: 'confirmed', value: { waitedMs: ms } });
+        finish({ ok: true, outcome: 'confirmed', value: { waitedMs: ms } });
       });
-      void timer;
     });
   }
   const met = wait ? wait(ms) : true;

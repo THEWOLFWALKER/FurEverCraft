@@ -12,6 +12,8 @@ export type BridgeServiceState = 'idle' | 'starting' | 'running' | 'degraded' | 
 export type RelayMonitor = {
   start(): Promise<void>;
   stop(reason?: string): Promise<void>;
+  /** Escalation after the graceful deadline; must be synchronous or bounded. */
+  forceStop?(): void | Promise<void>;
   readonly state: string;
   readonly pid?: number;
   onExit(listener: (reason: string) => void): () => void;
@@ -21,12 +23,14 @@ export type RelayMonitor = {
 export type ObserverMonitor = {
   start(): void;
   stop(): Promise<void>;
+  forceStop?(): void | Promise<void>;
   state(): unknown;
   onFailure?(listener: (reason: string) => void): () => void;
 };
 
 export type HelperMonitor = {
   shutdown(): Promise<void>;
+  forceStop?(): void | Promise<void>;
   releaseOwnedInputs?(): Promise<unknown>;
   /** Reports helper death/crash. Control is revoked before any restart and never re-armed here. */
   onExit?(listener: (reason: string) => void): () => void;
@@ -94,6 +98,8 @@ export class BridgeService {
   private readonly unsubscribeRelay: (() => void) | undefined;
   private readonly unsubscribeObserver: (() => void) | undefined;
   private readonly unsubscribeHelper: (() => void) | undefined;
+  /** Runtime-side listeners for control/lifecycle integration (separate from options.onEvent). */
+  private readonly eventListeners = new Set<(event: BridgeServiceEvent) => void>();
 
   constructor(private readonly options: BridgeServiceOptions = {}) {
     this.now = options.now ?? (() => Date.now());
@@ -106,6 +112,12 @@ export class BridgeService {
 
   get state(): BridgeServiceState { return this.stateValue; }
   get controlRevoked(): boolean { return this.controlRevokedValue; }
+
+  /** Subscribe a runtime consumer (admission/lifecycle). Returns an unsubscribe function. */
+  on(listener: (event: BridgeServiceEvent) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
 
   async start(): Promise<void> {
     if (this.stateValue === 'running' || this.stateValue === 'starting') return;
@@ -186,6 +198,13 @@ export class BridgeService {
     if (!completed) {
       this.forcedShutdown = true;
       this.log('error', 'shutdown-deadline-exceeded', { reason, graceMs });
+      // A deadline must not leave orphaned children: escalate to each monitor's hard stop.
+      const forced = [
+        this.options.relay?.forceStop?.(),
+        this.options.observer?.forceStop?.(),
+        this.options.helper?.forceStop?.(),
+      ].map(item => Promise.resolve(item).catch(() => undefined));
+      await withDeadline(Promise.all(forced), Math.max(50, Math.min(graceMs, 500)));
     }
     this.stateValue = 'stopped';
     this.admissionOpenValue = false;
@@ -221,6 +240,9 @@ export class BridgeService {
     }
     this.flush();
     try { this.options.onEvent?.(event as BridgeServiceEvent); } catch { /* listeners isolated */ }
+    for (const listener of this.eventListeners) {
+      try { listener(event as BridgeServiceEvent); } catch { /* listeners isolated */ }
+    }
   }
 
   /** Attempt to drain queued IPC without blocking. */

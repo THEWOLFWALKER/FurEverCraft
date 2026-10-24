@@ -5,8 +5,15 @@ class FakeChild implements ChildProcessLike {
   readonly pid = 4242;
   readonly sent: unknown[] = [];
   killed = false;
+  exitOnShutdown = false;
   private readonly handlers = new Map<string, Set<(value?: unknown) => void>>();
-  send(message: unknown) { this.sent.push(message); return true; }
+  send(message: unknown) {
+    this.sent.push(message);
+    if (this.exitOnShutdown && (message as { command?: string } | undefined)?.command === 'shutdown') {
+      setImmediate(() => this.emit('exit', 0));
+    }
+    return true;
+  }
   on(event: 'message' | 'exit' | 'error', listener: (value?: unknown) => void) { const set = this.handlers.get(event) ?? new Set(); set.add(listener); this.handlers.set(event, set); return this; }
   kill() { this.killed = true; return true; }
   emit(event: 'message' | 'exit' | 'error', value?: unknown) { for (const listener of this.handlers.get(event) ?? []) listener(value); }
@@ -103,5 +110,31 @@ describe('B06 process supervisor', () => {
     child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'foreign-owner', bootEpoch: 'b', capabilities: [] });
     expect(supervisor.state).toBe('failed');
     expect(child.killed).toBe(true);
+  });
+
+  it('lets a responsive child exit from the shutdown request before killing it', async () => {
+    const child = new FakeChild();
+    child.exitOnShutdown = true;
+    const supervisor = new ProcessSupervisor({ spawn: () => child, childExitGraceMs: 200 });
+    await supervisor.start();
+    child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'child-1', bootEpoch: 'b', capabilities: [] });
+    await new Promise(r => setImmediate(r));
+    await supervisor.stop();
+    expect(supervisor.state).toBe('stopped');
+    expect(child.sent.some(message => (message as { command?: string }).command === 'shutdown')).toBe(true);
+    expect(child.killed).toBe(false);
+  });
+
+  it('force-kills a child that ignores the shutdown request after the exit grace', async () => {
+    const child = new FakeChild();
+    const supervisor = new ProcessSupervisor({ spawn: () => child, childExitGraceMs: 10 });
+    await supervisor.start();
+    child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'child-1', bootEpoch: 'b', capabilities: [] });
+    await new Promise(r => setImmediate(r));
+    const started = Date.now();
+    await supervisor.stop();
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(child.killed).toBe(true);
+    expect(supervisor.state).toBe('stopped');
   });
 });

@@ -21,7 +21,7 @@ type RelayIpc = {
   off?(event: 'message' | 'disconnect', listener: (message?: unknown) => void): unknown;
 };
 
-export async function runRelayEntry(config: RelayEntryConfig, ipc: RelayIpc): Promise<void> {
+export async function runRelayEntry(config: RelayEntryConfig, ipc: RelayIpc): Promise<{ stop: () => Promise<void> }> {
   const sessionEpoch = `relay_session_${randomUUID()}`;
   const { observer: observerConfig, ...relayConfig } = config;
   let observer: ObserverWorkerHost | undefined;
@@ -73,10 +73,17 @@ export async function runRelayEntry(config: RelayEntryConfig, ipc: RelayIpc): Pr
   });
   // Parent loss must not orphan the listener or its sockets.
   ipc.on('disconnect', () => { void stop().then(() => process.exit(0)); });
+  return { stop };
 }
 
 // Entry points are only launched when this module is the process entry.
 if (process.send) {
   const config = JSON.parse(process.env.FUREVERCRAFT_RELAY_CONFIG ?? '{}') as RelayEntryConfig;
-  void runRelayEntry(config, { send: message => process.send!(message), on: (event, listener) => process.on(event, listener), off: (event, listener) => process.off(event, listener) });
+  void runRelayEntry(config, { send: message => process.send!(message), on: (event, listener) => process.on(event, listener), off: (event, listener) => process.off(event, listener) }).then(handle => {
+    // SIGTERM is a graceful request (flush/close sessions), not an abrupt kill. The supervisor
+    // falls back to force-kill only when the bounded grace expires without an exit.
+    const shutdown = () => { void handle.stop().then(() => process.exit(0)).catch(() => process.exit(1)); };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+  }, () => { process.exit(1); });
 }

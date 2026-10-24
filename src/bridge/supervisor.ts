@@ -22,6 +22,8 @@ export type SupervisorOptions = {
   heartbeatMs?: number;
   ownerLossMs?: number;
   ipcTimeoutMs?: number;
+  /** How long a child gets to exit after an IPC shutdown request before it is killed. */
+  childExitGraceMs?: number;
 };
 
 export type OwnerLossResult = { ownerLost: boolean; revoked: boolean; reason?: string };
@@ -41,6 +43,7 @@ export class ProcessSupervisor {
   private readonly ownerLossMs: number;
   private readonly heartbeatMs: number;
   private readonly ipcTimeoutMs: number;
+  private readonly childExitGraceMs: number;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly helloWaiters = new Set<(epoch: string) => void>();
   private readonly exitListeners = new Set<(reason: string) => void>();
@@ -56,6 +59,7 @@ export class ProcessSupervisor {
     this.ownerLossMs = options.ownerLossMs ?? 1_000;
     this.heartbeatMs = options.heartbeatMs ?? 250;
     this.ipcTimeoutMs = options.ipcTimeoutMs ?? 5_000;
+    this.childExitGraceMs = Math.max(0, options.childExitGraceMs ?? 200);
     this.lastHeartbeat = this.now();
   }
 
@@ -192,6 +196,20 @@ export class ProcessSupervisor {
     this.stateValue = 'stopped';
   }
 
+  /** Hard stop used only after the graceful deadline: never leave an orphaned child behind. */
+  forceStop(): void {
+    const child = this.child;
+    this.child = undefined;
+    this.childEpoch = undefined;
+    this.childBootEpoch = undefined;
+    for (const [id, waiter] of this.pending) { clearTimeout(waiter.timer); waiter.reject(new Error('ipc-disconnected')); this.pending.delete(id); }
+    if (child) {
+      this.expectedExits.add(child);
+      try { child.kill(); } catch { /* best effort */ }
+    }
+    this.stateValue = 'stopped';
+  }
+
   private notifyExit(child: ChildProcessLike): void {
     if (this.notifiedExits.has(child)) return;
     this.notifiedExits.add(child);
@@ -206,14 +224,28 @@ export class ProcessSupervisor {
     const child = this.child;
     if (child) this.expectedExits.add(child);
     const epoch = this.childEpoch;
-    this.child = undefined;
     this.childEpoch = undefined;
     this.childBootEpoch = undefined;
     for (const [id, waiter] of this.pending) { clearTimeout(waiter.timer); waiter.reject(new Error('ipc-disconnected')); this.pending.delete(id); }
     if (!child) return;
-    // The relay only accepts its own session epoch; fall back to kill when no hello was seen.
-    if (epoch) { try { child.send({ type: 'request', protocolVersion: 1, requestId: `stop-${reason}`, sessionEpoch: epoch, command: 'shutdown', payload: {}, timeoutMs: 1_000 } satisfies IpcMessage); } catch { /* best effort */ } }
-    try { child.kill(); } catch { /* best effort */ }
+    // Without a session epoch the IPC shutdown request would be rejected as stale, so there is
+    // nothing graceful to wait for. Otherwise give the child a bounded window to flush and exit
+    // before falling back to kill (the relay entry also treats SIGTERM as a graceful stop).
+    if (!epoch) {
+      try { child.kill(); } catch { /* best effort */ }
+      if (this.child === child) this.child = undefined;
+      return;
+    }
+    const exited = new Promise<boolean>(resolve => {
+      let settled = false;
+      const finish = (value: boolean) => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
+      const timer = setTimeout(() => finish(false), this.childExitGraceMs);
+      child.on('exit', () => finish(true));
+      child.on('error', () => finish(true));
+    });
+    try { child.send({ type: 'request', protocolVersion: 1, requestId: `stop-${reason}`, sessionEpoch: epoch, command: 'shutdown', payload: {}, timeoutMs: 1_000 } satisfies IpcMessage); } catch { /* fall through to kill */ }
+    if (!await exited) { try { child.kill(); } catch { /* best effort */ } }
+    if (this.child === child) this.child = undefined;
   }
 }
 

@@ -32,7 +32,7 @@
 npm run typecheck        # pass
 npm run build            # pass
 npm run build:web        # pass
-npm run test:offline     # 46 files / 394 tests passed (after P24 Round 1)
+npm run test:offline     # 47 files / 409 tests passed (after P24 Round 2)
 npm run test:v:offline   # integration 56, soak 2, diagnostics 15 passed
 npm run test:web:e2e     # 2 Playwright Chromium tests passed (~19s)
 npm run demo:offline     # 6 scenarios pass
@@ -83,7 +83,7 @@ E2E 使用 Playwright 1.64.1 + Chrome for Testing 156.0.8078.4（headless，无�
 | P21 doctor/trace/replay | done-offline | `src/diagnostics/doctor.ts`、`trace.ts`，`tests/diagnostics/**`（15） |
 | P22 Playwright E2E | done-offline（模拟 body + 真实 server/浏览器） | `tests/e2e/**`，2 tests passed |
 | P23 组合故障/长时 | done-offline | `tests/unit/p23-*`、`tests/integration/p23-process-faults.test.ts`、`tests/soak/p23-fault-soak.test.ts` |
-| P24 最终一致性与五轮 review | **未完成** | 见第 5 节 |
+| P24 最终一致性与五轮 review | **未完成** | 见第 5 节；Round 1–2 已完成 |
 
 状态词只表示：`done-offline` = 离线可执行并有测试；`done-limited` = 实现范围/验证边界受限，限制见下。
 
@@ -91,8 +91,8 @@ E2E 使用 Playwright 1.64.1 + Chrome for Testing 156.0.8078.4（headless，无�
 
 ## 5. 明确尚未完成的部分（请勿按缺陷计数，但可以指出实现上会 blocking 的点）
 
-1. **P24 与五轮 review 进行中**：P24 的脚本/端点/文档已落地；Round 1（完整性与真实接线）已执行并修复发现，Round 2–5 尚未执行。
-2. **仓库进度文档已更新到 P24 Round 1**：`PROGRESS.md`、`WORKSTREAM.md`、`DELIVERY_REPORT.md`、`CLAUDE.md` 反映当前状态；最终一致性整理仍待 P24 收尾。
+1. **P24 与五轮 review 进行中**：P24 的脚本/端点/文档已落地；Round 1（完整性与真实接线）与 Round 2（并发、崩溃与生命周期）已执行并修复发现，Round 3–5 尚未执行。
+2. **仓库进度文档已更新到 P24 Round 2**：`PROGRESS.md`、`WORKSTREAM.md`、`DELIVERY_REPORT.md`、`CLAUDE.md` 反映当前状态；最终一致性整理仍待 P24 收尾。
 3. **`trace:export` / `trace:replay` npm scripts 已在 P24 加入**，并有真实 CLI 调用记录。
 4. **`/api/v1/doctor` 已在 P24 加入**，复用 `ControlService.diagnostics()` 与同一条认证路径。
 5. **26.3 真实数据完全缺失**：已安装的 `minecraft-data@3.87.0` 没有 26.3 的 version/protocol 数据；所有 26.3 decoder/domain 保持 `unsupported`/`unavailable`，只做 fail-closed 与 synthetic 合同测试。没有伪字段、没有把最新依赖当成 26.3。

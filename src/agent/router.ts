@@ -23,6 +23,7 @@ import { syntheticCapture } from '../autonomous/bounds.js';
 export function memoryScopeOf(context: BodyContext): MemoryScope {
   return {
     serverProfileId: context.serverProfileId,
+    ...(context.accountId ? { accountId: context.accountId } : {}),
     ...(context.worldGenerationId ? { worldGenerationId: context.worldGenerationId } : {}),
     dimensionId: context.dimension,
   };
@@ -342,11 +343,14 @@ export class ToolRouter {
         const failure = this.memory!.resolveReturnToPlace(placeId, this.memoryScope, { now: this.clockNow() });
         return { ok: false as const, reason: failure.ok ? 'place-unresolved' : failure.reason };
       } : undefined;
-      const skillClock = { now: this.clockNow, schedule: (at: number, fn: () => void) => { const id = nextId('router-timer'); const timer = setTimeout(fn, Math.max(0, at-this.clockNow())); (this as any)._timers ??= new Map(); (this as any)._timers.set(id,timer); return id; }, cancel: (id: string) => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } };
+      const skillClock = { now: this.clockNow, schedule: (at: number, fn: () => void) => { const id = nextId('router-timer'); const timers = ((this as any)._timers ??= new Map()) as Map<string, ReturnType<typeof setTimeout>>; const timer = setTimeout(() => { timers.delete(id); fn(); }, Math.max(0, at-this.clockNow())); timers.set(id,timer); return id; }, cancel: (id: string) => { const timers=(this as any)._timers as Map<string,ReturnType<typeof setTimeout>>; const timer=timers?.get(id); if(timer) clearTimeout(timer); timers?.delete(id); } };
       const invokeSkill = async (lifeSignal?: AbortSignal) => {
         const current = () => signal.aborted || Boolean(lifeSignal?.aborted);
+        // Skills that wait on a timer need an event, not just a predicate, so pause/stop can
+        // clear their timer immediately instead of leaving the execution pending until it fires.
+        const abortSignal = lifeSignal && typeof AbortSignal.any === 'function' ? AbortSignal.any([signal, lifeSignal]) : lifeSignal ?? signal;
         const result = (implementation as (ctx: Parameters<typeof implementation>[0], arg: any) => unknown)(
-          { bridge: this.bridge, lease, report: guardedReport, isCanceled: current, ...(lifeSignal ? { isPaused: current } : {}), ...(resolvePlace ? { resolvePlace } : {}), ...(this.nav ? { nav: this.nav } : {}), ...(this.motor ? { motor: this.motor } : {}), clock: skillClock },
+          { bridge: this.bridge, lease, report: guardedReport, isCanceled: current, signal: abortSignal, ...(lifeSignal ? { isPaused: current } : {}), ...(resolvePlace ? { resolvePlace } : {}), ...(this.nav ? { nav: this.nav } : {}), ...(this.motor ? { motor: this.motor } : {}), clock: skillClock },
           executeArgs,
         );
         return result instanceof Promise ? await result : result;

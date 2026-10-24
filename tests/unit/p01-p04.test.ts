@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -68,6 +68,19 @@ describe('P04 RuntimeOwnershipLock', () => {
     writeFileSync(lock.lockPath, JSON.stringify({ pid: 1, hostname: hostname(), createdAt: 0, epoch: 'unknown', runtimeId: 'unknown' }));
     expect(() => lock.acquire()).toThrow('runtime-control-owned');
     expect(existsSync(lock.lockPath)).toBe(true);
+  });
+
+  it('publishes the lock with complete contents atomically and leaves no temp file', () => {
+    const { dir, db } = allocation();
+    const lock = new RuntimeOwnershipLock(db);
+    try {
+      lock.acquire();
+      // The owner record is complete the moment the lock path exists; a crash can only leave a
+      // private temp file, never an unreadable lock that would block every future owner.
+      expect(JSON.parse(readFileSync(lock.lockPath, 'utf8'))).toMatchObject({ pid: process.pid, runtimeId: lock.runtimeId });
+      const leftovers = existsSync(dir) ? readdirSync(dir).filter(name => name.includes('.owner.lock.tmp.')) : [];
+      expect(leftovers).toEqual([]);
+    } finally { lock.release(); }
   });
 
   it('reclaims a lock whose recorded process is demonstrably dead', () => {

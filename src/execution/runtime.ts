@@ -1,10 +1,19 @@
-import { nextId, type Clock, type Execution, SystemClock } from '../contracts/index.js';
+import { nextId, type BodyContext, type Clock, type Execution, SystemClock } from '../contracts/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import { findSkill, type SkillId } from '../skills/registry.js';
 import { INPUT_SKILLS } from './admission.js';
 
 export type Lease = { leaseId: string; owner: string; resources: string[]; until: number; generation: number; contextEpoch: string };
+/**
+ * Fencing key for an input lease. It includes every stable identity field plus both runtime
+ * epochs, so a dimension/account/server change also invalidates held leases rather than only
+ * a reconnect.
+ */
+export const leaseContextEpoch = (context: BodyContext) => [
+  context.serverProfileId, context.accountId ?? '', context.worldGenerationId ?? '',
+  context.dimension, context.connectionEpoch, context.bodyEpoch,
+].join(':');
 export type ExecutionStage = 'prepare' | 'dispatch' | 'verify' | 'complete';
 export type Progress = { stage: ExecutionStage; completed: number; total?: number; message?: string; at: number };
 export type ExecutorOptions = { clock?: Clock; leaseTtl?: number; watchdogTtl?: number; inputsEnabled?: () => boolean };
@@ -121,6 +130,13 @@ export class Executor {
       if (execution.status !== 'stopping') execution.status = 'running';
       const progress = { ...p, at: this.clock.now() };
       this.progressByExecution.set(execution.executionId, progress);
+      // Retain a bounded window of completed execution progress; active executions are never evicted.
+      if (this.progressByExecution.size > 512) {
+        for (const id of this.progressByExecution.keys()) {
+          if (this.progressByExecution.size <= 512) break;
+          if (!this.active.has(id)) this.progressByExecution.delete(id);
+        }
+      }
       this.store.saveExecution({ ...execution, checkpoint: progress });
       // Progress renews the lease and resets the no-progress watchdog; long-running work is not failed for being slow.
       this.arbiter.renew(lease.leaseId, execution.executionId, this.leaseTtl);
@@ -174,6 +190,18 @@ export class Executor {
     this.store.updateExecutionStatus?.(executionId, 'stopping', 'cancel-requested');
     return this.store.getExecution(executionId);
   }
+  /** Cancel every execution this executor is currently driving (control-loss shutdown path). */
+  cancelAll(reason = 'canceled') {
+    for (const executionId of [...this.active.keys()]) {
+      const execution = this.store.getExecution(executionId);
+      if (!execution || ['succeeded', 'failed', 'canceled'].includes(execution.status)) continue;
+      const active = this.active.get(executionId);
+      if (active) { active.canceled = true; active.controller.abort(); }
+      this.store.updateExecutionStatus?.(executionId, 'stopping', reason);
+    }
+  }
+  /** True while this process still owns and drives the execution. Recovery must not suspend it. */
+  isActive(executionId: string): boolean { return this.active.has(executionId); }
   progress(executionId: string) { return this.progressByExecution.get(executionId); }
   watchdog(executionId: string) { const execution = this.store.getExecution(executionId); if (execution && executionTerminal.has(execution.status)) return; const active = this.active.get(executionId); if (active) { active.canceled = true; active.controller.abort(); this.arbiter.release(active.lease.leaseId, executionId); this.active.delete(executionId); this.store.updateExecutionStatus?.(executionId, 'failed', 'watchdog-timeout', 'unknown'); } }
   /** Reconcile an effect result without ever promoting an unknown outcome to success. */

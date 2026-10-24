@@ -13,14 +13,14 @@ P01–P23 merged baseline: `ccb9f8e` (`p24-final`), with the built `dist/` prese
 | `npm run typecheck` | pass |
 | `npm run build` | pass |
 | `npm run build:web` | pass (Vite 5.4.11, 32 modules) |
-| `npm run test:offline` | **46 files / 394 tests passed**, 0 skipped (post-build run) |
+| `npm run test:offline` | **47 files / 409 tests passed**, 0 skipped (post-build run) |
 | `npm run test:v:offline` | integration **10 files / 56 tests**, soak **2 files / 2 tests**, diagnostics **2 files / 15 tests** — all passed |
 | `npm run test:web:e2e` | **1 spec file / 2 Playwright Chromium tests passed** (~19 s, headless, no screenshots/video/trace) |
 | `npm run demo:offline` | **6/6 scenarios** completed (`autonomous`, `obstruction`, `human-steering`, `chat-ui`, `crash-recovery`, `bridge-fixture`) |
 | `npm run doctor` | exited 0; truthful `status: "degraded"` for the default simulated/legacy-2D runtime; no live claims |
 | `npm run doctor -- --profile simulated-3d` | exited 0; reports a 3D simulated body, never a client |
 
-P24 work adds `tests/integration/p24-doctor.test.ts`, the authenticated doctor endpoint (`0dd7bfc`) and the Round 1 wiring fixes. Current counts are **46 files / 394 tests** offline and **10 files / 56 tests** integration; soak, diagnostics and E2E counts are unchanged.
+P24 work adds `tests/integration/p24-doctor.test.ts`, the authenticated doctor endpoint (`0dd7bfc`), the Round 1 wiring fixes and the Round 2 concurrency/crash fixes (`b6d7f42`). Current counts are **47 files / 409 tests** offline and **10 files / 56 tests** integration; soak, diagnostics and E2E counts are unchanged.
 
 ## P01–P23 status
 
@@ -49,21 +49,21 @@ P24 work adds `tests/integration/p24-doctor.test.ts`, the authenticated doctor e
 | P21 doctor/trace/replay | done-offline | `src/diagnostics/doctor.ts`, `src/diagnostics/trace.ts`, `src/control/service.ts` `diagnostics()`; `trace:export`/`trace:replay` CLI; authenticated `GET /api/v1/doctor` added in P24 | `tests/diagnostics/doctor.test.ts` (8), `tests/diagnostics/trace.test.ts` (7), `tests/integration/p24-doctor.test.ts` |
 | P22 Playwright E2E | done-offline (real server/browser; simulated body) | `tests/e2e/**`, `playwright.config.ts` — pairing, goal, execution, effects, cancel, pause/resume, SSE reconnect; browser+CLI share one Runtime | 2 Chromium tests passed; no screenshot/video/trace |
 | P23 fault combinations/soak | done-offline | `tests/unit/p23-fault-combinations.test.ts`, `tests/unit/p23-provider-motor.test.ts`, `tests/integration/p23-process-faults.test.ts`, `tests/soak/p23-fault-soak.test.ts` — child crashes, slow observer, IPC backpressure, write failures, provider/Motor faults; 60 virtual minutes + short wall-clock smoke | 4 integration tests, 1 soak test, combined-fault units |
-| **P24 final consistency + five reviews** | **not-done (in progress)** | P24 adds trace npm scripts, authenticated `/api/v1/doctor` plus integration test, current docs, and Round 1 fixes; Rounds 2–5 not started | `package.json`, `src/server/index.ts`, `tests/integration/p24-doctor.test.ts`, `tests/integration/integration-wiring.test.ts`; review table below |
+| **P24 final consistency + five reviews** | **not-done (in progress)** | P24 adds trace npm scripts, authenticated `/api/v1/doctor` plus integration test, current docs, Round 1 fixes and Round 2 lifecycle/crash fixes; Rounds 3–5 not started | `package.json`, `src/server/index.ts`, `tests/integration/p24-doctor.test.ts`, `tests/unit/p24-round2.test.ts`, `tests/integration/integration-wiring.test.ts`; review table below |
 
 ## P24 status at start of this work
 
-- The worktree was initially created from the P01–P04 lineage (`c27dcfa`), then fast-forwarded to the actual `p24-final` HEAD `ccb9f8e` (merged P01–P23 plus P24 prep) before review.
+- The worktree was initially created from the P01–P04 lineage (`c27dcfa`), then fast-forwarded to the actual `p24-final` HEAD `ccb9f8e` before review; Round 2 started at `033f29a`.
 - At the start, **zero of the five review rounds from `REVIEW.md` had been completed**, so P24 remains `not-done`.
 - The P24 documentation/consistency items completed before Round 1 are: missing `trace:export`/`trace:replay` npm scripts, authenticated `GET /api/v1/doctor`, its integration test, and truthful updates to `CLAUDE.md`, `PROGRESS.md`, `WORKSTREAM.md`, `DELIVERY_REPORT.md`.
-- Round 1 is recorded in `DELIVERY_REPORT.md`; it fixed the public 3D wiring, capability routing, effect/receipt gaps and 3D/2D state leaks. Rounds 2–5 and the post-round final consistency pass remain owed.
+- Round 1 is recorded in `DELIVERY_REPORT.md`; it fixed the public 3D wiring, capability routing, effect/receipt gaps and 3D/2D state leaks. Round 2 is also recorded there and fixed stop/pause terminality, bridge-service control enforcement, crash-restart execution/receipt settlement, account/dimension fencing, abort-aware waits, graceful child shutdown and bounded retention. Rounds 3–5 and the post-round final consistency pass remain owed.
 
 ## Review rounds
 
 | Round | Status | Notes |
 |---|---|---|
 | Round 1 — completeness/real wiring | completed 2026-10-24 | Whole-repo scan and four chain traces; 9 findings fixed, 1 external projection boundary documented; see `DELIVERY_REPORT.md` |
-| Round 2 — concurrency/crash/lifecycle | not-done | not started |
+| Round 2 — concurrency/crash/lifecycle | completed 2026-10-24 | Whole-repo chain trace with injected ordering/failures; 10 findings fixed; see `DELIVERY_REPORT.md` |
 | Round 3 — protocol/data/permissions | not-done | not started |
 | Round 4 — user flows/test credibility | not-done | not started |
 | Round 5 — final independent reread/regression | not-done | starts only after rounds 1–4 are closed |
@@ -78,6 +78,8 @@ P24 work adds `tests/integration/p24-doctor.test.ts`, the authenticated doctor e
 - **Motor is simulated only:** no real 26.3 physics/terrain evidence; `stepUp`/`controlledDrop` remain disabled; P22 E2E body is a fixture.
 - **Legacy and 3D profiles are separate:** default `simulated` remains explicit legacy 2D; `simulated-3d` assembles the same runtime with a simulated 3D body/Motor. `{x,y}` is never promoted to real 3D, and 3D status no longer exposes legacy bridge cells/inventory/UI.
 - **P23 soak is virtual time:** 60 virtual minutes proves budget/resource bounds, not long-term live stability; the short wall-clock smoke is separate.
+- **Bridge-service control is explicit:** an attached `BridgeService` starts with admission closed (existing P09 contract); the runtime now enforces that state, so an operator/observation step must arm control before body writes.
+- **Account identity is not guessed:** `accountId` participates in recovery, memory, receipts and fencing when the body context provides it; current simulated/fixture profiles omit it, so cross-account claims stay unknown rather than being inferred.
 - **CI not observed:** Node 22 local checks pass; cloud CI has not been run/observed.
 
 See `DELIVERY_REPORT.md` for the exact 26.3 gap list and what P24/five rounds still owe.
