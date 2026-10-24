@@ -141,4 +141,85 @@ describe('raw TCP relay fixture',()=>{
   expect(metrics.closeReason).toBe('closed');
   await relay.stop();await new Promise<void>(r=>upstream.close(()=>r()));
  });
+
+ it('P05 forwards arbitrary binary bytes byte-for-byte in both directions',async()=>{
+  const toServer:Buffer[]=[];const toClient:Buffer[]=[];let serverPeer!:net.Socket;
+  const upstream=net.createServer(s=>{serverPeer=s;s.on('data',c=>toServer.push(Buffer.from(c)));});
+  await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',()=>r()));
+  const relay=createRawTcpRelay({listenPort:0,targetHost:'127.0.0.1',targetPort:(upstream.address() as net.AddressInfo).port,allowMinecraftUpstream:true});await relay.start();
+  const client=await peer(relay.address.port);client.on('data',c=>toClient.push(Buffer.from(c)));
+  // Bytes the observer cannot interpret (invalid framing, 0x00, high bytes) must pass unchanged.
+  const payload=Buffer.from(Array.from({length:4096},(_,i)=>(i*37+11)&255));
+  for(let i=0;i<payload.length;i+=97)client.write(payload.subarray(i,i+97));
+  await new Promise(r=>setTimeout(r,120));
+  const serverReply=Buffer.from(Array.from({length:2048},(_,i)=>(i*53+7)&255));
+  for(let i=0;i<serverReply.length;i+=131)serverPeer.write(serverReply.subarray(i,i+131));
+  await new Promise(r=>setTimeout(r,120));
+  expect(Buffer.concat(toServer)).toEqual(payload);
+  expect(Buffer.concat(toClient)).toEqual(serverReply);
+  const metrics=relay.sessions()[0]!.metrics();
+  expect(metrics.forwardedBytes).toEqual({'client-to-server':payload.length,'server-to-client':serverReply.length});
+  client.destroy();serverPeer.destroy();await relay.stop();await new Promise<void>(r=>upstream.close(()=>r()));
+ });
+
+ it('P05 isolates a throwing observer tap from forwarding',async()=>{
+  const upstream=net.createServer(s=>s.on('data',c=>s.write(c)));await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',()=>r()));
+  const taps:{direction:string,bytes:number}[]=[];
+  const relay=createRawTcpRelay({listenPort:0,targetHost:'127.0.0.1',targetPort:(upstream.address() as net.AddressInfo).port,allowMinecraftUpstream:true,onChunk:(direction,chunk)=>{taps.push({direction,bytes:chunk.length});throw new Error('observer-down');}});await relay.start();
+  const client=await peer(relay.address.port);const reply=collect(client);
+  client.write(Buffer.from('observer-failure-must-not-block'));
+  await new Promise(r=>setTimeout(r,60));
+  expect(reply.all().toString()).toBe('observer-failure-must-not-block');
+  expect(taps.map(t=>t.direction)).toEqual(['client-to-server','server-to-client']);
+  client.destroy();await relay.stop();await new Promise<void>(r=>upstream.close(()=>r()));
+ });
+
+ it('P05 applies backpressure on a slow consumer without dropping or reordering bytes',async()=>{
+  const received:Buffer[]=[];const sockets=new Set<net.Socket>();
+  const upstream=net.createServer({allowHalfOpen:true},s=>{sockets.add(s);s.on('close',()=>sockets.delete(s));s.pause();setTimeout(()=>{s.on('data',c=>received.push(Buffer.from(c)));s.resume();},80);});
+  await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',()=>r()));
+  const relay=createRawTcpRelay({listenPort:0,targetHost:'127.0.0.1',targetPort:(upstream.address() as net.AddressInfo).port,allowMinecraftUpstream:true,budgets:{highWaterMarkBytes:4096,lowWaterMarkBytes:1024,hardLimitBytes:2*1024*1024,writeStallMs:5000,closeFlushMs:500}});await relay.start();
+  const client=await peer(relay.address.port);
+  const payload=Buffer.alloc(512*1024,0x5a);
+  const writeAll=()=>new Promise<void>(resolve=>{let offset=0;const pump=()=>{while(offset<payload.length){const ok=client.write(payload.subarray(offset,offset+8192));offset+=8192;if(!ok){client.once('drain',pump);return;}}resolve();};pump();});
+  await writeAll();
+  for(let i=0;i<100&&Buffer.concat(received).length<payload.length;i++)await new Promise(r=>setTimeout(r,10));
+  expect(Buffer.concat(received)).toEqual(payload);
+  expect(relay.sessions()[0]!.metrics().state).not.toBe('failed');
+  client.destroy();for(const s of sockets)s.destroy();await relay.stop();await new Promise<void>(r=>upstream.close(()=>r()));
+ });
+
+ it('P05 releases the session and upstream socket on an abrupt client close',async()=>{
+  const sockets=new Set<net.Socket>();
+  const upstream=net.createServer({allowHalfOpen:true},s=>{sockets.add(s);s.on('close',()=>sockets.delete(s));s.on('data',()=>{});s.on('end',()=>s.end());});
+  await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',()=>r()));
+  const relay=createRawTcpRelay({listenPort:0,targetHost:'127.0.0.1',targetPort:(upstream.address() as net.AddressInfo).port,allowMinecraftUpstream:true,budgets:{closeFlushMs:100,halfCloseMs:100}});await relay.start();
+  const client=await peer(relay.address.port);client.write(Buffer.from('x'));await new Promise(r=>setTimeout(r,20));
+  client.destroy();
+  for(let i=0;i<60&&relay.sessions().length>0;i++)await new Promise(r=>setTimeout(r,10));
+  expect(relay.sessions()).toHaveLength(0);
+  for(let i=0;i<60&&sockets.size>0;i++)await new Promise(r=>setTimeout(r,10));
+  expect(sockets.size).toBe(0);
+  await relay.stop();await new Promise<void>(r=>upstream.close(()=>r()));
+ });
+
+ it('P05 rewrites only the first configured handshake and leaves later bytes untouched',async()=>{
+  let received=Buffer.alloc(0);
+  const upstream=net.createServer(s=>s.on('data',c=>{received=Buffer.concat([received,Buffer.from(c)]);}));await new Promise<void>(r=>upstream.listen(0,'127.0.0.1',()=>r()));
+  const relay=createRawTcpRelay({listenPort:0,targetHost:'127.0.0.1',targetPort:(upstream.address() as net.AddressInfo).port,allowMinecraftUpstream:true,rewriteHandshake:true});await relay.start();
+  const client=await peer(relay.address.port);
+  const handshakeBody=Buffer.concat([Buffer.from([0]),Buffer.from([0x09]),Buffer.from([3]),Buffer.from('old'),Buffer.from([0x63,0xdd]),Buffer.from([2])]);
+  const firstFrame=Buffer.concat([encodeVarIntForTest(handshakeBody.length),handshakeBody]);
+  const later=Buffer.from([0xde,0xad,0xbe,0xef,0x00,0xff]);
+  client.write(Buffer.concat([firstFrame,later]));
+  await new Promise(r=>setTimeout(r,60));
+  expect(received.subarray(-later.length)).toEqual(later);
+  // Exactly one rewrite: the later bytes appear once and only the handshake host/port changed.
+  expect(received.length).toBeGreaterThan(firstFrame.length+later.length);
+  expect(received.toString()).toContain('127.0.0.1');
+  client.destroy();await relay.stop();await new Promise<void>(r=>upstream.close(()=>r()));
+ });
 });
+
+function encodeVarIntForTest(value:number):Buffer{const out:number[]=[];let current=value;do{let next=current&0x7f;current=Math.floor(current/128);if(current)next|=0x80;out.push(next);}while(current);return Buffer.from(out);}
+
