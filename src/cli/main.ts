@@ -12,6 +12,7 @@ import { redact } from '../diagnostics/redaction.js';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
+import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
 import { getGameVersionProfile, versionProfileSummary } from '../bridge/version-profile.js';
 import { createControlServer } from '../server/index.js';
@@ -54,47 +55,263 @@ function runScenario(scenario: ScenarioName, db: string) {
 }
 
 type CliIo = { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream };
+export type AttachOptions = {
+  /** CLI bearer configured on the serving process. Never printed or put in a URL. */
+  token?: string;
+  /** One-time local pairing code; exchanged for an HttpOnly session + CSRF token. */
+  pairCode?: string;
+  /** Start the event/state subscription automatically (default true). */
+  subscribe?: boolean;
+  cursor?: string;
+  /** Abort the attach session (tests and embedding callers). */
+  signal?: AbortSignal;
+};
 const commandId = () => `cli-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 const parseWords = (line: string) => {
   const words: string[] = [];
-  const pattern = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|(\\S+)/g;
+  const pattern = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|(\S+)/g;
   for (let match = pattern.exec(line); match; match = pattern.exec(line)) words.push(match[1] ?? match[2] ?? match[3] ?? '');
   return words;
 };
 const printJson = (output: NodeJS.WritableStream, value: unknown) => output.write(`${JSON.stringify(redact(value))}\n`);
-async function postCommand(baseUrl: string, command: string, payload: Record<string, unknown>, expectedRevision?: number) {
-  const response = await fetch(`${baseUrl}/api/v1/commands`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: commandId(), command, payload, ...(expectedRevision === undefined ? {} : { expectedRevision }) }) });
-  return { status: response.status, body: await response.json() };
+
+/** Parse one SSE frame. Comments/heartbeats produce no frame. */
+function parseSseFrame(frame: string): { event: string; id?: string; data: string } | undefined {
+  let event = 'message'; let id: string | undefined; const data: string[] = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (!line || line.startsWith(':')) continue;
+    const colon = line.indexOf(':');
+    const field = colon < 0 ? line : line.slice(0, colon);
+    const value = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '');
+    if (field === 'event') event = value;
+    else if (field === 'id') id = value;
+    else if (field === 'data') data.push(value);
+  }
+  if (!data.length) return undefined;
+  return { event, id, data: data.join('\n') };
 }
-export async function runAttach(url: string, io: CliIo = {}) {
-  const input = io.input ?? process.stdin; const output = io.output ?? process.stdout; const baseUrl = url.replace(/\/$/, '');
-  const get = async (path: string) => { const response = await fetch(`${baseUrl}${path}`); return { status: response.status, body: await response.json() }; };
-  const command = async (words: string[]): Promise<unknown> => {
+
+/**
+ * Attach CLI. Every command is an HTTP call into the same ControlService that serves the web
+ * UI; the CLI never opens a second Runtime. `quit` only detaches this terminal, while
+ * `shutdown` asks the owning Runtime to stop (the `quit` control command).
+ */
+export async function runAttach(url: string, io: CliIo = {}, options: AttachOptions = {}) {
+  const input = io.input ?? process.stdin; const output = io.output ?? process.stdout;
+  const baseUrl = url.replace(/\/$/, '');
+  let token = options.token ?? process.env.MINECRAFT_AGENT_CLI_TOKEN;
+  let sessionCookie: string | undefined; let csrfToken: string | undefined;
+  let cursor = options.cursor ?? '0';
+  let stream: AbortController | undefined; let streamOpen = false;
+  const authHeaders = (write = false) => {
+    const headers: Record<string, string> = {};
+    if (token) headers.authorization = `Bearer ${token}`;
+    if (sessionCookie) {
+      headers.cookie = sessionCookie;
+      // The server requires a same-origin Origin header for browser-session writes.
+      headers.origin = baseUrl;
+    }
+    if (write && csrfToken) headers['x-csrf-token'] = csrfToken;
+    return headers;
+  };
+  const request = async (method: 'GET' | 'POST', path: string, body?: Record<string, unknown>) => {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...authHeaders(method !== 'GET') },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    return { status: response.status, body: payload as unknown };
+  };
+  const postCommand = async (command: string, payload: Record<string, unknown>, expectedRevision?: number) => request('POST', '/api/v1/commands', { requestId: commandId(), command, payload, ...(expectedRevision === undefined ? {} : { expectedRevision }) });
+  const readGoal = async (goalId: string) => {
+    const read = await request('GET', '/api/v1/goals');
+    if (read.status !== 200 || !Array.isArray(read.body)) return undefined;
+    return (read.body as Array<{ goal_id?: string; revision?: number }>).find(goal => goal.goal_id === goalId);
+  };
+
+  /** Exchange a local pairing code for the HttpOnly session and CSRF token. */
+  const pair = async (code: string) => {
+    if (!code) throw new Error('usage: pair <code>');
+    const response = await fetch(`${baseUrl}/api/v1/pair`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code }) });
+    const body = await response.json().catch(() => ({})) as { csrfToken?: string; expiresInMs?: number; error?: { code?: string } };
+    if (!response.ok) throw new Error(body.error?.code ?? `http-${response.status}`);
+    const cookie = response.headers.get('set-cookie') ?? '';
+    const match = /furevercraft_session=([^;]+)/.exec(cookie);
+    if (!match || !body.csrfToken) throw new Error('pairing-response-incomplete');
+    sessionCookie = `furevercraft_session=${match[1]}`;
+    csrfToken = body.csrfToken;
+    token = undefined;
+    // Never print the CSRF token or the session cookie.
+    return { paired: true, expiresInMs: body.expiresInMs };
+  };
+
+  const disconnect = (reason = 'requested') => {
+    const controller = stream; stream = undefined; streamOpen = false;
+    if (controller) controller.abort();
+    printJson(output, { subscription: { state: 'disconnected', cursor, reason } });
+  };
+  const connect = async (from = cursor) => {
+    if (stream) return;
+    cursor = from;
+    const controller = new AbortController(); stream = controller;
+    printJson(output, { subscription: { state: 'connecting', cursor } });
+    try {
+      const response = await fetch(`${baseUrl}/api/v1/events/stream?cursor=${encodeURIComponent(cursor)}`, { headers: authHeaders(false), signal: controller.signal });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        streamOpen = false;
+        printJson(output, { subscription: { state: 'rejected', cursor, error: (body as { error?: { code?: string } })?.error?.code ?? `http-${response.status}` } });
+        return;
+      }
+      streamOpen = true;
+      printJson(output, { subscription: { state: 'open', cursor } });
+      const reader = response.body!.getReader(); const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, '\n');
+        let split: number;
+        while ((split = buffer.indexOf('\n\n')) >= 0) {
+          const frame = buffer.slice(0, split); buffer = buffer.slice(split + 2);
+          const parsed = parseSseFrame(frame); if (!parsed) continue;
+          let payload: unknown = parsed.data;
+          try { payload = JSON.parse(parsed.data); } catch { /* keep text */ }
+          if (parsed.id && /^\d+$/.test(parsed.id)) cursor = parsed.id;
+          if (parsed.event === 'snapshot') {
+            const state = payload as { cursor?: string; paused?: boolean; stopping?: boolean; gap?: boolean };
+            if (state.cursor) cursor = state.cursor;
+            printJson(output, { subscription: { state: 'snapshot', cursor, paused: state.paused, stopping: state.stopping, gap: state.gap } });
+          } else if (parsed.event === 'gap') {
+            printJson(output, { gap: payload });
+          } else if (parsed.event.startsWith('control.') || parsed.event.startsWith('runtime.') || parsed.event.startsWith('tool.')) {
+            printJson(output, { event: { kind: parsed.event, seq: parsed.id, payload } });
+          }
+        }
+      }
+      if (!controller.signal.aborted) {
+        streamOpen = false;
+        printJson(output, { subscription: { state: 'closed', cursor } });
+      }
+    } catch (error) {
+      streamOpen = false;
+      if (!controller.signal.aborted) printJson(output, { subscription: { state: 'error', cursor, error: error instanceof Error ? error.message : String(error) } });
+    } finally {
+      if (stream === controller) stream = undefined;
+    }
+  };
+  const eventState = () => ({ state: stream ? (streamOpen ? 'open' : 'connecting') : 'disconnected', cursor });
+
+  const command = async (words: string[]): Promise<{ exit?: boolean }> => {
     const [verb, subverb, ...rest] = words;
-    if (!verb || verb === 'help') return { commands: ['status', 'goal set <id> <text>', 'goal revise <id> <revision> <change>', 'goal show', 'message <text>', 'pause', 'resume', 'stop', 'cancel <executionId>', 'chat <text>', 'executions', 'effects', 'events', 'places', 'provider', 'save', 'doctor', 'quit', 'help'] };
-    if (verb === 'quit') return { quit: true, result: await postCommand(baseUrl, 'quit', {}) };
-    const paths: Record<string, string> = { status: '/api/v1/status', executions: '/api/v1/executions', effects: '/api/v1/effects', events: '/api/v1/events', places: '/api/v1/places', provider: '/api/v1/provider' };
-    if (paths[verb]) return get(paths[verb]!);
-    if (verb === 'doctor') return { profile: (await get('/api/v1/capabilities')).body.profile, network: 'disabled', credentials: 'not-required-offline' };
-    if (verb === 'goal' && subverb === 'show') return get('/api/v1/goals');
-    if (verb === 'goal' && subverb === 'set') { if (rest.length < 2) throw new Error('usage: goal set <id> <text>'); return postCommand(baseUrl, 'goal.set', { goalId: rest[0], text: rest.slice(1).join(' ') }); }
-    if (verb === 'goal' && subverb === 'revise') { if (rest.length < 3) throw new Error('usage: goal revise <id> <revision> <change>'); return postCommand(baseUrl, 'goal.revise', { goalId: rest[0], expectedRevision: Number(rest[1]), change: rest.slice(2).join(' ') }, Number(rest[1])); }
-    if (verb === 'message' || verb === 'chat') { const text = [subverb, ...rest].filter(Boolean).join(' '); if (!text) throw new Error(`usage: ${verb} <text>`); return postCommand(baseUrl, verb, { text }); }
-    if (['pause', 'resume', 'stop', 'save'].includes(verb)) return postCommand(baseUrl, verb, {});
-    if (verb === 'cancel') { if (!subverb) throw new Error('usage: cancel <executionId>'); return postCommand(baseUrl, 'cancel', { executionId: subverb }); }
+    if (!verb || verb === 'help') {
+      printJson(output, { commands: [
+        'help', 'status', 'doctor', 'pair <code>',
+        'goal show [id]', 'goal set <id> <text>', 'goal revise <id> <revision> <change>',
+        'message <text>', 'chat <text>', 'pause', 'resume', 'recover', 'stop', 'save',
+        'cancel <executionId>', 'executions', 'effects [executionId]', 'events [cursor] [limit]',
+        'places', 'provider', 'capabilities', 'config',
+        'subscribe [cursor]', 'disconnect', 'reconnect', 'stream',
+        'quit (detach CLI; does not stop the Runtime)', 'shutdown (send quit to the Runtime)',
+      ], note: 'All writes go through the serving ControlService. Use shutdown to stop the Runtime.' });
+      return {};
+    }
+    if (verb === 'quit' || verb === 'exit') { printJson(output, { quit: true, runtimeStopped: false, note: 'CLI detached; the Runtime is still running. Use shutdown to stop it.' }); return { exit: true }; }
+    if (verb === 'pair') { printJson(output, await pair(subverb ?? '')); return {}; }
+    if (verb === 'disconnect' || verb === 'unsubscribe') { disconnect('command'); return {}; }
+    if (verb === 'reconnect' || verb === 'subscribe') {
+      if (stream) disconnect('reconnect');
+      // The subscription runs until it is disconnected; the REPL must keep accepting commands.
+      void connect(subverb && /^\d+$/.test(subverb) ? subverb : cursor);
+      return {};
+    }
+    if (verb === 'stream' || verb === 'subscription') { printJson(output, { stream: eventState() }); return {}; }
+    if (verb === 'shutdown' || verb === 'runtime-quit') { printJson(output, (await postCommand('quit', {})).body); return {}; }
+    const paths: Record<string, string> = {
+      status: '/api/v1/status', state: '/api/v1/status', executions: '/api/v1/executions', places: '/api/v1/places',
+      provider: '/api/v1/provider', capabilities: '/api/v1/capabilities', config: '/api/v1/config', doctor: '/api/v1/capabilities',
+    };
+    if (paths[verb] && !subverb) { printJson(output, (await request('GET', paths[verb]!)).body); return {}; }
+    if (verb === 'effects') {
+      const query = subverb ? `?executionId=${encodeURIComponent(subverb)}` : '';
+      printJson(output, (await request('GET', `/api/v1/effects${query}`)).body); return {};
+    }
+    if (verb === 'events') {
+      const at = subverb && /^\d+$/.test(subverb) ? subverb : '0';
+      const limit = rest[0] && /^\d+$/.test(rest[0]) ? rest[0] : '100';
+      printJson(output, (await request('GET', `/api/v1/events?cursor=${encodeURIComponent(at)}&limit=${limit}`)).body); return {};
+    }
+    if (verb === 'goal' && subverb === 'show') {
+      const body = (await request('GET', '/api/v1/goals')).body as unknown;
+      printJson(output, rest[0] && Array.isArray(body) ? (body as Array<{ goal_id?: string }>).filter(goal => goal.goal_id === rest[0]) : body);
+      return {};
+    }
+    if (verb === 'goal' && subverb === 'set') {
+      if (!rest[0] || rest.length < 2 || !rest.slice(1).join(' ').trim()) throw new Error('usage: goal set <id> <text>');
+      const existing = await readGoal(rest[0]);
+      printJson(output, (await postCommand('goal.set', { goalId: rest[0], text: rest.slice(1).join(' ') }, existing?.revision)).body);
+      return {};
+    }
+    if (verb === 'goal' && subverb === 'revise') {
+      if (!rest[0] || rest[1] === undefined || rest.length < 3) throw new Error('usage: goal revise <id> <revision> <change>');
+      const revision = Number(rest[1]);
+      if (!Number.isInteger(revision) || revision < 0) throw new Error('usage: goal revise <id> <revision> <change>');
+      printJson(output, (await postCommand('goal.revise', { goalId: rest[0], expectedRevision: revision, change: rest.slice(2).join(' ') }, revision)).body);
+      return {};
+    }
+    if (verb === 'message' || verb === 'chat') {
+      const text = [subverb, ...rest].filter(Boolean).join(' ');
+      if (!text) throw new Error(`usage: ${verb} <text>`);
+      printJson(output, (await postCommand(verb, { text })).body); return {};
+    }
+    if (['pause', 'resume', 'recover', 'stop', 'save'].includes(verb)) { printJson(output, (await postCommand(verb, {})).body); return {}; }
+    if (verb === 'cancel') {
+      if (!subverb) throw new Error('usage: cancel <executionId>');
+      printJson(output, (await postCommand('cancel', { executionId: subverb })).body); return {};
+    }
     throw new Error(`unknown-command:${verb}`);
   };
+
+  if (options.pairCode) {
+    try { printJson(output, await pair(options.pairCode)); }
+    catch (error) { printJson(output, { command: 'pair', error: error instanceof Error ? error.message : String(error) }); }
+  }
+  if (options.subscribe !== false) void connect();
+  const abortListener = () => { disconnect('signal'); };
+  options.signal?.addEventListener('abort', abortListener, { once: true });
   const rl = createInterface({ input, crlfDelay: Infinity });
-  for await (const line of rl) { if (!line.trim()) continue; const words = parseWords(line); try { printJson(output, await command(words)); } catch (error) { printJson(output, { error: error instanceof Error ? error.message : String(error) }); } if (words[0] === 'quit') break; }
-  rl.close();
+  try {
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      const words = parseWords(line);
+      try { const outcome = await command(words); if (outcome.exit) break; }
+      catch (error) { printJson(output, { command: words.join(' '), error: error instanceof Error ? error.message : String(error) }); }
+    }
+  } finally {
+    rl.close();
+    if (stream) { const controller = stream; stream = undefined; controller.abort(); }
+    options.signal?.removeEventListener('abort', abortListener);
+  }
 }
 async function listenServer(server: import('fastify').FastifyInstance, host: string, port: number) {
   await server.listen({ port, host });
   const address = server.server.address(); if (!address || typeof address === 'string') throw new Error('server-address-unavailable'); return `http://${host}:${address.port}`;
 }
-export async function runServe(options: { db?: string; host?: string; port?: string; profile?: string }) {
-  const db = options.db ?? process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent.sqlite'; const runtime = createRuntime({ profile: (options.profile ?? 'simulated') as 'simulated' | 'client-offline', db }); const server = createControlServer(runtime); const host = options.host ?? '127.0.0.1'; const url = await listenServer(server, host, Number(options.port ?? 0)); runtime.session.start();
-  console.log(JSON.stringify({ listening: url, profile: options.profile ?? 'simulated', db })); let closing = false;
+export async function runServe(options: { db?: string; host?: string; port?: string; profile?: string; pairing?: boolean; pairingCode?: string; cliBearer?: string; webRoot?: string; allowedOrigin?: string }) {
+  const db = options.db ?? process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent.sqlite';
+  const runtime = createRuntime({ profile: (options.profile ?? 'simulated') as 'simulated' | 'client-offline', db });
+  const host = options.host ?? '127.0.0.1';
+  const pairing = options.pairing ?? true;
+  const explicitPairingCode = options.pairingCode ?? process.env.MINECRAFT_AGENT_PAIRING_CODE;
+  const pairingCode = explicitPairingCode ?? randomBytes(4).toString('hex');
+  const cliBearer = options.cliBearer ?? process.env.MINECRAFT_AGENT_CLI_TOKEN;
+  const server = createControlServer(runtime, { host, pairing, pairingCode, cliBearer, webRoot: options.webRoot, allowedOrigin: options.allowedOrigin });
+  const url = await listenServer(server, host, Number(options.port ?? 3000)); runtime.session.start();
+  // A generated one-time pairing code is printed once to the owning terminal; an explicitly
+  // configured code is not repeated. The CLI bearer and any API key are never logged.
+  console.log(JSON.stringify({ listening: url, profile: options.profile ?? 'simulated', db, pairing, ...(pairing && !explicitPairingCode ? { pairingCode } : {}), cliAccess: cliBearer ? 'bearer-configured' : pairing ? 'pair-with-code' : 'loopback-open', webRoot: options.webRoot ?? './dist/web' }));
+  let closing = false;
   const close = async () => { if (closing) return; closing = true; await server.close(); runtime.close(); };
   process.once('SIGINT', close); process.once('SIGTERM', close); await new Promise<void>(resolve => { const timer = setInterval(() => { if (closing || runtime.control.status().stopping) { clearInterval(timer); void close().then(resolve); } }, 25); });
 }
@@ -103,8 +320,19 @@ export function main(argv = process.argv) {
   const program = new Command();
   program.name('minecraft-agent').option('--profile <profile>', 'profile', 'simulated').option('--db <path>', 'SQLite path');
   program.command('demo').option('--db <path>').option('--scenario <scenario>').action((options) => runDemo(options.db, options.scenario));
-  program.command('serve').option('--db <path>').option('--host <host>', 'bind host', '127.0.0.1').option('--port <port>', 'bind port', '3000').action((options, command) => runServe({ ...options, profile: command.parent?.opts().profile }));
-  program.command('attach').requiredOption('--url <url>').action(options => runAttach(options.url));
+  program.command('serve').option('--db <path>').option('--host <host>', 'bind host', '127.0.0.1').option('--port <port>', 'bind port', '3000')
+    .option('--no-pairing', 'disable local pairing (loopback-open development mode)')
+    .option('--pairing-code <code>', 'fixed local pairing code (not printed when supplied)')
+    .option('--cli-bearer <token>', 'CLI bearer token (prefer MINECRAFT_AGENT_CLI_TOKEN)')
+    .option('--web-root <path>', 'static build directory', './dist/web')
+    .option('--allowed-origin <origin>', 'extra development origin allowed for the web UI')
+    .action((options, command) => runServe({ ...options, profile: command.parent?.opts().profile }));
+  program.command('attach').requiredOption('--url <url>')
+    .option('--token <token>', 'CLI bearer token (defaults to MINECRAFT_AGENT_CLI_TOKEN)')
+    .option('--pair-code <code>', 'pair with a local one-time code before attaching')
+    .option('--cursor <cursor>', 'initial event cursor', '0')
+    .option('--no-subscribe', 'do not open the event/state subscription automatically')
+    .action(options => runAttach(options.url, {}, { token: options.token, pairCode: options.pairCode, subscribe: options.subscribe, cursor: options.cursor }));
   program.command('status').option('--db <path>').action((options, command) => { const db = options.db ?? command.parent?.opts().db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'; const runtime = new SessionRuntime(new FakeClientBridge(), new SQLiteStore(db)); try { console.log(JSON.stringify(redact({ simulated: true, status: runtime.store.listGoals().some(g => g.status === 'active') ? 'active' : 'idle', goals: runtime.store.listGoals(), executions: runtime.store.listExecutions() }))); } finally { runtime.store.close(); } });
   program.command('doctor').action((_, command) => { const profile = command.parent?.opts().profile ?? 'simulated'; const runtime = createRuntime({ profile }); try { console.log(JSON.stringify(redact({ profile, simulated: profile === 'simulated', network: 'disabled', credentials: 'not-required-offline', capabilities: { capture_view: 'synthetic-only' }, status: runtime.session.start() }))); } finally { runtime.close(); } });
   program.command('bridge').option('--config <path>', 'profile config').option('--mode <mode>', 'fixture|inspect|live', 'fixture').action(async (options) => { const file = resolve(options.config ?? 'configs/client-offline.example.json'); const config = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; const mode = options.mode as string; if (!['fixture', 'inspect', 'live'].includes(mode)) throw new Error('invalid-bridge-mode'); if (mode === 'live') { if (config.allowMinecraftUpstream !== true) throw new Error('live-mode-requires-explicit-upstream-gate'); throw new Error('live-mode-requires-real-client-environment'); } const profile=getGameVersionProfile(); if (mode === 'inspect') { console.log(JSON.stringify(redact({ mode, source: 'fixture', network: 'disabled', profile: versionProfileSummary(profile), protocol: { legacyCodecFixture: minecraftDataSummary(), target: profile }, config }))); return; }
