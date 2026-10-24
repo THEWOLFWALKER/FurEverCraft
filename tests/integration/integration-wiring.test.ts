@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
@@ -15,6 +15,8 @@ import { Motor3D } from '../../src/motor/primitives.js';
 import { navigate } from '../../src/skills/navigation.js';
 import type { KnowledgeRelease } from '../../src/autonomous/knowledge.js';
 import type { HttpTransport } from '../../src/providers/shared.js';
+import { OpenAIProvider } from '../../src/providers/openai/index.js';
+import { AnthropicProvider } from '../../src/providers/anthropic/index.js';
 import { BridgeService } from '../../src/bridge/service/orchestrator.js';
 import { runBridgeServiceCommand } from '../../src/cli/main.js';
 import { createControlServer } from '../../src/server/index.js';
@@ -310,6 +312,8 @@ describe('production integration: 3D tool → executor → skill → Motor → s
     const result = await runtime.router.invoke({ id: 'injected-motor', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 1, y: 0, z: 1 }) });
     expect(result.ok).toBe(true);
     expect(created).toBeGreaterThan(0);
+    // The injected factory produced the motor actually used by the chain, not an unused dependency.
+    expect(poseBlock(adapter.peek().pose)).toEqual({ x: 1, y: 0, z: 1 });
   });
 
   it('uses the injected legacy navigation port for planar return_to_place', async () => {
@@ -378,6 +382,35 @@ describe('provider gate and canonical provider session', () => {
     expect(history).toContainEqual(expect.objectContaining({ role: 'tool', toolResult: expect.objectContaining({ toolCallId: 'call-1' }) }));
   });
 
+  it('registers every injected provider and switches the next request with canonical history intact', async () => {
+    const openaiTransport = new RecordingTransport(openAITool('call-switch', 'get_state', '{}'), openAIText('openai done'));
+    const anthropicTransport = new RecordingTransport({ content: [{ type: 'text', text: 'anthropic done' }], stop_reason: 'end_turn' });
+    const runtime = track(createRuntime({
+      modelProvider: 'openai',
+      providers: {
+        openai: new OpenAIProvider(openaiTransport, 'http://offline/openai', 'model'),
+        anthropic: new AnthropicProvider(anthropicTransport, 'http://offline/anthropic', 'model'),
+      },
+    }));
+    expect(runtime.canonicalProviderPath).toBe(true);
+    const first = await runtime.control.command({ requestId: 'switch-msg-1', command: 'message', payload: { text: 'go' } });
+    expect(first.state).toBe('terminal');
+    expect(runtime.control.provider()).toMatchObject({ provider: 'openai', configured: true, networkEnabled: false, transport: 'fixture' });
+
+    runtime.loop.switchProvider('anthropic');
+    expect(runtime.providerSession!.provider).toBe('anthropic');
+    expect(runtime.control.provider()).toMatchObject({ provider: 'anthropic', configured: true, networkEnabled: false, transport: 'fixture' });
+    const second = await runtime.control.command({ requestId: 'switch-msg-2', command: 'message', payload: { text: 'again' } });
+    expect(second.state).toBe('terminal');
+    expect(openaiTransport.requests).toHaveLength(2);
+    expect(anthropicTransport.requests).toHaveLength(1);
+    const sent = anthropicTransport.requests[0]!.body as { messages: Array<{ role: string; content?: any }> };
+    expect(sent.messages.some(message => message.content?.some?.((block: any) => block.type === 'tool_use' && block.id === 'call-switch'))).toBe(true);
+    expect(sent.messages.some(message => message.content?.some?.((block: any) => block.type === 'tool_result' && block.tool_use_id === 'call-switch'))).toBe(true);
+    const history = runtime.providerSession!.history.snapshot();
+    expect(history).toContainEqual(expect.objectContaining({ role: 'tool', toolResult: expect.objectContaining({ toolCallId: 'call-switch' }) }));
+  });
+
   it('never enables network access when the gate is off and reports the disabled boundary', async () => {
     const runtime = track(createRuntime({ modelProvider: 'openai', allowModelNetwork: false, apiKey: 'sk-not-used' }));
     expect(runtime.control.provider()).toMatchObject({ provider: 'openai', configured: false, networkEnabled: false, transport: 'unavailable' });
@@ -426,6 +459,27 @@ describe('knowledge tools through the public router', () => {
     const retired = await runtime.router.invoke({ id: 'k9', name: 'query_knowledge', arguments: '{}' });
     expect(retired).toMatchObject({ ok: false, error: 'unknown-tool' });
   });
+
+  it('injects the runtime body scope into fact queries and ignores a model-supplied scope', async () => {
+    const runtime = track(createRuntime());
+    const release = knowledgeRelease('release-scope-int', '1', 1.5);
+    release.manifest.sources = [{ ...release.manifest.sources[0]!, sourceId: 'scoped-source', version: 'scoped-1' }];
+    release.rules = [
+      { ...release.rules[0]!, id: 'rule-global', sourceId: 'scoped-source', sourceVersion: 'scoped-1' },
+      { ...release.rules[0]!, id: 'rule-foreign', sourceId: 'scoped-source', sourceVersion: 'scoped-1', value: 9, scope: { worldGenerationId: 'other-world' } },
+    ];
+    runtime.knowledge.publish(release);
+
+    const facts = await runtime.router.invoke({ id: 'k-scope-1', name: 'query_knowledge_facts', arguments: JSON.stringify({ predicate: 'block.hardness' }) });
+    expect(facts.ok).toBe(true);
+    expect((facts.result as { items: Array<{ id: string }>; conflicts: unknown[] }).items.map(item => item.id)).toEqual(['rule-global']);
+    // Same predicate from another world is both excluded and not reported as a conflict here.
+    expect((facts.result as { conflicts: unknown[] }).conflicts).toEqual([]);
+
+    // The model cannot override the injected scope; the strict schema rejects the field.
+    const attempted = await runtime.router.invoke({ id: 'k-scope-2', name: 'query_knowledge_facts', arguments: JSON.stringify({ predicate: 'block.hardness', scope: { worldGenerationId: 'other-world' } }) });
+    expect(attempted).toMatchObject({ ok: false, error: 'invalid-tool-arguments' });
+  });
 });
 
 describe('scoped memory places for return_to_place', () => {
@@ -443,33 +497,41 @@ describe('scoped memory places for return_to_place', () => {
   });
 
   it('resolves a current in-scope place and rejects stale or foreign places', async () => {
-    const clock = new ManualClock();
-    const bridge = new FakeClientBridge(12, { context });
-    const runtime = track(createRuntime({ profile: 'simulated', bridge, clock }));
-    const remembered = await runtime.router.invoke({ id: 'p1', name: 'remember_place', arguments: JSON.stringify({ placeId: 'home', payload: { x: 1, y: 0 } }) });
-    expect(remembered.ok).toBe(true);
+    // Place freshness is a wall-clock comparison; a monotonic ManualClock alone must not be
+    // able to age persisted records.
+    const wallBase = Date.parse('2026-05-01T00:00:00.000Z');
+    const wall = vi.spyOn(Date, 'now').mockReturnValue(wallBase);
+    try {
+      const clock = new ManualClock();
+      const bridge = new FakeClientBridge(12, { context });
+      const runtime = track(createRuntime({ profile: 'simulated', bridge, clock }));
+      const remembered = await runtime.router.invoke({ id: 'p1', name: 'remember_place', arguments: JSON.stringify({ placeId: 'home', payload: { x: 1, y: 0 } }) });
+      expect(remembered.ok).toBe(true);
 
-    const returned = await runtime.router.invoke({ id: 'p2', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'home' }) });
-    expect(returned.ok).toBe(true);
-    expect((returned.result as { outcome?: string }).outcome).toBe('confirmed');
-    expect(bridge.position).toEqual({ x: 1, y: 0 });
+      const returned = await runtime.router.invoke({ id: 'p2', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'home' }) });
+      expect(returned.ok).toBe(true);
+      expect((returned.result as { outcome?: string }).outcome).toBe('confirmed');
+      expect(bridge.position).toEqual({ x: 1, y: 0 });
 
-    // The same place is scoped; a foreign-scope place is not a navigation target.
-    const foreign = runtime.memory.rememberPlace({ placeId: 'foreign', context: { serverProfileId: 'simulated', worldGenerationId: 'other-world', dimensionId: 'overworld' }, payload: { x: 2, y: 0 } });
-    expect(foreign.placeId).toBe('foreign');
-    expect(runtime.control.places().map(place => place.placeId)).toEqual(['home']);
-    const wrongScope = await runtime.router.invoke({ id: 'p3', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'foreign' }) });
-    expect(wrongScope.ok).toBe(false);
-    expect(bridge.position).toEqual({ x: 1, y: 0 });
-    const scopedMemory = await runtime.router.invoke({ id: 'p4', name: 'query_memory', arguments: '{}' });
-    expect((scopedMemory.result as { scope?: unknown }).scope).toMatchObject({ serverProfileId: 'simulated', worldGenerationId: 'world-1', dimensionId: 'overworld' });
+      // The same place is scoped; a foreign-scope place is not a navigation target.
+      const foreign = runtime.memory.rememberPlace({ placeId: 'foreign', context: { serverProfileId: 'simulated', worldGenerationId: 'other-world', dimensionId: 'overworld' }, payload: { x: 2, y: 0 } });
+      expect(foreign.placeId).toBe('foreign');
+      expect(runtime.control.places().map(place => place.placeId)).toEqual(['home']);
+      const wrongScope = await runtime.router.invoke({ id: 'p3', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'foreign' }) });
+      expect(wrongScope.ok).toBe(false);
+      expect(bridge.position).toEqual({ x: 1, y: 0 });
+      const scopedMemory = await runtime.router.invoke({ id: 'p4', name: 'query_memory', arguments: '{}' });
+      expect((scopedMemory.result as { scope?: unknown }).scope).toMatchObject({ serverProfileId: 'simulated', worldGenerationId: 'world-1', dimensionId: 'overworld' });
 
-    // Staleness fails closed before legacy navigation.
-    clock.advance(6 * 60_000);
-    const stale = await runtime.router.invoke({ id: 'p5', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'home' }) });
-    expect(stale.ok).toBe(false);
-    expect(String(stale.error)).toMatch(/place-stale/);
-    expect(bridge.position).toEqual({ x: 1, y: 0 });
+      // Staleness fails closed before legacy navigation.
+      wall.mockReturnValue(wallBase + 6 * 60_000);
+      const stale = await runtime.router.invoke({ id: 'p5', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'home' }) });
+      expect(stale.ok).toBe(false);
+      expect(String(stale.error)).toMatch(/place-stale/);
+      expect(bridge.position).toEqual({ x: 1, y: 0 });
+    } finally {
+      wall.mockRestore();
+    }
   });
 });
 
@@ -502,8 +564,13 @@ describe('P09 service orchestration exposure and control/server surfacing', () =
     } finally { await server.close(); }
   });
 
-  const builtEntry = existsSync(fileURLToPath(new URL('../../dist/bridge/service/entry.js', import.meta.url)));
-  it.skipIf(!builtEntry)('exposes the CLI bridge service mode over loopback without claiming a real client body', async () => {
+  const serviceEntryUrl = new URL('../../dist/bridge/service/entry.js', import.meta.url);
+  beforeAll(() => {
+    if (!existsSync(fileURLToPath(serviceEntryUrl))) {
+      throw new Error('missing-built-entry: dist/bridge/service/entry.js is required for the P09 child-process test. Run `npm run build` before running this test file.');
+    }
+  });
+  it('exposes the CLI bridge service mode over loopback without claiming a real client body', async () => {
     const upstream = net.createServer(socket => { socket.on('data', chunk => socket.write(chunk)); });
     await new Promise<void>((resolve, reject) => { upstream.once('error', reject); upstream.listen(0, '127.0.0.1', resolve); });
     const targetPort = (upstream.address() as net.AddressInfo).port;
@@ -511,7 +578,7 @@ describe('P09 service orchestration exposure and control/server surfacing', () =
       const result = await runBridgeServiceCommand({
         relay: { listenHost: '127.0.0.1', listenPort: 0, targetHost: '127.0.0.1', targetPort, allowMinecraftUpstream: true, heartbeatMs: 60 },
         observer: { enabled: true }, shutdownGraceMs: 1_000, helloTimeoutMs: 5_000, maxRestarts: 1, backoffBaseMs: 10,
-      }, { entryUrl: new URL('../../dist/bridge/service/entry.js', import.meta.url) });
+      }, { entryUrl: serviceEntryUrl });
       expect(result).toMatchObject({ mode: 'service', orchestration: 'bridge-service', network: 'disabled', boundary: 'client-body-unavailable', liveCompatibility: 'not-verified' });
       expect((result.status as { state?: string } | null)?.state).toMatch(/running|degraded/);
       expect(result.shutdown).toMatchObject({ stopped: true });

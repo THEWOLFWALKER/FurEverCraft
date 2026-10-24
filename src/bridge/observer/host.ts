@@ -40,11 +40,26 @@ export type ObserverWorkerHostOptions = {
   maxUnackedBytes?: number;
   /** Unacknowledged chunk budget per direction. */
   maxUnackedFrames?: number;
+  /**
+   * Idle deadline for the worker to acknowledge outstanding work. The deadline is armed
+   * while chunks are unacknowledged and re-armed on every acknowledgement, so steady
+   * progress keeps a healthy worker alive; only a worker that makes no progress for the
+   * full window is terminated. The decoder's synchronous `maxDecompressMs` check can only
+   * run after `inflateSync` returns, so a hostile frame can block the worker thread
+   * indefinitely. This deadline is enforced from the host thread and is therefore the real
+   * bound. `taskTimeoutMs` is accepted as an alias so the host can share the observer's
+   * configured task budget.
+   */
+  ackTimeoutMs?: number;
+  /** Alias for `ackTimeoutMs` (the observer's task budget). */
+  taskTimeoutMs?: number;
 };
 
 const PAYLOAD_KIND: ObserverPayloadKind = 'frame-metadata';
 const DEFAULT_MAX_UNACKED_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_UNACKED_FRAMES = 256;
+const DEFAULT_ACK_TIMEOUT_MS = 2_000;
+const DIRECTIONS: ObserverDirection[] = ['client-to-server', 'server-to-client'];
 const directionState = (direction: ObserverDirection): ObserverDirectionState => ({
   direction,
   byteOffset: '0',
@@ -83,11 +98,17 @@ function defaultWorker(): WorkerLike {
 export class ObserverWorkerHost {
   readonly sessionEpoch = `observer_host_${randomUUID()}`;
   private worker?: WorkerLike;
+  private workerGeneration = 0;
   private stopped = false;
   private lost = false;
   private readonly stoppedDirections = new Set<ObserverDirection>();
   private readonly unackedBytes: Record<ObserverDirection, number> = { 'client-to-server': 0, 'server-to-client': 0 };
   private readonly unackedFrames: Record<ObserverDirection, number> = { 'client-to-server': 0, 'server-to-client': 0 };
+  /** One progress/idle deadline per direction, armed only while work is outstanding. */
+  private readonly ackTimers: Record<ObserverDirection, ReturnType<typeof setTimeout> | undefined> = {
+    'client-to-server': undefined,
+    'server-to-client': undefined,
+  };
   private directions: Record<ObserverDirection, ObserverDirectionState> = {
     'client-to-server': directionState('client-to-server'),
     'server-to-client': directionState('server-to-client'),
@@ -105,14 +126,25 @@ export class ObserverWorkerHost {
   start(): void {
     if (this.worker || this.stopped) return;
     const worker = (this.options.createWorker ?? defaultWorker)();
+    const generation = ++this.workerGeneration;
     this.worker = worker;
     this.lost = false;
     this.stoppedDirections.clear();
+    // A (re)started worker has no framing continuity with any previous worker; never keep
+    // stale per-direction phase/offset/sequence state as if it were current.
+    this.directions = {
+      'client-to-server': directionState('client-to-server'),
+      'server-to-client': directionState('server-to-client'),
+    };
     for (const direction of Object.keys(this.unackedBytes) as ObserverDirection[]) {
       this.unackedBytes[direction] = 0;
       this.unackedFrames[direction] = 0;
     }
+    this.clearAckTimers();
+    // Events from a worker we already replaced/terminated must not mutate current state.
+    const current = () => generation === this.workerGeneration && this.worker === worker;
     worker.on('message', message => {
+      if (!current()) return;
       const payload = message as {
         type?: string;
         event?: ObserverEvent;
@@ -121,12 +153,24 @@ export class ObserverWorkerHost {
         bytes?: unknown;
         frames?: unknown;
       } | undefined;
-      if (payload?.type === 'event' && payload.event) this.options.onEvent(payload.event);
+      if (payload?.type === 'event' && payload.event) {
+        const event = payload.event as ObserverEvent;
+        // Attach backpressure stops a direction. The worker may still have chunks in
+        // flight for it (and can emit observations/gaps after the stop); those must not
+        // be presented as current continuity for a stopped direction.
+        const eventDirection = event.kind === 'observation' ? event.direction : event.gap.direction;
+        if (eventDirection && this.stoppedDirections.has(eventDirection)) return;
+        this.options.onEvent(event);
+      }
       if (payload?.type === 'ack' && payload.direction && isDirection(payload.direction)) {
         const ack = payload as unknown as WorkerAck;
         const direction = ack.direction;
         this.unackedBytes[direction] = Math.max(0, this.unackedBytes[direction] - Math.max(0, Number(ack.bytes) || 0));
-        this.unackedFrames[direction] = Math.max(0, this.unackedFrames[direction] - Math.max(1, Number(ack.frames ?? 1) || 1));
+        const acked = Math.max(1, Number(ack.frames ?? 1) || 1);
+        this.unackedFrames[direction] = Math.max(0, this.unackedFrames[direction] - acked);
+        // Progress resets the idle deadline: sustained slow-but-steady acknowledgements are
+        // healthy, while a worker that stops making progress for the full window is not.
+        this.armAckDeadline(direction);
       }
       if (payload?.type === 'state' && payload.direction && isDirection(payload.direction)) {
         const existing = this.directions[payload.direction];
@@ -139,8 +183,15 @@ export class ObserverWorkerHost {
         this.directions = { ...this.directions, [payload.direction]: merged };
       }
     });
-    worker.on('error', () => { this.lost = true; this.notifyFailure('observer-worker-error'); });
+    worker.on('error', () => {
+      if (!current()) return;
+      this.clearAckTimers();
+      this.lost = true;
+      this.notifyFailure('observer-worker-error');
+    });
     worker.on('exit', () => {
+      if (!current()) return;
+      this.clearAckTimers();
       this.worker = undefined;
       this.lost = true;
       if (!this.stopped) this.notifyFailure('observer-worker-exit');
@@ -152,8 +203,8 @@ export class ObserverWorkerHost {
     const running = Boolean(this.worker && !this.stopped);
     const unavailable = this.stopped || !running || this.lost;
     const directions = {
-      'client-to-server': { ...this.directions['client-to-server'], availability: unavailable ? 'unknown' : this.directions['client-to-server'].availability },
-      'server-to-client': { ...this.directions['server-to-client'], availability: unavailable ? 'unknown' : this.directions['server-to-client'].availability },
+      'client-to-server': { ...this.directions['client-to-server'], availability: unavailable || this.stoppedDirections.has('client-to-server') ? 'unknown' : this.directions['client-to-server'].availability },
+      'server-to-client': { ...this.directions['server-to-client'], availability: unavailable || this.stoppedDirections.has('server-to-client') ? 'unknown' : this.directions['server-to-client'].availability },
     } satisfies Record<ObserverDirection, ObserverDirectionState>;
     // Any direction that is stopped or reports unknown makes the aggregate unknown; worker
     // liveness alone is not enough to claim observation availability.
@@ -188,9 +239,13 @@ export class ObserverWorkerHost {
     this.unackedBytes[direction] += size;
     this.unackedFrames[direction] += 1;
     this.worker.postMessage({ type: 'chunk', direction, bytes } satisfies WorkerInbound);
+    // Arm the progress/idle deadline only if no deadline is already running. Posting more
+    // chunks must not extend it: progress is measured by acknowledgements, not by input.
+    this.ensureAckDeadline(direction);
     return true;
   }
   reset(direction: ObserverDirection): void {
+    this.clearAckTimer(direction);
     this.stoppedDirections.delete(direction);
     this.unackedBytes[direction] = 0;
     this.unackedFrames[direction] = 0;
@@ -198,6 +253,19 @@ export class ObserverWorkerHost {
     void _staleReason;
     this.directions = { ...this.directions, [direction]: { ...rest, availability: 'unknown' } };
     this.worker?.postMessage({ type: 'reset', direction } satisfies WorkerInbound);
+  }
+  /** Reset both directions (a global park) and restart framing/sequence continuity. */
+  resetAll(): void {
+    this.clearAckTimers();
+    this.stoppedDirections.clear();
+    for (const direction of DIRECTIONS) {
+      this.unackedBytes[direction] = 0;
+      this.unackedFrames[direction] = 0;
+      const { stoppedReason: _staleReason, ...rest } = this.directions[direction];
+      void _staleReason;
+      this.directions = { ...this.directions, [direction]: { ...rest, availability: 'unknown' } };
+    }
+    this.worker?.postMessage({ type: 'reset-all' } satisfies WorkerInbound);
   }
   control(direction: ObserverDirection, event: unknown): void { this.worker?.postMessage({ type: 'control', direction, event } satisfies WorkerInbound); }
   setCompression(direction: ObserverDirection, enabled: boolean, threshold = 0): void {
@@ -208,13 +276,69 @@ export class ObserverWorkerHost {
     if (this.stopped) return;
     this.stopped = true;
     const worker = this.worker;
+    this.workerGeneration += 1;
     this.worker = undefined;
+    this.clearAckTimers();
     if (!worker) return;
     try { await worker.terminate(); } catch { /* best effort */ }
   }
 
+  /**
+   * The worker made no progress within the idle window while work was still outstanding.
+   * It cannot be trusted to preserve framing continuity (or to be alive at all), so
+   * terminate it, fail the direction and report a global gap. Relay forwarding is owned
+   * by a different component and is unaffected.
+   */
+  private handleAckTimeout(direction: ObserverDirection): void {
+    if (this.ackTimers[direction] === undefined) return;
+    this.ackTimers[direction] = undefined;
+    if (this.stopped || this.stoppedDirections.has(direction) || this.lost || !this.worker) return;
+    // An acknowledgement may have cleared the last outstanding chunk in the same turn.
+    if (this.unackedFrames[direction] <= 0) return;
+    const worker = this.worker;
+    this.workerGeneration += 1;
+    this.worker = undefined;
+    this.lost = true;
+    this.clearAckTimers();
+    // A blocked worker may have produced partial state before stalling. Do not keep the
+    // other direction's last reported availability as if it were still trustworthy.
+    const unknown = { ...this.directions };
+    for (const other of Object.keys(unknown) as ObserverDirection[]) {
+      if (other !== direction) unknown[other] = { ...unknown[other], availability: 'unknown' };
+    }
+    this.directions = unknown;
+    this.stopDirection(direction, 'observer-ack-timeout');
+    try { void Promise.resolve(worker.terminate()).catch(() => undefined); } catch { /* best effort */ }
+  }
+
+  /** Arm the idle deadline only if it is not already running while work is outstanding. */
+  private ensureAckDeadline(direction: ObserverDirection): void {
+    if (this.ackTimers[direction] !== undefined) return;
+    if (this.unackedFrames[direction] <= 0) return;
+    const timeoutMs = Math.max(1, this.options.ackTimeoutMs ?? this.options.taskTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS);
+    this.ackTimers[direction] = setTimeout(() => this.handleAckTimeout(direction), timeoutMs);
+  }
+
+  /** A progress ack resets the idle deadline (or clears it when nothing is outstanding). */
+  private armAckDeadline(direction: ObserverDirection): void {
+    this.clearAckTimer(direction);
+    this.ensureAckDeadline(direction);
+  }
+
+  private clearAckTimer(direction: ObserverDirection): void {
+    const timer = this.ackTimers[direction];
+    if (timer) clearTimeout(timer);
+    this.ackTimers[direction] = undefined;
+  }
+
+  private clearAckTimers(direction?: ObserverDirection): void {
+    const directions = direction ? [direction] : DIRECTIONS;
+    for (const key of directions) this.clearAckTimer(key);
+  }
+
   private stopDirection(direction: ObserverDirection, reason: string): void {
     this.stoppedDirections.add(direction);
+    this.clearAckTimers(direction);
     this.unackedBytes[direction] = 0;
     this.unackedFrames[direction] = 0;
     this.directions = {

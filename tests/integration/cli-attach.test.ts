@@ -135,13 +135,22 @@ describe('P14 attach CLI over the real ControlService', { timeout: 30_000 }, () 
 
       expect(await cli.command('executions')).toEqual([]);
       expect(await cli.command('effects')).toEqual([]);
-      expect(await cli.command('places')).toEqual([]);
+      expect(await cli.command('places')).toEqual({ items: [], truncated: false });
       const events = await cli.command('events');
       expect(Array.isArray(events.events)).toBe(true);
       expect(events.events.some((event: { kind: string }) => event.kind === 'control.goal.set')).toBe(true);
       expect(await cli.command('provider')).toMatchObject({ provider: 'scripted' });
       expect(await cli.command('capabilities')).toMatchObject({ profile: 'simulated' });
       expect(await cli.command('config')).toMatchObject({ profile: 'simulated', cliAccess: 'configured' });
+
+      // `doctor` is the authenticated full P21 report, not a reduced capability/status view.
+      const doctor = await cli.command('doctor');
+      expect(doctor).toMatchObject({ version: 1, status: expect.any(String) });
+      expect(doctor.ownership).toMatchObject({ state: expect.any(String) });
+      expect(doctor.recovery).toMatchObject({ pendingEffects: expect.any(Number), effectCounts: expect.any(Object) });
+      expect(doctor.store).toMatchObject({ path: expect.any(String), health: 'ok' });
+      expect(doctor.provider).toMatchObject({ provider: 'scripted' });
+      expect(doctor).not.toHaveProperty('capabilities');
 
       const saved = await cli.command('save');
       expect(saved.state).toBe('terminal');

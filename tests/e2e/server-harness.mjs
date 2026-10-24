@@ -9,6 +9,11 @@
  * The injected model provider is a deterministic offline fixture. Only an explicit browser
  * message ("execute placement") produces a tool call; scheduler wakes and other commands return
  * a text turn. This keeps the browser workflow reproducible without pretending to call a model.
+ *
+ * This in-process harness is retained only for cases that need an injected provider and bridge
+ * fault (`ambiguous` placement); those dependencies are not exposed by the public serve CLI.
+ * The public `serve --profile`, `--db`, `--no-pairing` and `--cli-bearer` path is exercised by
+ * spawning the compiled CLI in the spec instead of duplicating that assembly here.
  */
 import { createRuntime } from '../../dist/execution/factory.js';
 import { createControlServer } from '../../dist/server/index.js';

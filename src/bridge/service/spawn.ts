@@ -1,19 +1,21 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ChildProcessLike } from '../supervisor.js';
+import { minimalChildEnvironment } from '../relay/spawn.js';
 import type { BridgeServiceEntryConfig } from './entry.js';
 
 export type BridgeServiceSpawnerOptions = { entryUrl?: URL; env?: NodeJS.ProcessEnv; cwd?: string };
 
 /**
  * Forks the bridge service child. The relay child and observer worker live under the service
- * process; the parent Runtime only sees the versioned IPC surface.
+ * process; the parent Runtime only sees the versioned IPC surface. Only the allowlisted
+ * process plumbing and the service config cross the boundary — never the parent's secrets.
  */
 export function spawnBridgeServiceProcess(config: BridgeServiceEntryConfig, options: BridgeServiceSpawnerOptions = {}): ChildProcessLike {
   const entry = options.entryUrl ?? new URL('./entry.js', import.meta.url);
   const child: ChildProcess = fork(fileURLToPath(entry), [], {
     stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
-    env: { ...process.env, ...options.env, FUREVERCRAFT_SERVICE_CONFIG: JSON.stringify(config) },
+    env: { ...minimalChildEnvironment(options.env), FUREVERCRAFT_SERVICE_CONFIG: JSON.stringify(config) },
     cwd: options.cwd ?? process.cwd(),
     execArgv: [],
   });

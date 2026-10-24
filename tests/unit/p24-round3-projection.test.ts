@@ -98,6 +98,58 @@ describe('Round 3 — per-direction pipeline uncertainty', () => {
   });
 });
 
+describe('Round 5 — projection scope fencing and resynchronisation anchors', () => {
+  it('binds the scope on the first projection and rejects a different account/world/dimension/server profile', () => {
+    const pipeline = new DomainProjectionPipeline();
+    pipeline.start('epoch-1');
+    expect(pipeline.project(input('1', positionPacket())).accepted).toBe(true);
+    // The exact reported case: same epoch and sequence, different account, must not be sequenced.
+    expect(pipeline.project({ ...input('1', positionPacket()), scope: { ...scope, accountId: 'account-b' } })).toMatchObject({ accepted: false, reason: 'scope-mismatch' });
+    const changes = [
+      ['accountId', 'account-b'],
+      ['worldGenerationId', 'w2'],
+      ['dimension', 'nether'],
+      ['serverProfileId', 'p2'],
+    ] as const;
+    for (let index = 0; index < changes.length; index += 1) {
+      const [field, value] = changes[index]!;
+      const sequence = String(index + 2);
+      const mismatched = pipeline.project({ ...input(sequence, positionPacket()), scope: { ...scope, [field]: value } });
+      expect(mismatched, field).toMatchObject({ accepted: false, reason: 'scope-mismatch' });
+      if (!mismatched.accepted) expect(mismatched.detail).toContain(field);
+      // A rejected scope never advances the sequence for the next legitimate packet.
+      expect(pipeline.state().lastSequences.downstream).toBe(String(index + 1));
+      expect(pipeline.project(input(sequence, positionPacket())).accepted, field).toBe(true);
+    }
+    expect(pipeline.scope).toEqual(scope);
+
+    // Only an explicit new session may rebind the scope.
+    const rebounded = { ...scope, accountId: 'account-b' };
+    pipeline.start('epoch-2', {}, rebounded);
+    expect(pipeline.scope).toEqual(rebounded);
+    expect(pipeline.project({ ...input('1', positionPacket(), 'epoch-2'), scope: rebounded }).accepted).toBe(true);
+    expect(pipeline.project({ ...input('2', positionPacket(), 'epoch-2'), scope })).toMatchObject({ accepted: false, reason: 'scope-mismatch' });
+  });
+
+  it('rejects non-decimal and non-advancing resync anchors without moving the fence', () => {
+    const pipeline = new DomainProjectionPipeline();
+    pipeline.start('epoch-1');
+    expect(pipeline.project(input('100', positionPacket())).accepted).toBe(true);
+
+    expect(() => pipeline.resync('epoch-1', 'not-a-number')).not.toThrow();
+    expect(pipeline.resync('epoch-1', 'not-a-number')).toMatchObject({ accepted: false, reason: 'invalid-resync-sequence' });
+    expect(pipeline.resync('epoch-1', '')).toMatchObject({ accepted: false, reason: 'invalid-resync-sequence' });
+    expect(pipeline.resyncAll('epoch-1', { downstream: '1.5' })).toMatchObject({ accepted: false, reason: 'invalid-resync-sequence' });
+    expect(pipeline.resync('epoch-1', '1')).toMatchObject({ accepted: false, reason: 'stale-resync-sequence' });
+    expect(pipeline.resync('epoch-1', '100')).toMatchObject({ accepted: false, reason: 'stale-resync-sequence' });
+    expect(pipeline.resyncAll('epoch-1', { downstream: '50' })).toMatchObject({ accepted: false, reason: 'stale-resync-sequence' });
+
+    expect(pipeline.state().lastSequences.downstream).toBe('100');
+    expect(pipeline.project(input('2', positionPacket()))).toMatchObject({ accepted: false, reason: 'stale-sequence' });
+    expect(pipeline.project(input('101', positionPacket())).accepted).toBe(true);
+  });
+});
+
 describe('Round 3 — nested unknown variable-length data', () => {
   const projectors = createSyntheticProjectors();
 

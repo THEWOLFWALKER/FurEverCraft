@@ -5,6 +5,7 @@ import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import { redact } from '../diagnostics/redaction.js';
 import { collectDoctorReport, type DoctorOptions, type DoctorReport } from '../diagnostics/doctor.js';
 import { bodyStateView, legacyBodyStateView, type BodyStateView } from '../motor/contracts.js';
+import { sameStableScope, stableScopeKey, stableScopeOf, type StableScope } from '../persistence/store.js';
 import {
   CancelPayloadSchema, ChatPayloadSchema, CommandRequestSchema, GoalRevisePayloadSchema, GoalSetPayloadSchema,
   MessagePayloadSchema, type CommandRequest, type CommandResult, type ProviderMetadata,
@@ -18,6 +19,17 @@ const canonicalize = (value: unknown): unknown => Array.isArray(value)
 
 export function canonicalPayloadHash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(canonicalize(value))).digest('hex');
+}
+
+/**
+ * Receipt scope for command idempotency. World generation and dimension are part of the stable
+ * identity, so reusing a requestId after a world/dimension change executes the command again
+ * against the new scope instead of replaying the old terminal receipt. Connection/body epochs
+ * are intentionally excluded: a reconnect to the same world must still replay the receipt.
+ */
+export function commandScopeOf(context: unknown): string {
+  const scope = stableScopeOf(context) ?? ({ serverProfileId: 'unknown' } satisfies StableScope);
+  return `control:${stableScopeKey(scope)}`;
 }
 
 const terminal = new Set(['succeeded', 'failed', 'canceled']);
@@ -82,14 +94,20 @@ export class ControlService {
   private bodyState(snapshot?: ReturnType<ClientBridgeCapabilities['snapshot']>): BodyStateView | undefined {
     const adapter = this.runtime.bodyAdapter;
     if (adapter) {
-      const observed = bodyStateView(adapter);
-      if (observed) return observed;
-      // Attached but no synchronous view: report the boundary rather than a legacy fallback.
-      return {
+      const unknownView = (): BodyStateView => ({
         mode: '3d', threeDimensional: true, legacy2d: false,
         dimension: adapter.context.dimension, revision: 'unknown', freshness: 'unknown',
         source: adapter.source, gap: true, context: { ...adapter.context },
-      };
+      });
+      try {
+        const observed = bodyStateView(adapter);
+        if (observed) return observed;
+      } catch {
+        // A throwing peek is an unknown body, not a failed control-plane read.
+        return unknownView();
+      }
+      // Attached but no synchronous view: report the boundary rather than a legacy fallback.
+      return unknownView();
     }
     try { return legacyBodyStateView(snapshot ?? this.runtime.bridge.snapshot()); }
     catch { return undefined; }
@@ -99,12 +117,12 @@ export class ControlService {
     // After a quit the store is closed; the control surface must still report the stopped state
     // instead of throwing on every status read until the caller shuts the server down.
     if (this.closed) return { state: 'closed', paused: this.paused, stopping: true, closed: true, goal: null, executions: 0, context: { ...this.runtime.bridge.context }, body: this.bodyState(), observation: { source: 'unknown', freshness: 'unknown', gap: true, reason: 'runtime-closed' }, session: { state: 'closed', recoveryAttempts: 0, recoveryBudget: 0 }, position: undefined, inventory: undefined, ui: undefined };
-    const goal = this.runtime.store.listGoals().find(item => item.status === 'active' || item.status === 'paused');
+    const goal = this.runtime.store.findGoalForScope(this.runtime.memoryScope, ['active', 'paused']);
     const base = {
       paused: this.paused,
       stopping: this.stopping,
       goal,
-      executions: this.runtime.store.listExecutions().length,
+      executions: this.runtime.store.countExecutionsForScope(this.runtime.memoryScope),
       context: { ...this.runtime.bridge.context },
       session: { state: this.runtime.session.state, recoveryAttempts: this.runtime.session.recoveryAttempts, recoveryBudget: this.runtime.session.recoveryBudget },
     };
@@ -168,14 +186,26 @@ export class ControlService {
       },
     };
   }
+  /** Goal reads outside the attached stable scope are invisible; a goal id is not a global handle. */
+  private scopedGoal(goalId: string) {
+    const goal = this.runtime.store.getGoal(goalId);
+    return goal && sameStableScope(goal.context, this.runtime.memoryScope) ? goal : undefined;
+  }
+
+  /** Body/server identity is reported separately from the assembled runtime profile. */
   capabilities() {
     const bridge = this.runtime.bridge as { capabilities?: unknown };
     const body = this.bodyState();
     const controlOpen = this.runtime.controlOpen();
     const inputsEnabled = this.runtime.inputsEnabled;
     const effectiveInputsEnabled = inputsEnabled && controlOpen;
+    const serverProfileId = this.runtime.bridge.context.serverProfileId;
     return {
-      profile: this.runtime.bridge.context.serverProfileId,
+      // `profile` is the legacy alias for the attached body/server profile; new callers should
+      // read `serverProfileId`. `runtimeProfile` is the profile string this runtime was built from.
+      profile: serverProfileId,
+      serverProfileId,
+      runtimeProfile: this.runtime.runtimeProfile,
       provider: this.providerMetadata,
       bridge: redact(bridge.capabilities ?? {}),
       skills: this.runtime.router.availableSkills?.() ?? [],
@@ -200,12 +230,18 @@ export class ControlService {
       ],
     };
   }
-  goals() { return this.runtime.store.listGoals(); }
-  executions() { return this.runtime.store.listExecutions(); }
-  effects(executionId?: string) { return this.runtime.store.listEffects(executionId); }
-  /** Scoped memory query (P20), not an unscoped table dump. */
-  places() { return this.runtime.memory.queryPlaces({ scope: this.runtime.memoryScope }).items; }
-  events(cursor = '0', limit = 100, filter?: string) { return this.runtime.session.events.read(cursor, limit, filter); }
+  goals(options: { limit?: number; cursor?: string } = {}) { return this.runtime.store.listGoalsForScope(this.runtime.memoryScope, options).items; }
+  executions(options: { limit?: number; cursor?: string } = {}) { return this.runtime.store.listExecutionsForScope(this.runtime.memoryScope, options).items; }
+  effects(executionId?: string, options: { limit?: number; cursor?: string } = {}) { return this.runtime.store.listEffectsForScope(this.runtime.memoryScope, { executionId, ...options }).items; }
+  /** Scoped memory query with explicit pagination; never a silently sliced table dump. */
+  placesPage(options: { limit?: number; cursor?: string; status?: string } = {}) { return this.runtime.memory.queryPlaces({ ...options, scope: this.runtime.memoryScope }); }
+  places(options: { limit?: number; cursor?: string; status?: string } = {}) { return this.placesPage(options).items; }
+  episodesPage(options: { limit?: number; cursor?: string } = {}) { return this.runtime.memory.queryEpisodic({ ...options, scope: this.runtime.memoryScope }); }
+  /** Scoped memories route: places and episodes are both paginated and scope-filtered. */
+  memories(options: { limit?: number; cursor?: string; status?: string } = {}) {
+    return { places: this.placesPage(options), episodes: this.episodesPage({ limit: options.limit, cursor: options.cursor }) };
+  }
+  events(cursor = '0', limit = 100, filter?: string) { return this.runtime.session.events.read(cursor, limit, filter, this.runtime.memoryScope); }
   /** Current event sequence head; SSE snapshots are labelled with it so snapshot and cursor agree. */
   eventsHead() { return this.runtime.session.events.head(); }
   provider() { return redact(this.providerMetadata); }
@@ -213,10 +249,9 @@ export class ControlService {
   diagnostics(options?: DoctorOptions): DoctorReport { return collectDoctorReport(this.runtime, options); }
   doctor(options?: DoctorOptions): DoctorReport { return this.diagnostics(options); }
 
-  /** Command receipts are scoped by server profile and, when known, account. */
+  /** Command receipts are scoped by the full stable identity (server, account, world, dimension). */
   private commandScope(): string {
-    const context = this.runtime.bridge.context;
-    return `control:${context.serverProfileId}${context.accountId ? `:${context.accountId}` : ''}`;
+    return commandScopeOf(this.runtime.bridge.context);
   }
 
   async command(input: unknown): Promise<CommandResult> {
@@ -244,8 +279,13 @@ export class ControlService {
       if (this.stopping && !lifecycleCommands.has(request.command) && replayState !== 'terminal') return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', payloadHash };
       return { requestId: request.requestId, command: request.command, state: replayState, result: old.result, payloadHash };
     }
-    try { this.runtime.store.addActionReceipt({ receiptId: request.requestId, scope, commandId: request.requestId, status: 'pending', payloadHash }); }
-    catch {
+    try {
+      // The receipt row is keyed by receipt_id. The same requestId may legitimately execute
+      // again in a different world/dimension, so the durable receipt id is derived from both
+      // the receipt scope and the command id; commandId stays the caller's requestId.
+      const receiptId = `receipt:${canonicalPayloadHash({ scope, requestId: request.requestId })}`;
+      this.runtime.store.addActionReceipt({ receiptId, scope, commandId: request.requestId, status: 'pending', payloadHash });
+    } catch {
       // The command has not started. Reporting "accepted/in-flight" here would claim
       // work that no durable receipt or execution exists for.
       this.inflight.delete(claimKey);
@@ -291,8 +331,24 @@ export class ControlService {
   private async execute(request: CommandRequest): Promise<CommandResult> {
     const payload = request.payload;
     switch (request.command) {
-      case 'goal.set': { const p = GoalSetPayloadSchema.parse(payload); const current = this.runtime.store.getGoal(p.goalId); const revision = current ? current.revision + 1 : 1; if (request.expectedRevision !== undefined && (current?.revision ?? 0) !== request.expectedRevision) throw new Error(`goal-revision-conflict:${current?.revision ?? 0}`); this.runtime.store.saveGoal({ goalId: p.goalId, revision, status: p.status ?? 'active', text: p.text, context: this.runtime.bridge.context }); return { requestId: request.requestId, command: request.command, state: 'terminal', result: this.runtime.store.getGoal(p.goalId), payloadHash: '' }; }
-      case 'goal.revise': { const p = GoalRevisePayloadSchema.parse(payload); const result = this.runtime.store.reviseGoal(p.goalId, p.expectedRevision ?? request.expectedRevision ?? 0, p.change); return { requestId: request.requestId, command: request.command, state: 'terminal', result, payloadHash: '' }; }
+      case 'goal.set': {
+        const p = GoalSetPayloadSchema.parse(payload);
+        // A goal id is only writable inside the scope that already owns it. Reusing an id from
+        // another world must not overwrite its body_context (or its CAS chain) from here.
+        const existing = this.runtime.store.getGoal(p.goalId);
+        if (existing && !sameStableScope(existing.context, this.runtime.memoryScope)) throw new Error(`goal-scope-mismatch:${p.goalId}`);
+        const revision = existing ? existing.revision + 1 : 1;
+        if (request.expectedRevision !== undefined && (existing?.revision ?? 0) !== request.expectedRevision) throw new Error(`goal-revision-conflict:${existing?.revision ?? 0}`);
+        this.runtime.store.saveGoal({ goalId: p.goalId, revision, status: p.status ?? 'active', text: p.text, context: this.runtime.bridge.context });
+        return { requestId: request.requestId, command: request.command, state: 'terminal', result: this.scopedGoal(p.goalId), payloadHash: '' };
+      }
+      case 'goal.revise': {
+        const p = GoalRevisePayloadSchema.parse(payload);
+        // Reject a foreign-scope goal instead of revising a row this body cannot own.
+        if (!this.scopedGoal(p.goalId)) throw new Error(this.runtime.store.getGoal(p.goalId) ? `goal-scope-mismatch:${p.goalId}` : 'goal-not-found');
+        const result = this.runtime.store.reviseGoal(p.goalId, p.expectedRevision ?? request.expectedRevision ?? 0, p.change);
+        return { requestId: request.requestId, command: request.command, state: 'terminal', result, payloadHash: '' };
+      }
       case 'message': { const p = MessagePayloadSchema.parse(payload); if (this.paused) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'paused', result: { queued: false }, payloadHash: '' }; const run = await this.runtime.loop.run([{ role: 'user', content: p.text }], undefined, this.abortSignal, { goalId: p.goalId, goalRevision: p.goalRevision, store: this.runtime.store, owner: this.runtime.ownerId }); if (this.stopping) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', result: { queued: false }, payloadHash: '' }; if (run.response.stopReason === 'goal-revision-conflict') return { requestId: request.requestId, command: request.command, state: 'conflict', code: 'goal-revision-conflict', result: run, payloadHash: '' }; return { requestId: request.requestId, command: request.command, state: 'terminal', result: run, payloadHash: '' }; }
       case 'chat': { const p = ChatPayloadSchema.parse(payload); if (this.paused) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'paused', payloadHash: '' }; const result = await this.runtime.router.invoke({ id: request.requestId, name: 'send_chat', arguments: JSON.stringify({ text: p.text }) }, { signal: this.abortSignal, owner: this.runtime.ownerId }); if (this.stopping) return { requestId: request.requestId, command: request.command, state: 'rejected', code: 'stopping', result, payloadHash: '' }; return { requestId: request.requestId, command: request.command, state: result.ok ? 'terminal' : 'unknown', result, payloadHash: '' }; }
       case 'pause': {
@@ -342,7 +398,15 @@ export class ControlService {
         const canceled = await this.cancelActiveExecutions(); const body = await this.releaseBody();
         this.runtime.session.events.publish('runtime.stopping', { reason: 'stop', canceled, body }, true); return { requestId: request.requestId, command: request.command, state: 'accepted', result: { stopping: true, canceled, body }, payloadHash: '' };
       }
-      case 'cancel': { const p = CancelPayloadSchema.parse(payload); const execution = this.runtime.store.getExecution(p.executionId); if (!execution) return { requestId: request.requestId, command: request.command, state: 'unknown', code: 'execution-not-found', payloadHash: '' }; const invoke = await this.runtime.router.invoke({ id: request.requestId, name: 'cancel_execution', arguments: JSON.stringify(p) }); const after = this.runtime.store.getExecution(p.executionId); return { requestId: request.requestId, command: request.command, state: terminal.has(after?.status ?? '') ? 'terminal' : invoke.ok ? 'accepted' : 'unknown', code: invoke.ok ? undefined : invoke.error, result: after, payloadHash: '' }; }
+      case 'cancel': {
+        const p = CancelPayloadSchema.parse(payload);
+        const execution = this.runtime.store.getExecution(p.executionId);
+        // A foreign-scope execution is not addressable through this body's control surface.
+        if (!execution || !sameStableScope(execution.context, this.runtime.memoryScope)) return { requestId: request.requestId, command: request.command, state: 'unknown', code: 'execution-not-found', payloadHash: '' };
+        const invoke = await this.runtime.router.invoke({ id: request.requestId, name: 'cancel_execution', arguments: JSON.stringify(p) });
+        const after = this.runtime.store.getExecution(p.executionId);
+        return { requestId: request.requestId, command: request.command, state: terminal.has(after?.status ?? '') ? 'terminal' : invoke.ok ? 'accepted' : 'unknown', code: invoke.ok ? undefined : invoke.error, result: after, payloadHash: '' };
+      }
       case 'save': { const checkpoint = { checkpointId: `runtime-${this.runtime.clock.now()}`, executionId: 'runtime', revision: (this.runtime.store.getLatestCheckpoint('runtime')?.revision ?? 0) + 1, payload: this.status() }; this.runtime.store.saveCheckpoint(checkpoint); return { requestId: request.requestId, command: request.command, state: 'terminal', result: checkpoint, payloadHash: '' }; }
       case 'quit': {
         this.abortActive(); this.quitting = true; this.stopping = true; this.paused = true; this.runtime.scheduler.close(); this.runtime.lifecycle.humanControl('quit');
@@ -374,10 +438,10 @@ export class ControlService {
     } catch (error) { return { released: false, error: error instanceof Error ? error.message : String(error) }; }
   }
 
-  /** Best-effort stop of every non-terminal execution; failures are reported, not thrown. */
+  /** Best-effort stop of every non-terminal execution this body scope owns; foreign rows stay untouched. */
   private async cancelActiveExecutions(): Promise<string[]> {
     const canceled: string[] = [];
-    for (const execution of this.runtime.store.listExecutions()) {
+    for (const execution of this.runtime.store.listExecutionsForScope(this.runtime.memoryScope).items) {
       if (terminal.has(execution.status)) continue;
       try { await this.runtime.router.invoke({ id: `stop-${execution.executionId}`, name: 'cancel_execution', arguments: JSON.stringify({ executionId: execution.executionId }) }); canceled.push(execution.executionId); }
       catch { /* best-effort: continue stopping the remaining executions */ }

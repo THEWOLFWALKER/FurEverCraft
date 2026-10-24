@@ -100,7 +100,7 @@ describe('P10 3D body contract migration', () => {
     const result = await controller.run({ target: { x: 1, y: 0, z: 1 }, leaseId: 'l', ownerToken: 'o' });
     expect(result.status).toBe('failed');
     expect(result.reason).toBe('legacy-observation-not-3d');
-    expect(result.pose).not.toBeNull();
+    expect(result.pose).toEqual({ x: 0, y: 0, z: 0, yaw: 0, pitch: 0 });
   });
 
   it('reports non-zero z and dimension in observations and route evidence', async () => {
@@ -109,7 +109,7 @@ describe('P10 3D body contract migration', () => {
     expect(result.status).toBe('confirmed');
     expect(poseBlock(result.pose!)).toEqual({ x: 1, y: 0, z: 2 });
     expect(result.pose?.z).toBeGreaterThan(1.5);
-    expect(result.route?.observationRevision).toBeTruthy();
+    expect(result.route?.observationRevision).toMatch(/^\d+:\d+$/);
     expect(result.route?.supportedActions).toEqual(['walk', 'jump_short']);
     expect(result.evidence).toBe('simulated-control-loop');
   });

@@ -16,8 +16,23 @@ const parseSequence = (value: unknown) => {
 export class WorldState {
   private current?:Observation; private revision=0n; private lastSequence=0n; private epoch?:string; private gap=false;
   private readonly seenEpochs=new Set<string>();
+  private readonly epochOrder:string[]=[];
   private readonly listeners=new Set<(s:WorldSnapshot)=>void>();
-  constructor(private readonly context:BodyContext, private readonly now:()=>number=()=>Date.now()){}
+  constructor(private readonly context:BodyContext, private readonly now:()=>number=()=>Date.now(), private readonly maxSeenEpochs=1024){
+    if(!Number.isInteger(maxSeenEpochs)||maxSeenEpochs<1) throw new Error('invalid-epoch-history-limit');
+  }
+
+  /** Bounded, insertion-ordered epoch history: old epochs are pruned so a long session cannot grow forever. */
+  private rememberEpoch(epoch:string):void{
+    if(this.seenEpochs.has(epoch)) return;
+    this.seenEpochs.add(epoch); this.epochOrder.push(epoch);
+    while(this.epochOrder.length>this.maxSeenEpochs){
+      const oldest=this.epochOrder.shift();
+      if(oldest!==undefined) this.seenEpochs.delete(oldest);
+    }
+  }
+  /** Number of epoch identifiers currently retained for superseded-epoch detection. */
+  get epochHistorySize():number{return this.seenEpochs.size;}
 
   apply(input:Observation):WorldSnapshot {
     const o = structuredClone(input);
@@ -35,7 +50,7 @@ export class WorldState {
     // Same-epoch observations must advance the sequence, including full snapshots. A stale full
     // snapshot is not a new baseline and must not roll world state backwards.
     if(!newEpoch && seq<=this.lastSequence) return this.snapshot();
-    if(newEpoch) this.seenEpochs.add(epoch);
+    if(newEpoch) this.rememberEpoch(epoch);
     if(newEpoch && !isFull) {
       this.epoch=epoch; this.lastSequence=seq;
       return this.invalidate('source-epoch-needs-baseline','all');

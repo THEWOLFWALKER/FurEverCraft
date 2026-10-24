@@ -87,6 +87,24 @@ export type DoctorReport = {
   version: 1;
   generatedAt: number;
   status: 'ok' | 'degraded' | 'unavailable';
+  /**
+   * The profile string this runtime was actually assembled from (`simulated`,
+   * `simulated-3d`, `client-offline`, ...). This is deliberately separate from
+   * `profile.id`, which is the attached body/server identity.
+   */
+  runtimeProfile: string;
+  /** The attached body/server profile id, kept separate from `runtimeProfile`. */
+  serverProfileId: string;
+  /**
+   * Attached body/server context, not the assembled Runtime profile string.
+   *
+   * `id` is `BodyContext.serverProfileId`, `source` is the attached bridge/body source,
+   * and the epoch/world/dimension fields come from the same context. For a runtime
+   * assembled with `--profile simulated-3d` they therefore stay `"simulated"`: that is
+   * the simulated body/server the runtime is attached to, not a mislabelled assembly.
+   * The assembled path is reported separately and truthfully by `body.mode`,
+   * `body.threeDimensional` and `body.source`.
+   */
   profile: {
     id: string;
     simulated: boolean;
@@ -112,12 +130,6 @@ export type DoctorReport = {
 export type DoctorOptions = { generatedAt?: number };
 
 const nowOf = (options: DoctorOptions): number => options.generatedAt ?? Date.now();
-
-const counts = (values: string[]): Record<string, number> => {
-  const result: Record<string, number> = {};
-  for (const value of values) result[value] = (result[value] ?? 0) + 1;
-  return result;
-};
 
 const providerReasonOf = (runtime: RuntimeAssembly): string | undefined => {
   // UnavailableProvider exposes the concrete fail-closed reason at runtime; prefer it over guessing.
@@ -262,9 +274,11 @@ function storeReport(runtime: RuntimeAssembly): DoctorStoreReport {
   }
   let executions = 0; let effects = 0; let goals = 0;
   try {
-    executions = runtime.store.listExecutions().length;
-    effects = runtime.store.listEffects().length;
-    goals = runtime.store.listGoals().length;
+    // COUNT(*) in SQL: reading the whole execution/effect/goal tables just to report a
+    // number both scales badly and leaks rows from other worlds/accounts.
+    executions = runtime.store.countExecutionsForScope(runtime.memoryScope);
+    effects = runtime.store.countEffectsForScope(runtime.memoryScope);
+    goals = runtime.store.countGoalsForScope(runtime.memoryScope);
   } catch (error) {
     health = 'error'; reason = reason ?? (error instanceof Error ? error.message : String(error));
   }
@@ -283,12 +297,12 @@ function storeReport(runtime: RuntimeAssembly): DoctorStoreReport {
 function recoveryReport(runtime: RuntimeAssembly): DoctorRecoveryReport {
   const session = runtime.session;
   let pendingEffects = 0;
-  let effectStatuses: string[] = [];
+  let effectStatuses: Record<string, number> = {};
   let reason: string | undefined;
   try {
-    const effects = runtime.store.listEffects();
-    effectStatuses = effects.map(effect => String(effect.status));
-    pendingEffects = runtime.store.pendingEffects().length;
+    // Aggregate in SQL rather than materialising every effect row twice per report.
+    effectStatuses = runtime.store.effectStatusCountsForScope(runtime.memoryScope);
+    pendingEffects = runtime.store.countPendingEffectsForScope(runtime.memoryScope);
   } catch (error) {
     reason = error instanceof Error ? error.message : String(error);
   }
@@ -296,7 +310,7 @@ function recoveryReport(runtime: RuntimeAssembly): DoctorRecoveryReport {
   try {
     const latest = Number(runtime.store.getLatestCriticalSequence() ?? '0');
     const from = String(Math.max(0, latest - 1000));
-    const events = runtime.store.getCriticalEvents(from, 1000) as Array<{ seq: string; kind: string; payload?: unknown }>;
+    const events = runtime.store.getCriticalEvents(from, 1000, undefined, runtime.memoryScope) as Array<{ seq: string; kind: string; payload?: unknown }>;
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const event = events[index]!;
       if (event.kind !== 'runtime.recovery_failed' && event.kind !== 'runtime.stopping' && event.kind !== 'session.failed') continue;
@@ -323,7 +337,7 @@ function recoveryReport(runtime: RuntimeAssembly): DoctorRecoveryReport {
     attempts: session.recoveryAttempts,
     budget: session.recoveryBudget,
     pendingEffects,
-    effectCounts: counts(effectStatuses),
+    effectCounts: effectStatuses,
     ...(lastFault ? { lastFault } : {}),
   };
 }
@@ -417,6 +431,10 @@ export function collectDoctorReport(runtime: RuntimeAssembly, options: DoctorOpt
     version: 1,
     generatedAt: nowOf(options),
     status,
+    runtimeProfile: runtime.runtimeProfile,
+    serverProfileId: context.serverProfileId,
+    // Body/server context summary: `id`/`source` are not the Runtime assembly profile.
+    // See the `DoctorReport.profile` comment; `body` below carries the assembled body mode.
     profile: {
       id: context.serverProfileId,
       simulated: context.serverProfileId === 'simulated',
@@ -459,6 +477,8 @@ export function unavailableDoctorReport(input: UnavailableDoctorInput): DoctorRe
     version: 1,
     generatedAt: input.generatedAt ?? Date.now(),
     status: 'unavailable',
+    runtimeProfile: input.profile,
+    serverProfileId: input.profile,
     profile: { id: input.profile, simulated: false, source: 'unavailable', dimension: 'unknown', connectionEpoch: 'unknown', bodyEpoch: 'unknown' },
     provider: { ...capability, provider: 'unknown', configured: false, transport: 'unavailable', networkEnabled: false, canonicalPath: false },
     network: { state: 'disabled', reason: 'network-gate-disabled' },

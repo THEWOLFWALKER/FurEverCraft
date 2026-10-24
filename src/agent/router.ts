@@ -3,14 +3,19 @@ import { nextId, type BodyContext } from '../contracts/index.js';
 import type { ModelMessage, ModelProvider, ToolCall } from '../providers/scripted/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
+import { sameStableScope } from '../persistence/store.js';
 import { Executor, type InputArbiter, type Progress } from '../execution/runtime.js';
-import type { AdmissionDecision, ExecutionAdmission } from '../execution/admission.js';
+import { skillRequiresInput, type AdmissionDecision, type ExecutionAdmission } from '../execution/admission.js';
 import { skillImplementations } from '../skills/skills.js';
 import { findSkill, findSkills, skillManifests } from '../skills/registry.js';
 import type { EventHub } from '../diagnostics/events.js';
 import { redactError } from '../diagnostics/redaction.js';
 import { MemoryService, createPlaceResolver, type MemoryScope } from '../autonomous/memory.js';
 import { KnowledgeService, knowledgeToolDefinitions } from '../autonomous/knowledge.js';
+import { ProviderSession } from '../providers/session.js';
+import { assertModelResponse } from '../providers/canonical.js';
+import { ProviderError } from '../providers/shared.js';
+import type { ProviderMetadata } from '../control/dto.js';
 import { getAttachedBodyAdapter, bodyStateFromObservation } from '../motor/contracts.js';
 import type { MotorFactory } from '../motor/controller.js';
 import type { SkillLifecycle } from '../skills/lifecycle.js';
@@ -101,28 +106,45 @@ export class ToolRouter {
     this.motor = extras.motor;
     this.memoryScope = extras.memoryScope ?? memoryScopeOf(bridge.context);
   }
-  /** Skills the current body can actually run, derived from capability presence rather than a hard-coded list. */
+  /** True when a stored goal belongs to the currently attached stable body scope. */
+  goalScopeMatches(goalContext: unknown): boolean { return sameStableScope(goalContext, this.currentContext()); }
+  /** Skills the current body can actually run, derived from manifest metadata and body capability rather than a hard-coded list. */
   availableSkills(): string[] {
-    const all = skillManifests.map(manifest => manifest.id as string);
     const body = getAttachedBodyAdapter(this.bridge);
-    return all.filter(id => {
-      // A 3D adapter is the body for movement/exploration/gather skills. Only the
-      // methods and capabilities it actually declares make a skill available.
-      if (body) {
-        const movement = body.capabilities.threeDimensional && body.capabilities.walk;
-        if (id === 'navigate_to' || id === 'explore_area' || id === 'return_to_place') return movement;
-        if (id === 'gather_blocks') return movement && Boolean(body.findBlock && body.digBlock);
+    const movement3d = Boolean(body && body.capabilities.threeDimensional && body.capabilities.walk);
+    // Advertising a skill the input gate would immediately reject is misleading. A router
+    // embedded without an executor has no gate to consult; runtime routers always do.
+    const inputOpen = !this.executor || this.executor.inputGateOpen();
+    return skillManifests.filter(manifest => {
+      const id = manifest.id;
+      if (skillRequiresInput(id) && !inputOpen) return false;
+      // Honor the coordinate contract: a world-3d movement skill is not executable by the
+      // planar bridge. gather_blocks/return_to_place retain explicit legacy implementations,
+      // so they are checked against their legacy capabilities below instead.
+      if (manifest.coordinateSpace === 'world-3d' && !movement3d && id !== 'gather_blocks' && id !== 'return_to_place') return false;
+      switch (id) {
+        // A 3D adapter is the body for movement/exploration/gather skills. Only the
+        // methods and capabilities it actually declares make a skill available.
+        case 'navigate_to':
+        case 'explore_area':
+          return movement3d;
+        case 'gather_blocks':
+          if (body) return movement3d && Boolean(body.findBlock && body.digBlock);
+          return Boolean(this.bridge.digBlock && this.bridge.adjacentBlock);
+        case 'return_to_place':
+          if (body) return movement3d;
+          return Boolean(this.memory || this.bridge.findPlace);
+        case 'look_at': return Boolean(this.bridge.lookAt);
+        case 'dig_one': return Boolean(this.bridge.dig);
+        case 'collect_nearby': return Boolean(this.bridge.collectNearby);
+        case 'send_chat': return Boolean(this.bridge.dispatchChat);
+        case 'place_one': return typeof this.bridge.place === 'function';
+        case 'observe_ui': return typeof this.bridge.snapshot === 'function';
+        case 'wait_for_condition': return true;
+        // An unmapped manifest cannot be proven executable; never advertise it.
+        default: return false;
       }
-      if (id === 'look_at') return Boolean(this.bridge.lookAt);
-      if (id === 'dig_one') return Boolean(this.bridge.dig);
-      if (id === 'gather_blocks') return Boolean(this.bridge.digBlock && this.bridge.adjacentBlock);
-      if (id === 'collect_nearby') return Boolean(this.bridge.collectNearby);
-      if (id === 'return_to_place') return Boolean(this.memory || this.bridge.findPlace);
-      // navigate_to requires x/y/z and is served only by the 3D adapter path.
-      if (id === 'navigate_to') return false;
-      if (id === 'send_chat') return Boolean(this.bridge.dispatchChat);
-      return true;
-    });
+    }).map(manifest => manifest.id as string);
   }
   async invoke(call: ToolCall, admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal } = {}): Promise<z.infer<typeof ToolCallResultSchema>> {
     let raw: unknown;
@@ -202,16 +224,32 @@ export class ToolRouter {
           break;
         }
         // A missing backing service must report failure, not a successful undefined.
-        case 'get_execution': if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' }; result = this.store.getExecution(String(args.executionId)); if (!result) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' }; break;
+        // Execution ids are only addressable inside the attached stable body scope. A row from
+        // another world/account is reported as not found rather than exposed or mutated.
+        case 'get_execution': {
+          if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' };
+          const found = this.store.getExecution(String(args.executionId));
+          if (!found || !sameStableScope(found.context, this.currentContext())) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' };
+          result = found; break;
+        }
         case 'read_events': if (!this.events) return { callId: call.id, name: call.name, ok: false, error: 'events-unavailable' }; result = this.events.read(String(args.cursor ?? '0'), Number(args.limit ?? 100), args.filter as string | undefined); break;
-        case 'revise_goal': if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' }; result = this.store.reviseGoal(String(args.goalId), Number(args.expectedRevision), String(args.change)); break;
+        case 'revise_goal': {
+          if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' };
+          const goal = this.store.getGoal(String(args.goalId));
+          if (!goal) return { callId: call.id, name: call.name, ok: false, error: 'goal-not-found' };
+          // Reject a foreign-scope goal instead of revising another body's goal row.
+          if (!sameStableScope(goal.context, this.currentContext())) return { callId: call.id, name: call.name, ok: false, error: `goal-scope-mismatch:${String(args.goalId)}` };
+          result = this.store.reviseGoal(String(args.goalId), Number(args.expectedRevision), String(args.change)); break;
+        }
         case 'query_memory': if (!this.memory) return { callId: call.id, name: call.name, ok: false, error: 'memory-unavailable' }; result = { scope: { ...this.memoryScope }, spatial: this.memory.querySpatial({ ...(args as { limit?: number; cursor?: string }), scope: this.memoryScope }), episodic: this.memory.queryEpisodic({ ...(args as { limit?: number; cursor?: string }), scope: this.memoryScope }) }; break;
         case 'query_knowledge_facts':
         case 'query_knowledge_sources':
         case 'query_knowledge_coverage': {
           if (!this.knowledge) return { callId: call.id, name: call.name, ok: false, error: 'knowledge-unavailable' };
           // The legacy query_knowledge path is retired: all knowledge reads use one release-backed service.
-          const knowledge = this.knowledge.invoke(call.name, args);
+          // Facts are always scoped to the attached body's runtime scope here; the model cannot
+          // request another world/account by supplying its own `scope` (the tool schema rejects it).
+          const knowledge = this.knowledge.invoke(call.name, args, { scope: this.memoryScope });
           if (!knowledge.ok) return { callId: call.id, name: call.name, ok: false, error: knowledge.error };
           result = knowledge.result;
           break;
@@ -253,7 +291,7 @@ export class ToolRouter {
         case 'cancel_execution': {
           if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' };
           const target = this.store.getExecution(String(args.executionId));
-          if (!target) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' };
+          if (!target || !sameStableScope(target.context, this.currentContext())) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' };
           this.executor?.cancel(String(args.executionId));
           result = { canceled: args.executionId, status: this.store.getExecution(String(args.executionId))?.status };
           break;
@@ -300,6 +338,14 @@ export class ToolRouter {
     // epoch change between admission and the write must reject the stale plan. Copy the object
     // because a bridge may mutate its context in place instead of replacing it.
     const admittedContext = { ...this.currentContext() };
+    // A goal id from another stable scope is not a valid admission target even if its revision
+    // matches; this closes the store-global goal read before any effect or lease exists.
+    if (admissionContext.goalId !== undefined) {
+      const goal = this.store.getGoal(admissionContext.goalId);
+      if (!goal || !sameStableScope(goal.context, this.currentContext())) {
+        return { ok: false, error: 'goal-revision-conflict', result: { code: 'goal-revision-conflict', message: goal ? `goal-scope-mismatch:${admissionContext.goalId}` : `goal-not-found:${admissionContext.goalId}` } };
+      }
+    }
     const rejected = this.checkAdmission(skill, admissionContext, admittedContext);
     if (rejected && !rejected.ok) return { ok: false, error: rejected.code, result: { code: rejected.code, message: rejected.message } };
     const effectId = sideEffect ? nextId('effect') : undefined;
@@ -392,25 +438,44 @@ export class ToolRouter {
   }
 }
 
-import { ProviderSession } from '../providers/session.js';
+export type AgentLoopOptions = {
+  canonical?: boolean;
+  providerName?: string;
+  writeTools?: Iterable<string>;
+  /** Every provider the assembly can switch between. Defaults to the single resolved provider. */
+  providers?: Record<string, ModelProvider>;
+  /** Mutable public metadata object, updated on a successful provider switch. */
+  providerMetadata?: ProviderMetadata;
+  /** Immutable metadata snapshots keyed by registry name. */
+  providerMetadataByName?: Record<string, ProviderMetadata>;
+};
 
 export class AgentLoop {
   private readonly session?: ProviderSession;
+  private readonly providerMetadata?: ProviderMetadata;
+  private readonly providerMetadataByName?: Record<string, ProviderMetadata>;
   private canonicalQueue: Promise<void> = Promise.resolve();
   private runContext: { goalId?: string; goalRevision?: number; owner?: string } = {};
   constructor(
     private readonly provider: ModelProvider,
     private readonly router: ToolRouter,
     private readonly maxTurns = 8,
-    options: { canonical?: boolean; providerName?: string; writeTools?: Iterable<string> } = {},
+    options: AgentLoopOptions = {},
   ) {
+    this.providerMetadata = options.providerMetadata;
+    this.providerMetadataByName = options.providerMetadataByName;
     // The canonical provider session is the production path when a real configured provider is
     // used. Scripted/fixture/injected providers keep the legacy loop, which is also the offline
     // test/fixture path. Both drive the same ToolRouter and tool definitions.
     if (options.canonical) {
+      const providerName = options.providerName ?? Object.keys(options.providers ?? {})[0] ?? 'provider';
+      // Register every configured/injected provider, not only the initially resolved one, so a
+      // later switch is a metadata/history operation rather than an unknown-provider error.
+      const providers = options.providers ?? { [providerName]: provider };
+      if (!providers[providerName]) throw new ProviderError(`provider-unknown:${providerName}`);
       this.session = new ProviderSession({
-        providers: { [options.providerName ?? 'provider']: provider },
-        initialProvider: options.providerName ?? 'provider',
+        providers,
+        initialProvider: providerName,
         tools: defaultTools,
         execute: (call, signal) => this.router.invoke(call, { ...this.runContext, ...(signal ? { signal } : {}) }),
         writeTools: options.writeTools ?? ['start_skill', 'send_chat', 'remember_place'],
@@ -420,17 +485,36 @@ export class AgentLoop {
   }
   get canonicalPath(): boolean { return Boolean(this.session); }
   get providerSession(): ProviderSession | undefined { return this.session; }
+  /**
+   * A goal is admissible only when it exists, its revision matches and it belongs to this
+   * runtime's current stable body scope.
+   */
+  private goalMatches(store: SQLiteStore, goalId: string, expectedRevision?: number): boolean {
+    const goal = store.getGoal(goalId);
+    if (!goal) return false;
+    if (expectedRevision !== undefined && goal.revision !== expectedRevision) return false;
+    return this.router.goalScopeMatches(goal.context);
+  }
   /** Provider switching is only available on the canonical path and only between a completed turn. */
   switchProvider(name: string): void {
     if (!this.session) throw new Error('provider-session-unavailable');
     this.session.switchProvider(name);
+    // Canonical history and the write ledger stay untouched; only provenance metadata changes.
+    const next = this.providerMetadataByName?.[name];
+    if (next && this.providerMetadata) {
+      this.providerMetadata.provider = next.provider;
+      this.providerMetadata.configured = next.configured;
+      this.providerMetadata.networkEnabled = next.networkEnabled;
+      this.providerMetadata.transport = next.transport;
+      if (next.model === undefined) delete this.providerMetadata.model;
+      else this.providerMetadata.model = next.model;
+    }
   }
 
   async run(messages: ModelMessage[], tools: ToolDefinition[] = defaultTools, signal?: AbortSignal, options: { goalId?: string; goalRevision?: number; owner?: string; store?: SQLiteStore } = {}) {
     // Goal-revision fencing happens before the provider is called on both paths.
     if (options.goalId && options.store) {
-      const goal = options.store.getGoal(options.goalId);
-      if (!goal || (options.goalRevision !== undefined && goal.revision !== options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace: [] as unknown[] };
+      if (!this.goalMatches(options.store, options.goalId, options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace: [] as unknown[] };
     }
     if (this.session) return this.runCanonical(messages, signal, options);
     const history = messages.map(message => structuredClone(message));
@@ -438,10 +522,11 @@ export class AgentLoop {
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
       if (options.goalId && options.store) {
-        const goal = options.store.getGoal(options.goalId);
-        if (!goal || (options.goalRevision !== undefined && goal.revision !== options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace };
+        if (!this.goalMatches(options.store, options.goalId, options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace };
       }
       const response = await this.provider.complete(history, tools, signal); trace.push(response);
+      // The legacy injected/fixture path applies the same non-terminal contract.
+      assertModelResponse(response);
       if (!response.toolCalls?.length) return { response, trace };
       if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
       const byId = new Map<string, Awaited<ReturnType<ToolRouter['invoke']>>>();
@@ -453,7 +538,9 @@ export class AgentLoop {
       history.push({ role: 'assistant', content: response.text ?? '', toolCalls: response.toolCalls });
       for (const call of response.toolCalls) { const result = byId.get(call.id); if (result) history.push({ role: 'tool', toolCallId: result.callId, content: JSON.stringify(result) }); }
     }
-    return { response: { stopReason: 'max-turns', text: '' }, trace };
+    // Exhausting the turn budget is not a successful terminal answer. Surface it as an error
+    // so the command layer does not record a fabricated empty success.
+    throw new ProviderError('provider-max-turns');
   }
 
   /**
@@ -481,7 +568,7 @@ export class AgentLoop {
         ...(signal ? { signal } : {}),
         ...(options.goalId ? { goalId: options.goalId } : {}),
         ...(options.goalRevision !== undefined ? { expectedRevision: options.goalRevision } : {}),
-        ...(options.store ? { getGoalRevision: (goalId: string) => options.store!.getGoal(goalId)?.revision } : {}),
+        ...(options.store ? { getGoalRevision: (goalId: string) => this.goalMatches(options.store!, goalId) ? options.store!.getGoal(goalId)?.revision : undefined } : {}),
       });
       // `turns` is the session-wide log; the trace is only this run's responses plus the final one.
       const trace = [...result.turns.slice(turnsBefore).map(turn => turn.response), result.response];

@@ -242,7 +242,7 @@ describe('P03 execution and effect boundary', () => {
     const bridge = new FakeClientBridge();
     const runtime = createRuntime({ bridge, clock: new ManualClock() });
     try {
-      runtime.store.saveGoal({ goalId: 'goal-p03', revision: 1, status: 'active', text: 'place' });
+      runtime.store.saveGoal({ goalId: 'goal-p03', revision: 1, status: 'active', text: 'place', context: bridge.context });
       const result = await runtime.router.invoke(placeCall('stale-goal'), { goalId: 'goal-p03', goalRevision: 0 });
       expect(result).toMatchObject({ ok: false, error: 'goal-revision-conflict' });
       expect(bridge.inventory).toBe(8);
@@ -277,7 +277,7 @@ describe('P03 execution and effect boundary', () => {
     const bridge = new FakeClientBridge();
     const runtime = createRuntime({ bridge, clock: new ManualClock() });
     try {
-      runtime.store.saveGoal({ goalId: 'goal-p03', revision: 1, status: 'active', text: 'place' });
+      runtime.store.saveGoal({ goalId: 'goal-p03', revision: 1, status: 'active', text: 'place', context: bridge.context });
       const result = await runtime.router.invoke(placeCall('barrier-hit'), { goalId: 'goal-p03', goalRevision: 1 });
       expect(result.ok).toBe(true);
       expect(bridge.cell(1, 0)).toBe('blocked');

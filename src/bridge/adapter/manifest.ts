@@ -253,6 +253,21 @@ function numbersEqual(observed: unknown, expected: number): boolean {
  * stays an explicit unavailable result.
  */
 export function verifyAdapterManifest(input: unknown, options: VerifyManifestOptions): ManifestVerification {
+  // Fail closed before touching any option or the filesystem: JavaScript callers can omit
+  // the argument even though the type requires it.
+  const failClosed = (code: string, path: string, message: string): ManifestVerification => ({
+    ok: false,
+    status: 'unsupported',
+    available: false,
+    checked: { artifacts: 0, dependencies: 0, capabilities: 0 },
+    issues: [{ code, severity: 'blocker', path, message }],
+  });
+  if (!options || typeof options !== 'object') {
+    return failClosed('verification-options-required', 'options', 'verification requires explicit options with rootDir and expected target');
+  }
+  if (typeof options.rootDir !== 'string' || options.rootDir.length === 0) {
+    return failClosed('verification-rootdir-required', 'rootDir', 'verification requires a non-empty rootDir');
+  }
   const parsed = AdapterManifestSchema.safeParse(input);
   const issues: ManifestIssue[] = [];
   if (!parsed.success) {

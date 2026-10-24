@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { FakeClientBridge } from '../../src/bridge/fake/index.js';
 import { EventHub } from '../../src/diagnostics/events.js';
+import { redact } from '../../src/diagnostics/redaction.js';
 import { TaskScheduler } from '../../src/autonomous/tasks.js';
 import { AuthCoordinator } from '../../src/autonomous/session.js';
 import { SkillLifecycle } from '../../src/skills/lifecycle.js';
@@ -154,11 +155,22 @@ describe('P18 scheduler and bounded auth', () => {
     expect(auth.nextCommand()).toBeUndefined();
   });
 
-  it('requires an explicit secret reference and does not echo the secret', () => {
+  it('surfaces only an explicit secret reference and redacts the actual secret value', () => {
     const auth = new AuthCoordinator([{ id: 'login', promptPattern: /password/i, response: 'secretRef', allowed: true }]);
     expect(auth.authorize('Password?')).toMatchObject({ status: 'waiting-configuration', reason: 'secret-ref-not-configured' });
     const ready = auth.authorize('Password?', { ref: 'secret://vault/mc', configured: true });
     expect(ready).toMatchObject({ status: 'ready', secretRef: 'secret://vault/mc' });
-    expect(JSON.stringify(ready)).not.toContain('super-secret-value');
+    // The coordinator accepts and returns only a reference; the prompt text is not echoed.
+    expect(JSON.stringify(ready)).not.toContain('Password?');
+
+    // Prove the redaction boundary with the real value, not a value that was never supplied.
+    const secret = 'super-secret-value';
+    const redacted = redact({
+      authorization: `Bearer ${secret}`,
+      note: `password=${secret}`,
+      password: secret,
+    });
+    expect(redacted).toEqual({ authorization: '[REDACTED]', note: 'password=[REDACTED]', password: '[REDACTED]' });
+    expect(JSON.stringify(redacted)).not.toContain(secret);
   });
 });

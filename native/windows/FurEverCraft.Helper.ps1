@@ -28,11 +28,21 @@ public static class FurEverCraftNative {
 Add-Type -TypeDefinition $source -ReferencedAssemblies System.Drawing
 $owned = New-Object 'System.Collections.Generic.HashSet[string]'
 $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+$seenOrder = New-Object 'System.Collections.Generic.Queue[string]'
+$seenLimit = 1024
 $boundPid = 0
 $boundHwnd = [IntPtr]::Zero
 $generation = -1
 $heartbeatDeadline = [DateTime]::UtcNow.AddSeconds(8)
 $script:DryRunMode = [bool]$DryRun
+function Test-Seen([string]$id) { return $seen.Contains($id) }
+function Add-Seen([string]$id) {
+  if ($seen.Add($id)) {
+    $seenOrder.Enqueue($id)
+    while ($seenOrder.Count -gt $seenLimit) { [void]$seen.Remove($seenOrder.Dequeue()) }
+  }
+}
+function Clear-Seen { $seen.Clear(); $seenOrder.Clear() }
 function Release-Owned {
   if ($script:DryRunMode) { $owned.Clear(); return }
   foreach ($key in @($owned)) { if ($key.StartsWith('key:')) { [FurEverCraftNative]::Key([UInt16]$key.Substring(4), $false) } elseif ($key -eq 'mouse:left') { [FurEverCraftNative]::Mouse(0,0,0x0004) } elseif ($key -eq 'mouse:right') { [FurEverCraftNative]::Mouse(0,0,0x0010) } elseif ($key -eq 'mouse:middle') { [FurEverCraftNative]::Mouse(0,0,0x0040) } }
@@ -65,7 +75,7 @@ while ($line = [Console]::In.ReadLine()) {
         if (-not [FurEverCraftNative]::IsWindow($candidate)) { throw 'window-not-found' }
         [uint32]$pid = 0; [void][FurEverCraftNative]::GetWindowThreadProcessId($candidate,[ref]$pid)
         if ($pid -ne [uint32]$request.pid) { throw 'window-pid-mismatch' }
-        Release-Owned; $boundHwnd=$candidate; $boundPid=[uint32]$request.pid; $heartbeatDeadline=[DateTime]::UtcNow.AddSeconds(8); $generation=-1
+        Release-Owned; Clear-Seen; $boundHwnd=$candidate; $boundPid=[uint32]$request.pid; $heartbeatDeadline=[DateTime]::UtcNow.AddSeconds(8); $generation=-1
         @{ bound=$true; pid=$boundPid; hwnd=$request.hwnd }
       }
       'getWindowState' {
@@ -83,17 +93,17 @@ while ($line = [Console]::In.ReadLine()) {
         @{accepted=$true;generation=$generation}
       }
       'moveRelative' {
-        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if($seen.Contains([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
-        if(-not $DryRun){[FurEverCraftNative]::Mouse([int]$request.dx,[int]$request.dy,0x0001)}; [void]$seen.Add([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
+        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if(Test-Seen ([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
+        if(-not $DryRun){[FurEverCraftNative]::Mouse([int]$request.dx,[int]$request.dy,0x0001)}; Add-Seen ([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
       }
       'click' {
-        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if($seen.Contains([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
+        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if(Test-Seen ([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
         $flags=switch([string]$request.button){'left'{0x0002 -bor 0x0004};'right'{0x0008 -bor 0x0010};'middle'{0x0020 -bor 0x0040};default{throw 'invalid-mouse-button'}}
-        if(-not $DryRun){$down=switch([string]$request.button){'left'{0x0002};'right'{0x0008};'middle'{0x0020};default{throw 'invalid-mouse-button'}};$up=switch([string]$request.button){'left'{0x0004};'right'{0x0010};'middle'{0x0040};default{throw 'invalid-mouse-button'}};[FurEverCraftNative]::Mouse(0,0,[uint32]$down);[FurEverCraftNative]::Mouse(0,0,[uint32]$up)}; [void]$seen.Add([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
+        if(-not $DryRun){$down=switch([string]$request.button){'left'{0x0002};'right'{0x0008};'middle'{0x0020};default{throw 'invalid-mouse-button'}};$up=switch([string]$request.button){'left'{0x0004};'right'{0x0010};'middle'{0x0040};default{throw 'invalid-mouse-button'}};[FurEverCraftNative]::Mouse(0,0,[uint32]$down);[FurEverCraftNative]::Mouse(0,0,[uint32]$up)}; Add-Seen ([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
       }
       'typeText' {
-        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if($seen.Contains([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
-        if(-not $DryRun){foreach($char in [string]$request.text){[FurEverCraftNative]::Unicode($char,$true);[FurEverCraftNative]::Unicode($char,$false)}}; [void]$seen.Add([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
+        Assert-Action $request; if([long]$request.generation -gt $generation){$generation=[long]$request.generation}; if(Test-Seen ([string]$request.commandId)){@{accepted=$true;duplicate=$true;commandId=$request.commandId};break}
+        if(-not $DryRun){foreach($char in [string]$request.text){[FurEverCraftNative]::Unicode($char,$true);[FurEverCraftNative]::Unicode($char,$false)}}; Add-Seen ([string]$request.commandId); @{accepted=$true;commandId=$request.commandId}
       }
       'captureWindow' {
         if(-not $EnableCapture){throw 'screen-capture-disabled'}

@@ -40,14 +40,17 @@ describe('V01-V04 runtime integration fixtures', () => {
       try {
         const pendingBefore = recovered.store.pendingEffects();
         // A failed place must leave a durable pending effect rather than silently disappearing.
-        expect(pendingBefore.length).toBeGreaterThan(0);
+        expect(pendingBefore).toHaveLength(1);
+        expect(pendingBefore[0]).toMatchObject({ status: 'ambiguous' });
         const recovery = recovered.session.start();
         expect(recovery.recovered).toBe(true);
-        expect(recovery.reconciled.length).toBeGreaterThan(0);
-        expect(recovery.reconciled.every(item => ['ambiguous', 'confirmed'].includes(item.status))).toBe(true);
         // The ambiguous outcome must never be upgraded to confirmed by recovery.
-        const place = recovered.store.pendingEffects().find(effect => String((effect.intent as { kind?: string })?.kind ?? '').includes('place') || effect.status !== 'confirmed');
-        if (place) expect(['ambiguous', 'confirmed']).toContain(place.status);
+        expect(recovery.reconciled).toEqual([{ effectId: pendingBefore[0]!.effectId, status: 'ambiguous' }]);
+        const effects = recovered.store.listEffects();
+        expect(effects).toHaveLength(1);
+        expect(effects[0]).toMatchObject({ status: 'ambiguous' });
+        expect(effects.some(effect => effect.status === 'confirmed')).toBe(false);
+        expect(recovered.store.getExecution(effects[0]!.executionId)).toMatchObject({ status: 'suspended', outcome: 'ambiguous' });
       } finally {
         recovered.close();
       }

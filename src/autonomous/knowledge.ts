@@ -102,6 +102,14 @@ const scopeCompatible = (ruleScope: KnowledgeScope | undefined, requested: Knowl
   if (!ruleScope) return true;
   return Object.entries(ruleScope).every(([key, value]) => value === undefined || requested[key as keyof KnowledgeScope] === value);
 };
+const validityOf = (rule: KnowledgeFact, now: number): 'current' | 'future' | 'expired' => {
+  const from = rule.validFrom === undefined ? undefined : Date.parse(rule.validFrom);
+  if (from !== undefined && (!Number.isFinite(from) || now < from)) return 'future';
+  const until = rule.validUntil === undefined ? undefined : Date.parse(rule.validUntil);
+  if (until !== undefined && (!Number.isFinite(until) || now > until)) return 'expired';
+  return 'current';
+};
+const currentAt = (rule: KnowledgeFact, now: number) => validityOf(rule, now) === 'current';
 function fail(code: string, detail?: string): never { throw new Error(detail ? `${code}:${detail}` : code); }
 
 /** Validate a release before it can become visible to any query. */
@@ -133,14 +141,30 @@ export function validateKnowledgeRelease(release: KnowledgeRelease): void {
     if (rule.sourceVersion !== source.version) fail('knowledge-source-version-mismatch', `${rule.id}:${rule.sourceVersion}!=${source.version}`);
     if (source.verified && rule.namespace !== 'rule') fail('knowledge-verified-source-namespace', rule.id);
     if (!source.verified && rule.namespace !== 'example') fail('knowledge-unverified-source-namespace', rule.id);
+    // Validity windows are wall-clock facts. Reject malformed or inverted windows at publish
+    // so no query has to guess which end is authoritative.
+    const from = validateValidityTimestamp(rule.validFrom, rule.id, 'validFrom');
+    const until = validateValidityTimestamp(rule.validUntil, rule.id, 'validUntil');
+    if (from !== undefined && until !== undefined && from > until) fail('knowledge-validity-inverted', rule.id);
   }
+}
+
+function validateValidityTimestamp(value: unknown, ruleId: string, field: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !value.trim()) fail('knowledge-validity-invalid', `${ruleId}:${field}`);
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) fail('knowledge-validity-invalid', `${ruleId}:${field}`);
+  return parsed;
 }
 
 const keyOf = (rule: KnowledgeFact) => `${rule.predicate}\u0000${rule.subject ?? ''}`;
 
-export function detectKnowledgeConflicts(rules: readonly KnowledgeFact[]): KnowledgeConflict[] {
+export function detectKnowledgeConflicts(rules: readonly KnowledgeFact[], scope?: KnowledgeScope): KnowledgeConflict[] {
+  // Scope is part of the conflict domain: facts that cannot apply to the requested body scope
+  // must not create a false conflict there.
+  const considered = scope ? rules.filter(rule => scopeCompatible(rule.scope, scope)) : rules;
   const groups = new Map<string, KnowledgeFact[]>();
-  for (const rule of rules) { const key = keyOf(rule); groups.set(key, [...(groups.get(key) ?? []), rule]); }
+  for (const rule of considered) { const key = keyOf(rule); groups.set(key, [...(groups.get(key) ?? []), rule]); }
   const conflicts: KnowledgeConflict[] = [];
   for (const group of groups.values()) {
     const values = new Map<string, { value: unknown; sourceIds: Set<string> }>();
@@ -203,13 +227,17 @@ export class KnowledgeService {
     const start = parsed.cursor === undefined ? 0 : Number(parsed.cursor);
     if (!Number.isInteger(start) || start < 0) fail('invalid-knowledge-cursor', String(parsed.cursor));
     if (start > MAX_KNOWLEDGE_CURSOR) fail('knowledge-cursor-limit', String(start));
+    const now = this.now();
     const filtered = release.rules
       .filter(rule => rule.namespace === namespace)
       .filter(rule => !parsed.predicate || rule.predicate === parsed.predicate)
       .filter(rule => !parsed.subject || rule.subject === parsed.subject)
       .filter(rule => scopeCompatible(rule.scope, parsed.scope))
+      // A query answers for the current wall clock. Expired and not-yet-valid facts are not
+      // returned as current knowledge; the release itself remains the historical record.
+      .filter(rule => currentAt(rule, now))
       .sort((a, b) => `${a.predicate}\u0000${a.subject ?? ''}\u0000${a.id}`.localeCompare(`${b.predicate}\u0000${b.subject ?? ''}\u0000${b.id}`));
-    const conflicts = detectKnowledgeConflicts(filtered);
+    const conflicts = detectKnowledgeConflicts(filtered, parsed.scope);
     const conflictKeys = new Set(conflicts.map(conflict => `${conflict.predicate}\u0000${conflict.subject ?? ''}`));
     const items: KnowledgeRuleHit[] = filtered.slice(start, start + limit).map(rule => ({ ...rule, ...(conflictKeys.has(keyOf(rule)) ? { conflict: true } : {}) }));
     const covered = !parsed.predicate || release.manifest.sources.some(source => source.covers.includes(parsed.predicate!));
@@ -256,10 +284,17 @@ export class KnowledgeService {
     };
   }
 
-  /** Small tool surface for the agent router: facts, sources and coverage. */
-  invoke(tool: 'query_knowledge' | 'query_knowledge_facts' | 'query_knowledge_sources' | 'query_knowledge_coverage', args: unknown): { ok: boolean; result?: unknown; error?: string } {
+  /**
+   * Small tool surface for the agent router: facts, sources and coverage. `scope` is injected
+   * by the runtime for fact queries; it overrides any scope present in the model arguments so
+   * a caller cannot read another world/account's scoped rules.
+   */
+  invoke(tool: 'query_knowledge' | 'query_knowledge_facts' | 'query_knowledge_sources' | 'query_knowledge_coverage', args: unknown, options: { scope?: KnowledgeScope } = {}): { ok: boolean; result?: unknown; error?: string } {
     try {
-      if (tool === 'query_knowledge' || tool === 'query_knowledge_facts') return { ok: true, result: this.query(KnowledgeQuerySchema.parse(args ?? {})) };
+      if (tool === 'query_knowledge' || tool === 'query_knowledge_facts') {
+        const parsed = KnowledgeQuerySchema.parse(args ?? {});
+        return { ok: true, result: this.query({ ...parsed, ...(options.scope ? { scope: options.scope } : {}) }) };
+      }
       if (tool === 'query_knowledge_sources') return { ok: true, result: this.sources(KnowledgeSourcesQuerySchema.parse(args ?? {}).releaseId) };
       if (tool === 'query_knowledge_coverage') return { ok: true, result: this.coverage(KnowledgeCoverageQuerySchema.parse(args ?? {}).releaseId) };
       return { ok: false, error: 'unknown-knowledge-tool' };

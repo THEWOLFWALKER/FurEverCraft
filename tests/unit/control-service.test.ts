@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRuntime } from '../../src/execution/factory.js';
 import { SQLiteStore } from '../../src/persistence/store.js';
-import { canonicalPayloadHash } from '../../src/control/service.js';
+import { canonicalPayloadHash, commandScopeOf } from '../../src/control/service.js';
 import { FakeClientBridge, type FakeBridgeOptions } from '../../src/bridge/fake/index.js';
 import type { ModelMessage, ModelProvider, ModelResponse, ToolCall } from '../../src/providers/scripted/index.js';
 import { nextId } from '../../src/contracts/index.js';
@@ -49,7 +49,7 @@ class CountingBridge extends FakeClientBridge {
 }
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
-const controlScope = 'control:simulated';
+const controlScope = commandScopeOf({ serverProfileId: 'simulated', worldGenerationId: 'world-1', connectionEpoch: '1', bodyEpoch: '1', dimension: 'overworld' });
 
 describe('U01 ControlService', () => {
   it('hashes payloads canonically and deduplicates durable requests', async () => {
@@ -81,7 +81,7 @@ describe('U01 ControlService', () => {
       expect(result).toMatchObject({ state: 'unknown', code: 'receipt-unavailable' });
       // No durable receipt means no execution: the goal write must not have happened.
       expect(runtime.store.getGoal('g-receipt')).toBeUndefined();
-      const receipt = runtime.store.getActionReceipt('control:simulated', 'receipt-unavailable');
+      const receipt = runtime.store.getActionReceipt(controlScope, 'receipt-unavailable');
       expect(receipt).toBeUndefined();
     } finally { runtime.close(); }
   });
@@ -100,7 +100,7 @@ describe('U01 ControlService', () => {
       expect(result).toMatchObject({ state: 'unknown', code: 'receipt-write-failed' });
       // The command may have taken effect; the response must not claim a durable terminal.
       expect(runtime.store.getGoal('g-commit')?.revision).toBe(1);
-      expect(runtime.store.getActionReceipt('control:simulated', 'receipt-commit-fail')?.status).toBe('pending');
+      expect(runtime.store.getActionReceipt(controlScope, 'receipt-commit-fail')?.status).toBe('pending');
     } finally { runtime.close(); }
   });
 
@@ -142,7 +142,7 @@ describe('U01 ControlService', () => {
   it('stop cancels non-terminal executions instead of only flagging', async () => {
     const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
     try {
-      runtime.store.saveExecution({ executionId: 'exec-running', proposalId: 'prop-running', proposalHash: 'h', goalId: 'g1', skillId: 'navigate_to', skillVersion: '1.0.0', status: 'running' });
+      runtime.store.saveExecution({ executionId: 'exec-running', proposalId: 'prop-running', proposalHash: 'h', goalId: 'g1', skillId: 'navigate_to', skillVersion: '1.0.0', status: 'running', context: runtime.bridge.context });
       const stopped = await runtime.control.command({ requestId: 'stop', command: 'stop', payload: {} });
       expect(stopped.state).toBe('accepted');
       expect((stopped.result as { canceled?: string[] }).canceled).toContain('exec-running');
@@ -166,14 +166,14 @@ describe('FEC-052 in-process requestId claim', () => {
       const leaked = await runtime.control.command({ ...request, payload: { text: 'different' } });
       expect(duplicates.every(result => result.state === 'accepted' && result.code === 'in-flight')).toBe(true);
       expect(leaked).toMatchObject({ state: 'accepted', code: 'in-flight' });
-      expect(runtime.store.getActionReceipt('control:simulated', 'same')?.status).toBe('pending');
+      expect(runtime.store.getActionReceipt(controlScope, 'same')?.status).toBe('pending');
 
       provider.releaseRun();
       expect((await first).state).toBe('terminal');
       expect(provider.calls).toBe(1); // exactly one admitted AgentLoop run
       const replay = await runtime.control.command(request);
       expect(replay.state).toBe('terminal');
-      expect(runtime.store.getActionReceipt('control:simulated', 'same')?.status).toBe('completed');
+      expect(runtime.store.getActionReceipt(controlScope, 'same')?.status).toBe('completed');
       expect(await runtime.control.command({ ...request, payload: { text: 'different' } })).toMatchObject({ state: 'conflict', code: 'command-payload-conflict' });
       expect(provider.calls).toBe(1);
     } finally { runtime.close(); }
@@ -308,7 +308,7 @@ describe('FEC-043/044 quit runs the runtime cleanup path', () => {
       // The store is closed: a direct query fails instead of silently succeeding.
       expect(() => runtime.store.getGoal('any')).toThrow();
       // The quit receipt and event are durable before the store closes.
-      expect(inspector.getActionReceipt('control:simulated', 'quit-1')?.status).toBe('completed');
+      expect(inspector.getActionReceipt(controlScope, 'quit-1')?.status).toBe('completed');
       const durableKinds = inspector.getCriticalEvents('0', 100).map(event => event.kind);
       expect(durableKinds).toEqual(expect.arrayContaining(['runtime.shutdown-requested', 'control.quit']));
       expect(runtime.control.status()).toMatchObject({ stopping: true, paused: true, closed: true });

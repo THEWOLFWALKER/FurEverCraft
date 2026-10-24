@@ -11,6 +11,7 @@ export type WorkerInbound =
   | { type: 'chunk'; direction: ObserverDirection; bytes: Uint8Array }
   | { type: 'stop' }
   | { type: 'reset'; direction: ObserverDirection }
+  | { type: 'reset-all' }
   | { type: 'control'; direction: ObserverDirection; event: unknown }
   | { type: 'set-compression'; direction: ObserverDirection; enabled: boolean; threshold?: number }
   | { type: 'set-phase'; direction: ObserverDirection; phase: string };
@@ -43,6 +44,10 @@ if (parentPort) {
     } else if (message.type === 'reset') {
       observer.reset(message.direction);
       postState(message.direction);
+    } else if (message.type === 'reset-all') {
+      // A global park is only cleared once both directions are re-anchored together.
+      observer.resetAll();
+      for (const direction of ['client-to-server', 'server-to-client'] as ObserverDirection[]) postState(direction);
     } else if (message.type === 'control') {
       observer.control(message.direction, message.event as ControlEvent | undefined);
       postState(message.direction);

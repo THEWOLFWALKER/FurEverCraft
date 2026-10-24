@@ -183,12 +183,17 @@ describe('P17 shared bounded request runtime', () => {
     expect(injected.requests).toHaveLength(0);
   });
 
-  it('deduplicates write fingerprints only for writes', () => {
+  it('deduplicates write fingerprints only for writes, and reset clears one run', () => {
     const ledger = new ToolExecutionLedger(new Set(['place_one']));
     ledger.record({ id: 'a', name: 'place_one', arguments: '{"x":1}' }, { ok: true });
     expect(ledger.reuse({ id: 'b', name: 'place_one', arguments: '{ "x" : 1 }' })).toEqual({ replayed: true, result: { ok: true } });
     const readLedger = new ToolExecutionLedger();
     readLedger.record({ id: 'r', name: 'get_state', arguments: '{}' }, { ok: true });
     expect(readLedger.reuse({ id: 'other', name: 'get_state', arguments: '{}' }).replayed).toBe(false);
+    // ProviderSession resets this at the start of each top-level run: the next user turn can
+    // legitimately repeat the write; durable execution records cover restarts, not this ledger.
+    ledger.reset();
+    expect(ledger.size).toBe(0);
+    expect(ledger.reuse({ id: 'c', name: 'place_one', arguments: '{"x":1}' }).replayed).toBe(false);
   });
 });

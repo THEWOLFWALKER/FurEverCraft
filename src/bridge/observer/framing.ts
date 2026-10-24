@@ -302,6 +302,9 @@ export class DirectionalFrameDecoder {
         this.markUnknown('invalid-zlib');
         return this.failure('invalid-zlib', frames);
       }
+      // Detection only: synchronous inflate has already returned by the time this runs, so
+      // it can never preempt a hostile frame. The worker host enforces the real wall-clock
+      // bound by terminating a worker that does not acknowledge the chunk in time.
       if (this.now() - started > this.budget.maxDecompressMs) {
         this.markUnknown('decompress-timeout');
         return this.failure('decompress-timeout', frames);

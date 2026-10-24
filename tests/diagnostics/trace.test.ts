@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TraceRecorder, replayTrace, exportTraceFromStore, type TraceDocument, type TraceRecord } from '../../src/diagnostics/trace.js';
+import { TraceRecorder, replayTrace, exportTraceFromStore, DEFAULT_TRACE_POLICY, type TraceDocument, type TraceRecord } from '../../src/diagnostics/trace.js';
+import { SQLiteStore } from '../../src/persistence/store.js';
 import { createRuntime } from '../../src/execution/factory.js';
 import { FakeClientBridge } from '../../src/bridge/fake/index.js';
 import { ManualClock, type BodyContext } from '../../src/contracts/index.js';
@@ -191,5 +192,125 @@ describe('P21 offline trace and replay', () => {
     const bytes = Buffer.byteLength(JSON.stringify(payloads), 'utf8');
     expect(bytes).toBeLessThanOrEqual(900);
     expect(bounded.records.length).toBeLessThan(20);
+  });
+
+  it('bounds effect export in SQL instead of materialising the whole effects table', () => {
+    const store = new SQLiteStore(':memory:');
+    const context: BodyContext = { serverProfileId: 'simulated', worldGenerationId: 'trace-export', connectionEpoch: '1', bodyEpoch: '1', dimension: 'overworld' };
+    try {
+      store.saveExecution({ executionId: 'exec-export', proposalId: 'proposal-export', proposalHash: 'h', goalId: 'g', skillId: 'place_one', skillVersion: '1.0.0', status: 'running', context });
+      for (let index = 0; index < 40; index += 1) {
+        store.addEffect({ effectId: `effect-${String(index).padStart(2, '0')}`, executionId: 'exec-export', context, status: 'prepared', intent: { kind: 'place', x: index, y: 0 } });
+      }
+      const materialized = vi.spyOn(store, 'listEffects').mockImplementation(() => { throw new Error('materialized-whole-table'); });
+      try {
+        const document = exportTraceFromStore(store, { maxEffects: 3, maxRecords: 10 });
+        expect(document.effects).toHaveLength(3);
+        expect(document.inputIntents).toHaveLength(3);
+      } finally {
+        materialized.mockRestore();
+      }
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe('trace replay applies the capture boundary policy', () => {
+  it('bounds an oversized crafted record list and reports the omission instead of materialising it', () => {
+    const records = Array.from({ length: DEFAULT_TRACE_POLICY.maxRecords + 3 }, (_, index) => record(String(index + 1)));
+    // A document cannot raise the replay bound by declaring a larger policy.
+    const document: TraceDocument = {
+      version: 1, source: 'offline-fixture', records,
+      policy: { maxRecords: 1_000_000, maxRecordBytes: 64 * 1024 * 1024, maxBytes: 1024 * 1024 * 1024, retentionMs: 0 },
+    };
+    const seen: string[] = [];
+    const result = replayTrace(document, entry => seen.push(entry.seq));
+    expect(result.records).toBe(DEFAULT_TRACE_POLICY.maxRecords);
+    expect(seen).toHaveLength(DEFAULT_TRACE_POLICY.maxRecords);
+    expect(result.replayTruncated).toBe(true);
+    expect(result.truncated).toBe(true);
+    expect(result.truncation).toMatchObject({ reasons: ['records'], omitted: { records: 3 } });
+    expect(result.bounds).toEqual({ maxRecords: DEFAULT_TRACE_POLICY.maxRecords, maxRecordBytes: DEFAULT_TRACE_POLICY.maxRecordBytes, maxBytes: DEFAULT_TRACE_POLICY.maxBytes });
+    // A bounded replay cannot claim complete continuity.
+    expect(result.contiguous).toBe(false);
+    expect(result.boundaries).toEqual({ mode: 'diagnostic-only', input: 'disabled', network: 'disabled', paidApis: 'disabled', sideEffects: 'not-resent' });
+  });
+
+  it('bounds per-record byte size even when a crafted record declares no truncation', () => {
+    const document: TraceDocument = {
+      version: 1, source: 'offline-fixture', truncated: false,
+      records: [record('1'), { ...record('2'), payload: { blob: 'x'.repeat(DEFAULT_TRACE_POLICY.maxRecordBytes * 2) } }],
+    };
+    let bounded: TraceRecord | undefined;
+    const result = replayTrace(document, { onRecord: entry => { if (entry.seq === '2') bounded = entry; } });
+    expect(result.replayTruncated).toBe(true);
+    expect(result.truncation?.reasons).toContain('record-bytes');
+    expect(bounded?.truncated).toBe(true);
+    expect(bounded?.payload).toMatchObject({ truncated: true });
+    expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThanOrEqual(DEFAULT_TRACE_POLICY.maxRecordBytes);
+  });
+
+  it('enforces the total-byte bound across records and stops cleanly', () => {
+    const records = Array.from({ length: 300 }, (_, index) => record(String(index + 1), 'fixture.large'));
+    for (let index = 0; index < records.length; index += 1) records[index]!.payload = { blob: String(index).padEnd(15_000, 'y') };
+    const result = replayTrace({ version: 1, source: 'offline-fixture', records });
+    expect(result.records).toBeLessThan(records.length);
+    expect(result.records).toBeGreaterThan(0);
+    expect(result.replayTruncated).toBe(true);
+    expect(result.truncation?.reasons).toContain('total-bytes');
+    expect(result.truncation?.omitted.records).toBe(records.length - result.records);
+    expect(result.lastSeq).toBe(String(result.records));
+  });
+
+  it('bounds effect state and gap arrays for oversized documents', () => {
+    const effects = Array.from({ length: DEFAULT_TRACE_POLICY.maxRecords + 5 }, (_, index) => ({
+      effectId: `effect-${index}`, executionId: 'exec', status: 'prepared', intent: { index }, observedAt: index,
+    }));
+    const effectResult = replayTrace({ version: 1, source: 'offline-fixture', records: [], effects });
+    expect(effectResult.effectStates).toHaveLength(DEFAULT_TRACE_POLICY.maxRecords);
+    expect(effectResult.effects.count).toBe(DEFAULT_TRACE_POLICY.maxRecords);
+    expect(effectResult.replayTruncated).toBe(true);
+    expect(effectResult.truncation).toMatchObject({ reasons: ['effects'], omitted: { effects: 5 } });
+
+    // A non-monotonic crafted stream produces at most one gap per delivered record.
+    const repeated = Array.from({ length: DEFAULT_TRACE_POLICY.maxRecords + 500 }, () => record('1'));
+    const gapResult = replayTrace({ version: 1, source: 'offline-fixture', records: repeated });
+    expect(gapResult.gaps.length).toBeLessThanOrEqual(DEFAULT_TRACE_POLICY.maxRecords);
+    expect(gapResult.gap).toBe(true);
+    expect(gapResult.replayTruncated).toBe(true);
+  });
+
+  it('rejects invalid structure with controlled errors and never throws on non-JSON payloads', () => {
+    expect(() => replayTrace({ version: 1, source: 'offline-fixture', records: [{ ...record('1'), seq: '9'.repeat(65) }] })).toThrow('invalid-trace-sequence');
+    expect(() => replayTrace({ version: 1, source: 'offline-fixture', records: [], inputIntents: [] }, { cursor: '9'.repeat(65) })).toThrow('invalid-trace-cursor');
+    expect(() => replayTrace({ version: 9, source: 'offline-fixture', records: [] } as unknown as TraceDocument)).toThrow('unsupported-trace');
+
+    const seen: TraceRecord[] = [];
+    const result = replayTrace({ version: 1, source: 'offline-fixture', records: [{ ...record('1'), payload: { big: 1n } }] }, entry => seen.push(entry));
+    expect(result.replayTruncated).toBe(true);
+    expect(result.truncation?.reasons).toContain('record-bytes');
+    expect(seen[0]?.payload).toMatchObject({ truncated: true, serialization: 'unavailable' });
+  });
+
+  it('replays a bounded crafted document without any input, network or provider side effect', () => {
+    const records = Array.from({ length: DEFAULT_TRACE_POLICY.maxRecords + 2 }, (_, index) => record(String(index + 1)));
+    const effects = Array.from({ length: 4 }, (_, index) => ({ effectId: `e-${index}`, executionId: 'x', status: 'prepared', intent: { index }, observedAt: index }));
+    const network = vi.fn();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(network as unknown as typeof fetch);
+    const recordCalls: string[] = [];
+    const effectCalls: string[] = [];
+    try {
+      const result = replayTrace({ version: 1, source: 'offline-fixture', records, effects }, {
+        onRecord: entry => recordCalls.push(entry.seq),
+        onEffectState: effect => effectCalls.push(effect.effectId),
+      });
+      expect(recordCalls).toHaveLength(result.records);
+      expect(effectCalls).toHaveLength(4);
+      expect(result.records).toBe(DEFAULT_TRACE_POLICY.maxRecords);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+    expect(network).not.toHaveBeenCalled();
   });
 });

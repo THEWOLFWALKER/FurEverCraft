@@ -1,6 +1,7 @@
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { BodyContext, WorldSnapshot } from '../contracts/index.js';
 import type { SQLiteStore } from '../persistence/store.js';
+import { sameStableScope } from '../persistence/store.js';
 import { EventHub } from '../diagnostics/events.js';
 
 const sameContext = (left: BodyContext, right: BodyContext) =>
@@ -130,13 +131,16 @@ export class SessionRuntime {
       }
       // A process crash leaves executions in an in-flight state forever: the proposal-id
       // dedupe then returns that stale "running" row on any retry. Only this recovery may
-      // settle them, and only when they are not actively driven by this process. They become
-      // suspended/ambiguous (never succeeded) so the operator or a new explicit run can act.
+      // settle them, only in this exact stable world scope (a no-effect execution carries the
+      // same stored context), and only when they are not actively driven by this process.
+      // They become suspended/ambiguous (never succeeded) so the operator or a new explicit
+      // run can act. Foreign/unscoped rows are left untouched for their own session.
       const inFlight = new Set(['queued', 'running', 'stopping', 'verifying']);
       const suspendedExecutions: string[] = [];
       for (const execution of this.store.listExecutions()) {
         const executionId = execution.executionId;
         if (!inFlight.has(String(execution.status))) continue;
+        if (!sameStableScope(execution.context, this.bridge.context)) continue;
         if (foreignExecutions.has(executionId) || this.isExecutionActive(executionId)) continue;
         const updated = this.store.updateExecutionStatus(executionId, 'suspended', 'recovered-after-restart', 'ambiguous');
         if (updated && updated.status === 'suspended') suspendedExecutions.push(executionId);
@@ -146,7 +150,7 @@ export class SessionRuntime {
       const attempts = this._attempts;
       // A completed recovery clears the consecutive-failure budget.
       this._attempts = 0;
-      this.events.publish('runtime.recovered', { executions: this.store.listExecutions().length, effects: reconciled.length, foreignEffects: foreign.length, suspendedExecutions, ownerId: this.ownerId, recoveryAttempts: attempts }, true);
+      this.events.publish('runtime.recovered', { executions: this.store.countExecutionsForScope(this.bridge.context), effects: reconciled.length, foreignEffects: foreign.length, suspendedExecutions, ownerId: this.ownerId, recoveryAttempts: attempts }, true);
       return { recovered: true, context: this.bridge.context, reconciled, suspendedExecutions, attempts, budget: this.maxRecoveryAttempts };
     } catch (error) {
       this.started = false;

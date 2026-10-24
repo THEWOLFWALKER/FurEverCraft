@@ -168,5 +168,58 @@ describe('P19 knowledge releases', () => {
   it('detects conflicts only for distinct values of the same predicate/subject', () => {
     const rules = [rule('a', 'p', 1, 's1', '1', 'rule', 'x'), rule('b', 'p', 1, 's2', '1', 'rule', 'x'), rule('c', 'p', 2, 's3', '1', 'rule', 'x')];
     expect(detectKnowledgeConflicts(rules)).toMatchObject([{ predicate: 'p', subject: 'x', sourceIds: ['s1', 's2', 's3'], values: [1, 2] }]);
+    // Scope is part of the conflict domain: a foreign-world rule cannot conflict here.
+    const scoped = [
+      { ...rule('in-scope', 'p', 1, 's1', '1', 'rule', 'x'), scope: { worldGenerationId: 'world-1' } },
+      { ...rule('foreign', 'p', 2, 's2', '1', 'rule', 'x'), scope: { worldGenerationId: 'other-world' } },
+    ];
+    expect(detectKnowledgeConflicts(scoped, { serverProfileId: 'simulated', worldGenerationId: 'world-1' })).toEqual([]);
+  });
+
+  it('injects the runtime scope for fact queries and ignores a model-chosen scope', () => {
+    const release = releaseOne();
+    release.releaseId = 'release-scoped';
+    release.manifest.sources = [source('scoped-source', 'scoped-1', true, ['scoped.predicate'])];
+    release.rules = [
+      { ...rule('global', 'scoped.predicate', 1, 'scoped-source', 'scoped-1', 'rule', 'x') },
+      { ...rule('local', 'scoped.predicate', 1, 'scoped-source', 'scoped-1', 'rule', 'x'), scope: { worldGenerationId: 'world-1' } },
+      { ...rule('foreign', 'scoped.predicate', 9, 'scoped-source', 'scoped-1', 'rule', 'x'), scope: { worldGenerationId: 'other-world' } },
+    ];
+    const knowledge = new KnowledgeService();
+    knowledge.publish(release);
+    const runtimeScope = { serverProfileId: 'simulated', worldGenerationId: 'world-1', dimensionId: 'overworld' };
+    const scoped = knowledge.invoke('query_knowledge_facts', { predicate: 'scoped.predicate' }, { scope: runtimeScope });
+    expect(scoped.ok).toBe(true);
+    expect((scoped.result as { items: Array<{ id: string }> }).items.map(item => item.id)).toEqual(['global', 'local']);
+    expect((scoped.result as { conflicts: unknown[] }).conflicts).toEqual([]);
+
+    // A scope supplied in model arguments cannot override the server-injected runtime scope.
+    const attempted = knowledge.invoke('query_knowledge_facts', { predicate: 'scoped.predicate', scope: { worldGenerationId: 'other-world' } }, { scope: runtimeScope });
+    expect((attempted.result as { items: Array<{ id: string }> }).items.map(item => item.id)).toEqual(['global', 'local']);
+  });
+
+  it('filters expired and future facts against the wall clock and rejects invalid windows', () => {
+    const now = Date.parse('2026-06-01T00:00:00.000Z');
+    const release = releaseOne();
+    release.releaseId = 'release-validity';
+    release.manifest.sources = [source('validity-source', 'validity-1', true, ['validity.predicate'])];
+    release.rules = [
+      { ...rule('unwindowed', 'validity.predicate', 1, 'validity-source', 'validity-1'), validFrom: undefined },
+      { ...rule('current', 'validity.predicate', 2, 'validity-source', 'validity-1'), validFrom: '2026-01-01T00:00:00.000Z', validUntil: '2026-12-31T00:00:00.000Z' },
+      { ...rule('expired', 'validity.predicate', 3, 'validity-source', 'validity-1'), validFrom: '2025-01-01T00:00:00.000Z', validUntil: '2026-05-31T00:00:00.000Z' },
+      { ...rule('future', 'validity.predicate', 4, 'validity-source', 'validity-1'), validFrom: '2026-07-01T00:00:00.000Z' },
+    ];
+    const knowledge = new KnowledgeService({ now: () => now });
+    knowledge.publish(release);
+    const result = knowledge.query({ predicate: 'validity.predicate' });
+    expect(result.items.map(item => item.id)).toEqual(['current', 'unwindowed']);
+    expect(result.items.some(item => item.id === 'expired' || item.id === 'future')).toBe(false);
+
+    const inverted = releaseOne();
+    inverted.rules = [{ ...rule('inverted', 'block.hardness', 1, 'wiki-fixture', 'fixture-1'), validFrom: '2026-12-01T00:00:00.000Z', validUntil: '2026-01-01T00:00:00.000Z' }];
+    expect(() => validateKnowledgeRelease(inverted)).toThrow('knowledge-validity-inverted');
+    const malformed = releaseOne();
+    malformed.rules = [{ ...rule('malformed', 'block.hardness', 1, 'wiki-fixture', 'fixture-1'), validFrom: 'not-a-date' }];
+    expect(() => validateKnowledgeRelease(malformed)).toThrow('knowledge-validity-invalid');
   });
 });

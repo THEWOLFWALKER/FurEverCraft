@@ -77,7 +77,7 @@ export type BridgeServiceStatus = {
   admissionOpen: boolean;
   controlRevoked: boolean;
   restarts: { attempts: number; max: number; lastDelayMs?: number };
-  ipc: { messages: number; bytes: number; dropped: number; controlLost: boolean; globalUnknown: boolean };
+  ipc: { messages: number; bytes: number; dropped: number; controlLost: boolean; globalUnknown: boolean; backpressured: boolean };
   shutdown: { forced: boolean; graceMs: number };
 };
 
@@ -92,6 +92,8 @@ export class BridgeService {
   private restarting?: Promise<boolean>;
   private forcedShutdown = false;
   private globalUnknown = false;
+  /** True while the IPC channel has rejected a hand-off (a throw, not a false/queued send). */
+  private transportUnavailable = false;
   /** True once the current observation-overflow episode has notified its listeners. */
   private overflowEpisodeNotified = false;
   private readonly outbox: BoundedIpcOutbox;
@@ -143,12 +145,30 @@ export class BridgeService {
     }
   }
 
-  /** Explicit control re-arm after a new, trusted observation; restart is not enough. */
-  armControl(reason = 'operator-arm'): void {
+  /**
+   * Explicit control re-arm after a new, trusted observation; restart is not enough.
+   * Arming is refused while the IPC channel is in a loss/backpressure episode: reopening
+   * admission there would silently resume control on a channel that still cannot carry
+   * control, and later drops in the same episode would not revoke again.
+   */
+  armControl(reason = 'operator-arm'): boolean {
+    // An IPC channel with our own messages still queued is backpressured even when the
+    // send itself was accepted (false = queued). Arming there would reopen admission on
+    // a channel that is not keeping up.
+    const backpressured = this.transportUnavailable
+      || (this.options.ipc !== undefined && this.outbox.queued().messages > 0);
+    if (this.globalUnknown || this.overflowEpisodeNotified || backpressured) {
+      this.log('warn', 'control-arm-refused', {
+        reason,
+        ipc: { globalUnknown: this.globalUnknown, backpressured, dropped: this.outbox.queued().dropped },
+      });
+      return false;
+    }
     this.controlRevokedValue = false;
     this.admissionOpenValue = true;
     this.log('info', 'control-armed', { reason });
     this.emitState();
+    return true;
   }
 
   /** Revoke held input and close admission without stopping forwarding. */
@@ -240,7 +260,7 @@ export class BridgeService {
       admissionOpen: this.admissionOpenValue,
       controlRevoked: this.controlRevokedValue,
       restarts: { attempts: this.restarts.length, max: this.options.maxRestarts ?? 3, ...(this.lastDelayMs === undefined ? {} : { lastDelayMs: this.lastDelayMs }) },
-      ipc: { ...this.outbox.queued(), globalUnknown: this.globalUnknown },
+      ipc: { ...this.outbox.queued(), globalUnknown: this.globalUnknown, backpressured: this.transportUnavailable },
       shutdown: { forced: this.forcedShutdown, graceMs: this.options.shutdownGraceMs ?? 3_000 },
     };
   }
@@ -272,18 +292,34 @@ export class BridgeService {
         this.dispatch({ type: 'ipc-overflow', dropped: droppedNow, controlLost: after.controlLost, globalUnknown: true });
       }
     }
-    this.flush();
+    this.flush(droppedNow === 0);
     this.dispatch(event as BridgeServiceEvent);
   }
 
-  /** Attempt to drain queued IPC without blocking. */
-  flush(): void {
+  /**
+   * Attempt to drain queued IPC without blocking.
+   *
+   * `endEpisodeOnDrain=false` is used right after a drop so one backed-up publish does not
+   * immediately declare the episode recovered. A transport throw (not a false/queued send)
+   * marks the channel unavailable; admission cannot be re-armed until a later flush hands
+   * off successfully and the queue is empty.
+   */
+  flush(endEpisodeOnDrain = true): void {
     if (!this.options.ipc) return;
     const result = this.outbox.flush(message => {
-      try { return this.options.ipc!.send(message); } catch { return false; }
+      try { return this.options.ipc!.send(message); } catch { throw new Error('ipc-transport-failed'); }
     });
+    if (result.transportError) {
+      this.transportUnavailable = true;
+      return;
+    }
+    // Every entry in this flush was handed to the channel (true = written, false = queued).
+    this.transportUnavailable = false;
     // A fully drained queue ends the overflow episode; a later overflow is a new episode.
-    if (result.queued === 0) this.overflowEpisodeNotified = false;
+    if (result.queued === 0 && endEpisodeOnDrain) {
+      this.overflowEpisodeNotified = false;
+      this.globalUnknown = false;
+    }
   }
 
   private async onRelayExit(reason: string): Promise<void> {

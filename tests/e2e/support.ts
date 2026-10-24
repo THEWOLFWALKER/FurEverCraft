@@ -141,8 +141,152 @@ export async function startServer(options: { pairingCode?: string; cliBearer?: s
   return server;
 }
 
-/** Start a second harness against an owned database and prove it exits non-zero. */
-export async function expectServerStartupFailure(db: string): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+async function waitForServeReady(child: ChildProcess, logs: HarnessLogs): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    let settled = false;
+    const finish = (error: Error | undefined, value?: Record<string, unknown>) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout?.off('data', onStdout);
+      child.off('exit', onExit);
+      if (error) reject(error); else resolve(value!);
+    };
+    const onStdout = (chunk: string) => {
+      buffer += chunk;
+      let newline: number;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let document: Record<string, unknown>;
+        try { document = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+        if (typeof document.listening === 'string') {
+          finish(undefined, document);
+          return;
+        }
+      }
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      finish(new Error(`serve exited before ready (code=${code}, signal=${signal}); stderr=${logs.stderr.trim()}`));
+    };
+    const timer = setTimeout(() => {
+      finish(new Error(`serve did not become ready within 20s; stdout=${logs.stdout.trim()} stderr=${logs.stderr.trim()}`));
+    }, 20_000);
+    child.stdout?.on('data', onStdout);
+    child.once('exit', onExit);
+  });
+}
+
+export type RunningServe = {
+  url: string;
+  dir: string;
+  db: string;
+  pairingCode?: string;
+  cliBearer?: string;
+  pid: number;
+  child: ChildProcess;
+  ready: Record<string, unknown>;
+  logs: HarnessLogs;
+  stop(): Promise<{ code: number | null; signal: NodeJS.Signals | null; timedOut: boolean }>;
+};
+
+/**
+ * Spawn the compiled public `serve` CLI, not the in-process harness. The returned record contains
+ * the parsed startup document, so a test can assert the real db path, ephemeral port and pairing
+ * mode that the CLI reported. The caller must call stop() (or rely on cleanupAll on failure).
+ */
+export async function startServe(options: { profile?: string; pairing?: boolean; pairingCode?: string; cliBearer?: string; webRoot?: string } = {}): Promise<RunningServe> {
+  const dir = mkdtempSync(join(tmpdir(), 'furevercraft-serve-e2e-'));
+  temporaryDirs.add(dir);
+  const db = join(dir, 'state.sqlite');
+  const pairing = options.pairing ?? true;
+  const pairingCode = pairing ? (options.pairingCode ?? `pair-${randomBytes(6).toString('hex')}`) : undefined;
+  // A served bearer is optional; without pairing it would otherwise force token mode and hide
+  // the explicit --no-pairing loopback-open behaviour.
+  const cliBearer = options.cliBearer ?? (pairing ? `bearer-${randomBytes(8).toString('hex')}` : undefined);
+  const child = spawn(process.execPath, [
+    cliMainPath,
+    ...(options.profile ? ['--profile', options.profile] : []),
+    'serve',
+    '--db', db,
+    '--host', '127.0.0.1',
+    '--port', '0',
+    '--web-root', options.webRoot ?? join(repoRoot, 'dist/web'),
+    ...(pairing ? ['--pairing-code', pairingCode!] : ['--no-pairing']),
+    ...(cliBearer ? ['--cli-bearer', cliBearer] : []),
+  ], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+  liveChildren.add(child);
+  const logs = collectLogs(child);
+  let ready: Record<string, unknown>;
+  try {
+    ready = await waitForServeReady(child, logs);
+  } catch (error) {
+    await stopChild(child);
+    temporaryDirs.delete(dir);
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+  const server: RunningServe = {
+    url: String(ready.listening),
+    dir,
+    db,
+    ...(pairingCode === undefined ? {} : { pairingCode }),
+    ...(cliBearer === undefined ? {} : { cliBearer }),
+    pid: child.pid!,
+    child,
+    ready,
+    logs,
+    async stop() {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        liveChildren.delete(child);
+        temporaryDirs.delete(dir);
+        rmSync(dir, { recursive: true, force: true });
+        return { code: child.exitCode, signal: child.signalCode, timedOut: false };
+      }
+      const exitedPromise = Promise.race([
+        once(child, 'exit').then(([code, signal]) => ({ code: code as number | null, signal: signal as NodeJS.Signals | null, timedOut: false })),
+        delay(10_000).then(() => ({ code: null as number | null, signal: null as NodeJS.Signals | null, timedOut: true })),
+      ]);
+      child.kill('SIGTERM');
+      const exited = await exitedPromise;
+      if (exited.timedOut) await stopChild(child);
+      else liveChildren.delete(child);
+      temporaryDirs.delete(dir);
+      rmSync(dir, { recursive: true, force: true });
+      return exited;
+    },
+  };
+  return server;
+}
+
+/**
+ * Send a control command over the loopback HTTP API authenticated with the CLI bearer. This is the
+ * same command route the attach CLI uses, and it lets a test change Runtime state while the
+ * browser's SSE connection is deliberately disconnected.
+ */export async function sendControlCommand(
+  server: RunningServer,
+  command: string,
+  payload: Record<string, unknown>,
+  expectedRevision?: number,
+): Promise<{ status: number; body: Record<string, unknown>; requestId: string }> {
+  const requestId = `e2e-http-${randomBytes(6).toString('hex')}`;
+  const response = await fetch(`${server.url}/api/v1/commands`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${server.cliBearer}` },
+    body: JSON.stringify({
+      requestId,
+      command,
+      payload,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }),
+  });
+  const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+  return { status: response.status, body, requestId };
+}
+
+/** Start a second harness against an owned database and prove it exits non-zero. */export async function expectServerStartupFailure(db: string): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
   const child = spawn(process.execPath, [
     harnessPath,
     '--db', db,
@@ -184,14 +328,26 @@ export class AttachClient {
     child.stderr?.on('data', (chunk: string) => { this.output += chunk; });
   }
 
-  static async start(url: string, token: string): Promise<AttachClient> {
-    const child = spawn(process.execPath, [cliMainPath, 'attach', '--url', url, '--token', token], {
+  static async start(url: string, token?: string, options: { pairingCode?: string; subscribe?: boolean } = {}): Promise<AttachClient> {
+    const child = spawn(process.execPath, [
+      cliMainPath,
+      'attach',
+      '--url', url,
+      ...(token ? ['--token', token] : []),
+      ...(options.pairingCode ? ['--pair-code', options.pairingCode] : []),
+      ...(options.subscribe === false ? ['--no-subscribe'] : []),
+    ], {
       cwd: repoRoot,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     liveChildren.add(child);
     const client = new AttachClient(child);
     return client;
+  }
+
+  /** Attach with a one-time pairing code, obtaining the HttpOnly session and CSRF token. */
+  static async startWithPairCode(url: string, pairingCode: string): Promise<AttachClient> {
+    return AttachClient.start(url, undefined, { pairingCode });
   }
 
   private consume(chunk: string) {
@@ -220,6 +376,9 @@ export class AttachClient {
   }
 
   get transcript(): string { return this.output; }
+
+  /** Remove responses that arrived before the test issued a command (for example a pair receipt). */
+  takeResponses(): unknown[] { return this.responses.splice(0, this.responses.length); }
 
   send(line: string) { this.child.stdin?.write(`${line}\n`); }
 

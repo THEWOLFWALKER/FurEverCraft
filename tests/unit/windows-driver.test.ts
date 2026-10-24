@@ -67,6 +67,29 @@ describe('Windows helper driver offline contract', () => {
     expect(driver.helperState()).toMatchObject({ bound: false, window: null });
   });
 
+  it('bounds completed-command suppression while keeping recent dedupe and clearing at a new bind', async () => {
+    const transport = new FakeHelperTransport(request => ({
+      requestId: request.requestId,
+      ok: true,
+      result: request.command === 'bindWindow' ? { bound: true, pid: request.pid, hwnd: request.hwnd } : { accepted: true },
+    }));
+    const driver = new WindowsHelperDriver(transport, true, () => 100, 250, false, 3);
+    await driver.bindWindow(12, '0xc');
+    for (const commandId of ['c1', 'c2', 'c3', 'c4']) await driver.moveRelative(1, 0, commandId, 2_000);
+    expect(driver.retainedCommandCount()).toBe(3);
+
+    // Recent ids still suppress a retry.
+    expect(await driver.moveRelative(1, 0, 'c4', 2_000)).toEqual({ duplicate: true });
+    expect(await driver.moveRelative(1, 0, 'c3', 2_000)).toEqual({ duplicate: true });
+    // The evicted id is treated as new instead of permanently suppressing an unrelated retry.
+    expect(await driver.moveRelative(1, 0, 'c1', 2_000)).toMatchObject({ accepted: true });
+    expect(driver.retainedCommandCount()).toBe(3);
+
+    await driver.bindWindow(12, '0xc');
+    expect(driver.retainedCommandCount()).toBe(0);
+    await driver.shutdown();
+  });
+
   it('treats screen capture as an independent gate from OS input', async () => {
     const responder = (request: { requestId: string; command: string }) => ({
       requestId: request.requestId,
@@ -93,5 +116,32 @@ describe('Windows helper driver offline contract', () => {
 
     await inputOnly.shutdown();
     await withCapture.shutdown();
+  });
+
+  it('reports the transport dry-run state as part of the effective capability state', () => {
+    const responder = (request: { requestId: string; command: string }) => ({ requestId: request.requestId, ok: true, result: {} });
+    const synthetic = new WindowsHelperDriver(new FakeHelperTransport(responder), true, () => 100, 250, true);
+    expect(synthetic.effectiveState()).toMatchObject({
+      enabled: true, captureEnabled: true, dryRun: true, nativeInput: false, screenCapture: false, windowHealth: false,
+    });
+
+    const realInputOnly = new WindowsHelperDriver(new FakeHelperTransport(responder, { dryRun: false }), true);
+    expect(realInputOnly.effectiveState()).toMatchObject({
+      enabled: true, captureEnabled: false, dryRun: false, nativeInput: true, screenCapture: false, windowHealth: true,
+    });
+
+    const realBoth = new WindowsHelperDriver(new FakeHelperTransport(responder, { dryRun: false }), true, () => 100, 250, true);
+    expect(realBoth.effectiveState()).toMatchObject({
+      enabled: true, captureEnabled: true, dryRun: false, nativeInput: true, screenCapture: true, windowHealth: true,
+    });
+
+    const disabled = new WindowsHelperDriver(new FakeHelperTransport(responder, { dryRun: false }), false, () => 100, 250, true);
+    expect(disabled.effectiveState()).toMatchObject({
+      enabled: false, captureEnabled: true, dryRun: false, nativeInput: false, screenCapture: false, windowHealth: false,
+    });
+
+    // A transport that cannot prove real execution is treated as synthetic, not as real input.
+    const unproven = new WindowsHelperDriver({ send: async request => ({ requestId: request.requestId, ok: true }), close: async () => undefined }, true);
+    expect(unproven.effectiveState()).toMatchObject({ dryRun: true, nativeInput: false, screenCapture: false, windowHealth: false });
   });
 });

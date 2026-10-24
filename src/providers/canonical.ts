@@ -1,16 +1,23 @@
 import type { CanonicalImagePart, CanonicalMessage, CanonicalToolCall, ModelMessage, ModelResponse, ToolCall } from './scripted/index.js';
-import { jsonText, parseToolArguments, ProviderError } from './shared.js';
+import { jsonText, normalizeToolArguments, parseToolArguments, ProviderError, utf8Bytes } from './shared.js';
 
 export type ProviderName = 'openai' | 'anthropic';
 
 const toolResultId = (message: ModelMessage) => message.toolCallId ?? message.toolResult?.toolCallId;
 
+/** Byte ceiling for retained canonical history (a token-budget proxy). */
+export const MAX_CANONICAL_HISTORY_BYTES = 256 * 1024;
+
 /**
  * Validate the canonical contract before either provider serializes it. The check is about
  * pairing/order, not about provider-private blocks: canonical history is the only thing a
  * provider ever sees, so switching providers cannot leak a foreign private payload.
+ *
+ * Serializers set `requireComplete`: a request must never carry an assistant tool call whose
+ * result has not been recorded. Appends use the permissive form so the assistant message can
+ * be stored before its results exist.
  */
-export function validateCanonicalHistory(messages: readonly CanonicalMessage[], provider?: string): void {
+export function validateCanonicalHistory(messages: readonly CanonicalMessage[], provider?: string, options: { requireComplete?: boolean } = {}): void {
   const calls = new Map<string, { index: number; resultSeen: boolean }>();
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index]!;
@@ -19,8 +26,8 @@ export function validateCanonicalHistory(messages: readonly CanonicalMessage[], 
         if (!call || typeof call.id !== 'string' || !call.id || typeof call.name !== 'string' || !call.name) throw new ProviderError('provider-invalid-tool-call', undefined, provider);
         if (calls.has(call.id)) throw new ProviderError(`provider-duplicate-tool-call-id:${call.id}`, undefined, provider);
         if (!Number.isInteger(index)) throw new ProviderError('provider-invalid-history', undefined, provider);
-        // The empty string is a valid JSON object only when parsed; reject obviously incomplete args.
-        parseToolArguments(call.arguments ?? '', provider);
+        // Blank arguments are normalized to `{}`; a truncated fragment is rejected.
+        parseToolArguments(normalizeToolArguments(call.arguments, provider), provider);
         calls.set(call.id, { index, resultSeen: false });
       }
     }
@@ -33,6 +40,7 @@ export function validateCanonicalHistory(messages: readonly CanonicalMessage[], 
       call.resultSeen = true;
     }
   }
+  if (options.requireComplete && !isToolHistoryComplete(messages)) throw new ProviderError('provider-incomplete-tool-history', undefined, provider);
 }
 
 /** True when the final assistant tool calls all have results. */
@@ -54,7 +62,7 @@ const textParts = (message: CanonicalMessage): unknown[] => {
 
 /** OpenAI Chat Completions serialization from canonical history. */
 export function openAIMessages(messages: ModelMessage[]): unknown[] {
-  validateCanonicalHistory(messages, 'openai');
+  validateCanonicalHistory(messages, 'openai', { requireComplete: true });
   return messages.map(message => {
     const content = message.images?.length
       ? [...textParts(message), ...message.images.map(imageToOpenAI)]
@@ -64,7 +72,7 @@ export function openAIMessages(messages: ModelMessage[]): unknown[] {
       return {
         role: 'assistant',
         content: content === '' || (Array.isArray(content) && content.length === 0) ? null : content,
-        tool_calls: message.toolCalls.map(call => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } })),
+        tool_calls: message.toolCalls.map(call => ({ id: call.id, type: 'function', function: { name: call.name, arguments: normalizeToolArguments(call.arguments, 'openai') } })),
       };
     }
     if (message.role === 'tool') {
@@ -89,7 +97,7 @@ function imageToAnthropic(image: CanonicalImagePart): unknown {
  * user message, which is the only shape Anthropic accepts for parallel tool_use blocks.
  */
 export function anthropicMessages(messages: ModelMessage[]): { system?: string; messages: unknown[] } {
-  validateCanonicalHistory(messages, 'anthropic');
+  validateCanonicalHistory(messages, 'anthropic', { requireComplete: true });
   const system = messages.filter(message => message.role === 'system').map(message => typeof message.content === 'string' ? message.content : (message.content ?? []).map(part => part.text).join('\n')).filter(Boolean).join('\n');
   const mapped: unknown[] = [];
   for (let index = 0; index < messages.length; index++) {
@@ -115,7 +123,7 @@ export function anthropicMessages(messages: ModelMessage[]): { system?: string; 
     const parts: unknown[] = [...textParts(message).map(part => ({ ...(part as object), type: 'text' as const })), ...(message.images ?? []).map(imageToAnthropic)];
     if (message.role === 'assistant' && message.toolCalls?.length) {
       // tool_use blocks are emitted in assistant order after any text, matching the response shape.
-      mapped.push({ role: 'assistant', content: [...parts, ...message.toolCalls.map(call => ({ type: 'tool_use', id: call.id, name: call.name, input: parseToolArguments(call.arguments, 'anthropic') }))] });
+      mapped.push({ role: 'assistant', content: [...parts, ...message.toolCalls.map(call => ({ type: 'tool_use', id: call.id, name: call.name, input: parseToolArguments(normalizeToolArguments(call.arguments, 'anthropic'), 'anthropic') }))] });
       continue;
     }
     if (message.role === 'assistant') { mapped.push({ role: 'assistant', content: singleText(parts) }); continue; }
@@ -133,13 +141,31 @@ export function admitToolCalls(response: Pick<ModelResponse, 'toolCalls'>, maxPa
   if (!Number.isInteger(maxParallel) || maxParallel < 1) throw new ProviderError('provider-parallel-limit');
   if (calls.length > maxParallel) throw new ProviderError('provider-parallel-limit', undefined, undefined, false);
   const ids = new Set<string>();
+  const admitted: ToolCall[] = [];
   for (const call of calls) {
-    if (!call.id || !call.name) throw new ProviderError('provider-invalid-tool-call');
+    if (!call || typeof call.id !== 'string' || !call.id || typeof call.name !== 'string' || !call.name) throw new ProviderError('provider-invalid-tool-call');
     if (ids.has(call.id)) throw new ProviderError(`provider-duplicate-tool-call-id:${call.id}`);
     ids.add(call.id);
-    parseToolArguments(call.arguments);
+    // Providers sometimes omit an empty argument object; canonical history always stores valid JSON.
+    admitted.push({ id: call.id, name: call.name, arguments: normalizeToolArguments(call.arguments) });
   }
-  return calls;
+  return admitted;
+}
+
+/**
+ * Provider-neutral response guard used by ProviderSession for injected providers too. A
+ * truncated or shape-less response must never be treated as a completed model turn.
+ */
+export function assertModelResponse(response: unknown, provider?: string): asserts response is ModelResponse {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) throw new ProviderError('provider-invalid-response', undefined, provider);
+  const candidate = response as Partial<ModelResponse>;
+  if (typeof candidate.stopReason !== 'string' || !candidate.stopReason) throw new ProviderError('provider-invalid-response', undefined, provider);
+  if (candidate.stopReason === 'length' || candidate.stopReason === 'max_tokens') throw new ProviderError(`provider-response-truncated:${candidate.stopReason}`, undefined, provider, false);
+  if (candidate.stopReason === 'unknown') throw new ProviderError('provider-response-unexpected-stop:unknown', undefined, provider, false);
+  if (candidate.toolCalls !== undefined && !Array.isArray(candidate.toolCalls)) throw new ProviderError('provider-invalid-response', undefined, provider);
+  // A tool-termination stop reason without any tool call is a malformed (not completed) turn.
+  if ((candidate.stopReason === 'tool_calls' || candidate.stopReason === 'tool_use' || candidate.stopReason === 'function_call') && !(candidate.toolCalls?.length)) throw new ProviderError('provider-invalid-response', undefined, provider);
+  if (candidate.text !== undefined && typeof candidate.text !== 'string') throw new ProviderError('provider-invalid-response', undefined, provider);
 }
 
 const stableJson = (value: unknown): string => {
@@ -154,9 +180,14 @@ export function toolFingerprint(call: ToolCall): string {
 }
 
 /**
- * Durable-in-process replay guard for one conversation. Read tools are reused by call id;
- * write tools are reused by semantic fingerprint even if the model invents a new id on a
- * retry, so a write that already executed is never executed twice.
+ * In-process replay guard for one top-level conversation turn. Read tools are reused by call
+ * id; write tools are reused by semantic fingerprint even if the model invents a new id on a
+ * retry, so a write that already executed is never executed twice inside one model turn chain.
+ *
+ * The ledger is intentionally scoped to a single ProviderSession.run: a later user turn may
+ * legitimately ask for the same write again. It is not durable. Cross-restart and cross-turn
+ * duplicate suppression is the job of the executor's durable proposal/execution records; this
+ * ledger only prevents replay of a write that this process already executed for the same turn.
  */
 export class ToolExecutionLedger {
   private readonly byId = new Map<string, unknown>();
@@ -175,6 +206,8 @@ export class ToolExecutionLedger {
     this.byId.set(call.id, result);
     if (this.isWrite(call.name)) this.writes.set(toolFingerprint(call), result);
   }
+  /** Forget every entry. Called at the start of each top-level run. */
+  reset() { this.byId.clear(); this.writes.clear(); }
   get size() { return this.byId.size; }
 }
 
@@ -200,15 +233,56 @@ export class CanonicalHistory {
   snapshot(): CanonicalMessage[] { return structuredClone(this.entries); }
   get length() { return this.entries.length; }
   validate(provider?: string) { validateCanonicalHistory(this.entries, provider); }
-  /**
-   * Drop old non-tool entries while keeping every assistant tool call and its result. This is
-   * the only safe point to trim a provider context.
-   */
-  trim(maxEntries = 200): void {
-    while (this.entries.length > maxEntries) {
-      const index = this.entries.findIndex(entry => entry.role !== 'tool' && !(entry.role === 'assistant' && entry.toolCalls?.length));
-      if (index < 0) break;
-      this.entries.splice(index, 1);
-    }
+  private byteLength(): number {
+    // Account for the actual serialized transcript (array punctuation and commas included).
+    return utf8Bytes(JSON.stringify(this.entries));
   }
+  /**
+   * Bound the transcript by entries and serialized bytes. Complete tool-turn groups
+   * (assistant call + its contiguous results) are evicted first as an indivisible unit, so an
+   * assistant call can never outlive its results (or vice versa). User/system context is only
+   * dropped when no tool-turn group remains to evict. Bytes are the token-budget proxy.
+   */
+  trim(maxEntries = 200, maxBytes = MAX_CANONICAL_HISTORY_BYTES): void {
+    const entryLimit = Math.max(0, Math.floor(maxEntries));
+    const byteLimit = Math.max(0, Math.floor(maxBytes));
+    const over = () => this.entries.length > entryLimit || this.byteLength() > byteLimit;
+    if (!over()) return;
+    const evict = (kind: 'tool-turn' | 'other' | 'system') => {
+      while (over()) {
+        const group = groupEntries(this.entries).find(candidate => candidate.kind === kind);
+        if (!group) return;
+        this.entries.splice(group.start, group.end - group.start);
+      }
+    };
+    // Tool turns are the bulk of a tool-heavy transcript, so evict them before context.
+    evict('tool-turn');
+    evict('other');
+    // A pathological system message still cannot exceed the hard cap.
+    evict('system');
+  }
+}
+
+type HistoryGroup = { start: number; end: number; kind: 'tool-turn' | 'other' | 'system' };
+
+/**
+ * Split history into evictable groups. An assistant message with tool calls and the contiguous
+ * tool results that follow it form one group; removing only part of it would corrupt pairing.
+ */
+function groupEntries(entries: readonly CanonicalMessage[]): HistoryGroup[] {
+  const groups: HistoryGroup[] = [];
+  let index = 0;
+  while (index < entries.length) {
+    const entry = entries[index]!;
+    if (entry.role === 'assistant' && entry.toolCalls?.length) {
+      let end = index + 1;
+      while (end < entries.length && entries[end]!.role === 'tool') end++;
+      groups.push({ start: index, end, kind: 'tool-turn' });
+      index = end;
+      continue;
+    }
+    groups.push({ start: index, end: index + 1, kind: entry.role === 'system' ? 'system' : 'other' });
+    index++;
+  }
+  return groups;
 }

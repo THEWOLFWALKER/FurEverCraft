@@ -1,4 +1,5 @@
 import { nextId } from '../contracts/index.js';
+import { sameStableScope } from '../persistence/store.js';
 import type { SQLiteStore } from '../persistence/store.js';
 import type { EventHub, Event } from '../diagnostics/events.js';
 import { findSkill } from '../skills/registry.js';
@@ -24,7 +25,11 @@ function hasCycle(nodes: TaskNode[]): boolean {
 }
 
 export class GoalManager {
-  constructor(private readonly store: SQLiteStore, private readonly events: EventHub) {}
+  /**
+   * `contextOf` returns the attached body context at write time, so a proposed goal is stored
+   * in the actual server/account/world/dimension scope instead of a shared literal.
+   */
+  constructor(private readonly store: SQLiteStore, private readonly events: EventHub, private readonly contextOf: () => unknown) {}
   propose(input: { goalId?: string; text: string; nodes?: TaskNode[]; priority?: number; completion?: string }) {
     const goalId = input.goalId ?? nextId('goal'); const nodes = input.nodes ?? [];
     if (nodes.length > 32) throw new Error('task-budget-exceeded');
@@ -33,10 +38,16 @@ export class GoalManager {
     if (hasCycle(nodes)) throw new Error('cyclic-task-dependencies');
     if (nodes.some(node => !findSkill(node.skill))) throw new Error('unknown-task-skill');
     const goal: GoalSpec = { goalId, text: input.text, revision: 0, nodes, priority: input.priority ?? 0, budget: { maxNodes: 32, used: 0 }, completion: input.completion };
-    this.store.saveGoal({ goalId, revision: 0, status: 'active', text: input.text, context: 'simulated' });
+    this.store.saveGoal({ goalId, revision: 0, status: 'active', text: input.text, context: this.contextOf() });
     this.events.publish('goal.proposed', goal, true); return goal;
   }
-  revise(goalId: string, expectedRevision: number, text: string) { const result = this.store.reviseGoal(goalId, expectedRevision, text); this.events.publish('goal.revised', { goalId, revision: result?.revision }, true); return result; }
+  revise(goalId: string, expectedRevision: number, text: string) {
+    const current = this.store.getGoal(goalId);
+    // A goal id is only addressable inside the scope that wrote it. Never revise another world's goal.
+    if (!current || !sameStableScope(current.context, this.contextOf())) throw new Error(current ? `goal-scope-mismatch:${goalId}` : 'goal-not-found');
+    const result = this.store.reviseGoal(goalId, expectedRevision, text);
+    this.events.publish('goal.revised', { goalId, revision: result?.revision }, true); return result;
+  }
 }
 
 export class TaskScheduler {

@@ -43,15 +43,42 @@ describe('bounded observer', () => {
     expect(observed.map(e => [e.frameSequence, e.payload.offsetStart, e.payload.offsetEnd])).toEqual([['1', '0', '3'], ['2', '3', '7']]);
   });
 
-  it('enforces the pending frame queue and gap rather than emitting unbounded', async () => {
-    const observer = createBoundedObserver({ maxQueuedFrames: 1, taskTimeoutMs: 50 });
-    const observed: any[] = [];
-    observer.subscribe(async e => { if (e.kind === 'observation') { observed.push(e); await new Promise(r => setTimeout(r, 30)); } });
-    observer.attach('client-to-server', Buffer.from([1, 1, 1, 2, 2, 2]));
-    observer.attach('client-to-server', Buffer.from([3, 3, 3]));
-    await new Promise(r => setTimeout(r, 120));
-    expect(observed.length).toBeLessThan(3);
-    expect(observer.health).not.toBe('healthy');
+  it('enforces the pending frame queue with an exact gap after delivering the retained frame', async () => {
+    const observer = createBoundedObserver({ maxQueuedFrames: 1, taskTimeoutMs: 1_000 });
+    const events: any[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    observer.subscribe(async event => { events.push(event); if (event.kind === 'observation') await gate; });
+
+    // Deliver one frame and keep its dispatch in flight: this is the delivery/retention baseline.
+    observer.attach('client-to-server', Buffer.from([1, 1]));
+    await tick();
+    const delivered = events.filter(event => event.kind === 'observation');
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ frameSequence: '1', payload: { bytes: 2, payloadBytes: 1, offsetStart: '0', offsetEnd: '2' } });
+    expect(observer.health).toBe('degraded');
+
+    // While that dispatch is in flight, the next chunk queues one frame and overflows on the
+    // following frame. The overflow is a global gap and the queued frame is dropped, not emitted.
+    observer.attach('client-to-server', Buffer.from([1, 2, 1, 3]));
+    expect(events.filter(event => event.kind === 'observation')).toHaveLength(1);
+    const gaps = events.filter(event => event.kind === 'observer_gap');
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toMatchObject({
+      kind: 'observer_gap',
+      source: 'client',
+      gap: { scope: 'global', reason: 'queue-overflow', direction: 'client-to-server', fromFrame: '3', toFrame: '3' },
+    });
+    expect(observer.health).toBe('unknown');
+    expect(observer.queued()).toEqual({ frames: 0, bytes: 0 });
+    expect(observer.state().downstream).toMatchObject({ phase: 'UNKNOWN', availability: 'unknown', stoppedReason: 'queue-overflow' });
+
+    // Once continuity is lost, later bytes are not interpreted even after the first dispatch settles.
+    observer.attach('client-to-server', Buffer.from([1, 9]));
+    release();
+    await tick();
+    expect(events.filter(event => event.kind === 'observation')).toHaveLength(1);
+    expect(events.filter(event => event.kind === 'observer_gap')).toHaveLength(1);
   });
 
   it('keeps global framing loss sticky until an explicit reset', async () => {
@@ -88,16 +115,20 @@ describe('bounded observer', () => {
     expect(observer.state().downstream).toMatchObject({ phase: 'UNKNOWN', availability: 'unknown' });
   });
 
-  it('reset clears only the selected direction and no longer reports global unknown', async () => {
+  it('reset anchors only the selected direction and keeps the global park on the other', async () => {
     const observer = createBoundedObserver({ maxQueuedFrames: 1, taskTimeoutMs: 50 });
     observer.subscribe(async () => { await new Promise(r => setTimeout(r, 20)); });
     observer.attach('client-to-server', Buffer.from([1, 1, 1, 2]));
     await new Promise(r => setTimeout(r, 60));
     expect(observer.health).toBe('unknown');
     observer.reset('client-to-server');
-    // The untouched direction has never had a phase anchor, so the observer stays degraded
-    // rather than claiming health it cannot prove.
-    expect(observer.health).toBe('degraded');
+    // A global park anchored both directions. Resetting only one must not silently resume
+    // the un-anchored direction; health remains unknown until both are reset.
+    expect(observer.health).toBe('unknown');
+    expect(observer.state().downstream).toMatchObject({ availability: 'degraded' });
+    expect(observer.state().upstream).toMatchObject({ availability: 'unknown' });
+    observer.resetAll();
+    expect(observer.state().upstream).toMatchObject({ availability: 'degraded' });
     expect(observer.state().downstream).toMatchObject({ availability: 'degraded' });
   });
 

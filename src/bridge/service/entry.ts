@@ -20,6 +20,12 @@ class RelayObserverMonitor implements ObserverMonitor {
   state(): unknown { return this.stateValue; }
   onFailure(listener: (reason: string) => void): () => void { this.failures.add(listener); return () => this.failures.delete(listener); }
 
+  /** Adopt the observer state returned by a relay recovery/stop command. */
+  applyResult(result: unknown): void {
+    const observer = (result as { observer?: unknown } | undefined)?.observer;
+    if (observer !== undefined) this.stateValue = observer;
+  }
+
   handle(message: unknown): void {
     const value = message as { type?: string; event?: string; payload?: unknown; reason?: string } | undefined;
     if (!value || value.type !== 'event') return;
@@ -50,6 +56,9 @@ class RelayObserverMonitor implements ObserverMonitor {
 export type BridgeServiceEntryConfig = {
   relay: RelayEntryConfig;
   observer?: { enabled?: boolean };
+  /** Optional profile/network labels supplied by the caller that assembled this config. */
+  profile?: string;
+  network?: string;
   shutdownGraceMs?: number;
   helloTimeoutMs?: number;
   maxRestarts?: number;
@@ -58,6 +67,8 @@ export type BridgeServiceEntryConfig = {
   backoffMaxMs?: number;
   maxIpcMessages?: number;
   maxIpcBytes?: number;
+  /** Explicit capability report; defaults are derived from the configured relay target. */
+  capabilities?: { profile?: string; network?: string };
 };
 
 export type ServiceIpc = {
@@ -79,12 +90,31 @@ export type ServiceCommandReply =
   | { kind: 'stop-observer' };
 
 /**
+ * Real capability report for the configured service. Target/network come from the relay
+ * configuration actually handed to this child; profile is reported only when the caller
+ * supplied it (`unspecified` otherwise, never a guessed profile).
+ */
+export function describeBridgeServiceCapabilities(config: BridgeServiceEntryConfig, observerState: unknown) {
+  const relay = config.relay;
+  const profile = config.capabilities?.profile ?? config.profile ?? 'unspecified';
+  const network = config.capabilities?.network ?? config.network
+    ?? (relay.allowMinecraftUpstream ? 'upstream-explicit' : 'disabled');
+  return {
+    profile,
+    network,
+    target: { host: relay.targetHost, port: relay.targetPort, source: 'configured-target' },
+    upstream: { enabled: relay.allowMinecraftUpstream === true, rewriteHandshake: relay.rewriteHandshake === true },
+    observer: observerState,
+  };
+}
+
+/**
  * Resolve one IPC request against the owning service. Session epoch is checked here so
  * every command (including arm) is fenced to the owner that was handed the epoch.
  */
 export function serviceCommandReply(
   request: IpcRequest,
-  context: { sessionEpoch: string; service: BridgeService; observer?: ObserverMonitor },
+  context: { sessionEpoch: string; service: BridgeService; observer?: ObserverMonitor; config?: BridgeServiceEntryConfig },
 ): ServiceCommandReply {
   if (request.sessionEpoch !== context.sessionEpoch) {
     return { kind: 'reply', ok: false, error: { code: 'stale-session', message: 'session epoch mismatch' } };
@@ -93,17 +123,30 @@ export function serviceCommandReply(
     case 'status':
       return { kind: 'reply', ok: true, result: { sessionEpoch: context.sessionEpoch, ...context.service.status(), observer: context.observer?.state() ?? null } };
     case 'capabilities':
-      return { kind: 'reply', ok: true, result: { profile: 'client-offline', network: 'disabled', observer: context.observer?.state() ?? null } };
+      return {
+        kind: 'reply', ok: true,
+        result: context.config
+          ? describeBridgeServiceCapabilities(context.config, context.observer?.state() ?? null)
+          : { profile: 'unspecified', network: 'disabled', target: null, observer: context.observer?.state() ?? null },
+      };
     case 'shutdown':
       return { kind: 'shutdown' };
     case 'start-observer':
+      if (context.observer === undefined) {
+        return { kind: 'reply', ok: false, error: { code: 'command-unsupported', message: 'observer is not configured for this service' } };
+      }
       return { kind: 'start-observer' };
     case 'stop-observer':
+      if (context.observer === undefined) {
+        return { kind: 'reply', ok: false, error: { code: 'command-unsupported', message: 'observer is not configured for this service' } };
+      }
       return { kind: 'stop-observer' };
     case 'arm': {
-      context.service.armControl('operator-ipc-arm');
+      const armed = context.service.armControl('operator-ipc-arm');
       const status = context.service.status();
-      return { kind: 'reply', ok: true, result: { armed: status.admissionOpen, controlRevoked: status.controlRevoked, status } };
+      return armed
+        ? { kind: 'reply', ok: true, result: { armed: true, controlRevoked: status.controlRevoked, status } }
+        : { kind: 'reply', ok: false, result: { armed: false, controlRevoked: status.controlRevoked, status }, error: { code: 'control-arm-refused', message: 'control cannot be armed while IPC loss/backpressure is unresolved' } };
     }
     case 'observe':
       return {
@@ -172,19 +215,26 @@ export async function runBridgeServiceEntry(
     // A hello/response/event from the parent is not a command; ignore non-requests.
     if (!parsed.success) return;
     const request = parsed.data;
-    const reply = serviceCommandReply(request, { sessionEpoch, service, ...(observer === undefined ? {} : { observer }) });
+    const reply = serviceCommandReply(request, { sessionEpoch, service, ...(observer === undefined ? {} : { observer }), config });
     if (reply.kind === 'shutdown') {
       respond(request, true, { stopped: true });
       void stop('shutdown').then(() => { if (typeof process.send === 'function') process.exit(0); });
       return;
     }
     if (reply.kind === 'start-observer') {
-      observer?.start();
-      respond(request, true, { observer: observer?.state() ?? null });
+      // Forward recovery to the owning relay child. A local no-op success would leave a
+      // globally parked/overflowed observer unrecoverable while reporting success.
+      void relay.request('start-observer').then(
+        result => { observer?.applyResult(result); respond(request, true, result); },
+        error => respond(request, false, undefined, { code: 'observer-recovery-failed', message: errorText(error) }),
+      );
       return;
     }
     if (reply.kind === 'stop-observer') {
-      void observer?.stop().then(() => respond(request, true, { observer: observer?.state() ?? null }));
+      void relay.request('stop-observer').then(
+        result => { observer?.applyResult(result); respond(request, true, result); },
+        error => respond(request, false, undefined, { code: 'observer-stop-failed', message: errorText(error) }),
+      );
       return;
     }
     respond(request, reply.ok, reply.result, reply.error);
@@ -192,19 +242,29 @@ export async function runBridgeServiceEntry(
 
   const onDisconnect = () => { void stop('parent-disconnect'); };
 
-  ipc.send({ type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch, bootEpoch, capabilities: ['control', 'observe', 'relay', 'observer'] });
   ipc.on('message', onMessage);
   ipc.on('disconnect', onDisconnect);
 
   try {
     await service.start();
   } catch (error) {
-    log('error', 'service-entry-start-failed', { error: error instanceof Error ? error.message : String(error) });
+    log('error', 'service-entry-start-failed', { error: errorText(error) });
     service.emit({ type: 'fatal', reason: 'service-entry-start-failed' }, true);
+    // Never advertise a service that never reached running/degraded. Do not send hello:
+    // the parent's waitForHello must fail so the command exits non-zero instead of
+    // reporting an optimistic result. Then release the relay child and exit non-zero.
+    await stop('start-failed').catch(() => undefined);
     process.exitCode = 1;
+    throw error;
   }
+  // Advertise the session only after the service actually reached running/degraded.
+  ipc.send({ type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch, bootEpoch, capabilities: ['control', 'observe', 'relay', 'observer'] });
 
   return { sessionEpoch, service, stop };
+}
+
+function errorText(error: unknown): string {
+  return redact(error instanceof Error ? error.message : String(error)) as string;
 }
 
 if (process.send && process.env.FUREVERCRAFT_SERVICE_CONFIG) {

@@ -21,7 +21,24 @@ jobs:
       - run: npm run doctor -- --profile simulated
       - run: npm run bridge:protocol -- --config configs/simulated.json
       - run: npm run cli -- bridge --mode inspect --config configs/client-offline.example.json
-      - run: npm run test:web
+      # Static web check only (typecheck + production bundle); the behavioral browser run is
+      # the separate browser-e2e job below via `npm run test:web:e2e`.
+      - run: npm run check:web
+  browser-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Install the exact Chromium build Playwright expects; a missing browser fails the job.
+      - run: npx playwright install --with-deps chromium
+      # Behavioral browser E2E: builds dist and the web bundle, starts isolated local servers on
+      # temp SQLite paths and drives headless Chromium. Screenshots/video/trace stay off, and any
+      # server, assertion or cleanup failure exits non-zero.
+      - run: npm run test:web:e2e
   windows-static:
     runs-on: windows-latest
     steps:

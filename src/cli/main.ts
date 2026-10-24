@@ -1,45 +1,91 @@
 import { Command } from 'commander';
+import Database from 'better-sqlite3';
 import { FakeClientBridge } from '../bridge/fake/index.js';
 import { navigate } from '../skills/navigation.js';
 import { SQLiteStore } from '../persistence/store.js';
 import { SessionRuntime } from '../execution/session.js';
+import { RuntimeOwnershipLock } from '../execution/ownership.js';
 import { placeOne, sendChat, navigateTo } from '../skills/skills.js';
 import { ProtocolSession, OfflineProtocolBridge, LoopbackFixtureTransport, minecraftDataSummary } from '../bridge/protocol/session.js';
 import { createRawTcpRelay } from '../bridge/relay/raw.js';
 import net from 'node:net';
 import { createRuntime } from '../execution/factory.js';
 import { redact } from '../diagnostics/redaction.js';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
 import { getGameVersionProfile, versionProfileSummary } from '../bridge/version-profile.js';
-import { createControlServer } from '../server/index.js';
+import { createControlServer, generatePairingCode } from '../server/index.js';
 import { replayTrace, exportTraceFromStore } from '../diagnostics/trace.js';
 import { collectDoctorReport, unavailableDoctorReport, type DoctorReport } from '../diagnostics/doctor.js';
-import { ProcessSupervisor } from '../bridge/supervisor.js';
+import { ProcessSupervisor, type ChildProcessLike } from '../bridge/supervisor.js';
 import { spawnBridgeServiceProcess } from '../bridge/service/spawn.js';
 import type { BridgeServiceEntryConfig } from '../bridge/service/entry.js';
 import { loadProfileConfig, type ProfileConfig } from '../config/profile.js';
+
+/** A utility command must never race the owner of the same SQLite path. */
+function ownershipFailure(db: string, error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith('runtime-control-owned')) throw new Error(`runtime-control-owned:${db}`);
+  throw error;
+}
+
+function acquireUtilityOwnership(db: string): RuntimeOwnershipLock {
+  const ownership = new RuntimeOwnershipLock(db);
+  try { ownership.acquire(); } catch (error) { ownershipFailure(db, error); }
+  return ownership;
+}
+
+/** Direct utility reads/writes require a persistent database; an ephemeral view is never faked. */
+function utilityDatabasePath(db: string | undefined): string {
+  if (!db || db === ':memory:') throw new Error('runtime-database-required');
+  return db;
+}
+
+function withReadOnlyDatabase<T>(db: string | undefined, fn: (database: Database.Database) => T): T {
+  const path = utilityDatabasePath(db);
+  if (!existsSync(path)) throw new Error(`runtime-database-not-found:${path}`);
+  // Take the same cross-process ownership lock as the serving Runtime. If another process owns
+  // the store, fail closed instead of reading a database another Runtime is writing.
+  const ownership = acquireUtilityOwnership(path);
+  let database: Database.Database | undefined;
+  try {
+    database = new Database(path, { readonly: true, fileMustExist: true });
+    return fn(database);
+  } finally {
+    try { database?.close(); } finally { ownership.release(); }
+  }
+}
 
 export async function runDemo(db = process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent-phase2-demo.sqlite', scenario?: string) {
   const names = ['autonomous','obstruction','human-steering','chat-ui','crash-recovery','bridge-fixture'] as const;
   if (scenario && !names.includes(scenario as typeof names[number])) throw new Error(`unknown-scenario:${scenario}`);
   const selected = scenario ? [scenario as typeof names[number]] : [...names];
-  // Each scenario gets a freshly created database so repeated runs are deterministic.
-  const results = selected.map((name, index) => {
-    const scenarioDb = `${db}.${index}`;
-    for (const suffix of ['', '-wal', '-shm']) { try { rmSync(`${scenarioDb}${suffix}`, { force: true }); } catch { /* best effort */ } }
-    return runScenario(name, scenarioDb);
-  });
-  console.log(JSON.stringify(redact({ simulated: true, scenarios: results, summary: { count: results.length, names: results.map(r => r.scenario) } })));
+  // The demo mutates SQLite, so it must be the single owner of its database path too.
+  if (db !== ':memory:') mkdirSync(dirname(db), { recursive: true });
+  const ownership = db === ':memory:' ? undefined : acquireUtilityOwnership(db);
+  try {
+    // Each scenario gets a freshly created database so repeated runs are deterministic.
+    const results = selected.map((name, index) => runScenario(name, `${db}.${index}`));
+    const document = { simulated: true, scenarios: results, summary: { count: results.length, names: results.map(r => r.scenario) } };
+    console.log(JSON.stringify(redact(document)));
+    return document;
+  } finally {
+    ownership?.release();
+  }
 }
 
 type ScenarioName = 'autonomous'|'obstruction'|'human-steering'|'chat-ui'|'crash-recovery'|'bridge-fixture';
 function runScenario(scenario: ScenarioName, db: string) {
-  const store = new SQLiteStore(db); const bridge = new FakeClientBridge(); const runtime = new SessionRuntime(bridge, store); runtime.start();
+  if (db !== ':memory:') mkdirSync(dirname(db), { recursive: true });
+  const ownership = db === ':memory:' ? undefined : acquireUtilityOwnership(db);
+  let store: SQLiteStore | undefined;
   try {
+    // Only delete a scenario database after proving this process owns it; an owner that lost
+    // the lock race must never have its files removed out from under it.
+    for (const suffix of ['', '-wal', '-shm']) { try { rmSync(`${db}${suffix}`, { force: true }); } catch { /* best effort */ } }
+    store = new SQLiteStore(db); const bridge = new FakeClientBridge(); const runtime = new SessionRuntime(bridge, store); runtime.start();
     if (scenario === 'autonomous') { const first = navigate(bridge, {x:2,y:0}); store.saveGoal({goalId:'goal_autonomous',revision:1,status:'active',text:'autonomous navigation'}); const next = navigate(bridge,{x:3,y:0}); const completed = first.status === 'succeeded' && next.status === 'succeeded'; if (completed) store.saveGoal({goalId:'goal_autonomous',revision:2,status:'completed',text:'autonomous navigation'}); return {scenario,outcome:completed?'completed':'failed',phases:['observe','navigate','milestone','next-task'],executionIds:[first.executionId,next.executionId],goal:store.getGoal('goal_autonomous')?.status,position:bridge.position}; }
     if (scenario === 'obstruction') { bridge.block(1,0); bridge.setUnknown(1,1); const result=navigate(bridge,{x:3,y:1},2); return {scenario,outcome:result.status,dynamicObstacle:true,unknownCell:true,replanned:result.path.length>0,budget:2,pathLength:result.path.length}; }
     if (scenario === 'human-steering') { const old=navigate(bridge,{x:4,y:0}); const revised=navigate(bridge,{x:0,y:2}); return {scenario,outcome:revised.status,oldExecution:old.executionId,oldResult:'superseded',steering:'target-revised',position:bridge.position}; }
@@ -50,13 +96,108 @@ function runScenario(scenario: ScenarioName, db: string) {
       store.saveExecution({ executionId: 'execution_demo', proposalId: 'proposal_demo', proposalHash: 'demo', goalId: 'goal_demo', skillId: 'place_one', skillVersion: '1.0.0', status: 'running' });
       bridge.position = { x: 1, y: 0 };
       store.addEffect({ effectId: 'effect_demo', executionId: 'execution_demo', context: bridge.context, status: 'may-have-dispatched', intent: { kind: 'place', x: 2, y: 0 } });
-      const before = store.pendingEffects().length; store.close();
+      const before = store.pendingEffects().length; store.close(); store = undefined;
       const reopened = new SQLiteStore(db); const restored = new SessionRuntime(new FakeClientBridge(), reopened).recover();
       const after = reopened.pendingEffects().length; reopened.close();
       return { scenario, outcome: 'reconciled', pendingBefore: before, pendingAfter: after, reconciled: restored.reconciled };
     }
     const protocol=new ProtocolSession('fixture-session'); const observations:unknown[]=[]; const unsubscribe=protocol.subscribe(o=>observations.push(o)); protocol.transition('LOGIN'); protocol.transition('CONFIGURATION'); protocol.transition('PLAY'); protocol.observe('position','downstream',{x:1,y:0}); protocol.close(); unsubscribe(); return {scenario,outcome:'fixture-complete',phase:protocol.phase,observations:observations.length,syntheticCapture:true,input:'fake-transport',disconnectCleanup:true};
-  } finally { if (scenario !== 'crash-recovery') store.close(); }
+  } finally {
+    if (store) store.close();
+    ownership?.release();
+  }
+}
+
+export type CliGoalView = Record<string, unknown> & { goal_id?: string; revision?: number; status?: string; context?: unknown; spec?: unknown };
+export type CliExecutionView = Record<string, unknown> & { executionId?: string; status?: string };
+export type CliDurableEvent = { seq: string; eventId: string; kind: string; durable: true; context: unknown; payload: unknown };
+
+const parseJson = (value: unknown): unknown => JSON.parse(String(value));
+const goalView = (row: Record<string, any>): CliGoalView => ({ ...row, context: parseJson(row.body_context), spec: parseJson(row.spec_json) });
+const executionView = (row: Record<string, any>): CliExecutionView => ({
+  executionId: row.execution_id,
+  proposalId: row.proposal_id,
+  proposalHash: row.proposal_hash,
+  goalId: row.goal_id,
+  skillId: row.skill_id,
+  skillVersion: row.skill_version,
+  status: row.status,
+  reason: row.reason ?? undefined,
+  outcome: row.outcome ?? undefined,
+  checkpoint: row.checkpoint_json ? parseJson(row.checkpoint_json) : undefined,
+  context: row.context ? parseJson(row.context) : undefined,
+  execution_id: row.execution_id,
+  proposal_id: row.proposal_id,
+  proposal_hash: row.proposal_hash,
+  goal_id: row.goal_id,
+  skill_id: row.skill_id,
+  skill_version: row.skill_version,
+});
+
+/**
+ * Read-only status view over the durable SQLite state. This is deliberately not a simulated
+ * Runtime view: a CLI reader cannot observe the serving Runtime's in-memory session, so the
+ * output says so instead of inventing one. It fails closed while another owner holds the lock.
+ */
+export function runStatusCommand(options: { db?: string }) {
+  return withReadOnlyDatabase(options.db, database => {
+    const goals = (database.prepare('SELECT * FROM goals ORDER BY goal_id').all() as Array<Record<string, any>>).map(goalView);
+    const executions = (database.prepare('SELECT * FROM executions ORDER BY execution_id').all() as Array<Record<string, any>>).map(executionView);
+    return {
+      source: 'sqlite' as const,
+      mode: 'read-only' as const,
+      liveSession: false as const,
+      database: String(options.db),
+      state: goals.some(goal => goal.status === 'active') ? 'active' : 'idle',
+      goals,
+      executions,
+    };
+  });
+}
+
+/** Read-only durable-event view; live in-memory events are intentionally not fabricated. */
+export function runEventsCommand(options: { db?: string; cursor?: string; limit?: number }) {
+  const cursor = options.cursor ?? '0';
+  const limit = options.limit ?? 100;
+  if (!/^\d+$/.test(cursor)) throw new Error('invalid-event-cursor');
+  if (!Number.isInteger(limit) || limit < 1 || limit > 10000) throw new Error('invalid-event-limit');
+  return withReadOnlyDatabase(options.db, database => {
+    const rows = database.prepare(`SELECT * FROM critical_events WHERE CAST(event_seq AS INTEGER)>CAST(? AS INTEGER)
+      ORDER BY CAST(event_seq AS INTEGER) LIMIT CAST(? AS INTEGER)`).all(cursor, limit) as Array<Record<string, any>>;
+    const events: CliDurableEvent[] = rows.map(row => ({
+      seq: String(row.event_seq), eventId: String(row.event_id), kind: String(row.kind), durable: true as const,
+      context: parseJson(row.context), payload: parseJson(row.payload_json),
+    }));
+    const first = database.prepare('SELECT event_seq FROM critical_events ORDER BY CAST(event_seq AS INTEGER) LIMIT 1').get() as { event_seq?: string } | undefined;
+    const availableFrom = String(first?.event_seq ?? cursor);
+    const firstSeq = /^\d+$/.test(availableFrom) ? BigInt(availableFrom) : BigInt(cursor);
+    return {
+      source: 'sqlite' as const,
+      mode: 'read-only' as const,
+      liveSession: false as const,
+      retainedLiveEvents: false as const,
+      database: String(options.db),
+      events,
+      gap: firstSeq > BigInt(cursor) + 1n,
+      next: events.at(-1)?.seq ?? cursor,
+      availableFrom,
+    };
+  });
+}
+
+/** Mutating utility command: own the database for the whole revision, then release it. */
+export function runGoalReviseCommand(options: { db?: string; id: string; revision: number; change: string }) {
+  const path = utilityDatabasePath(options.db);
+  if (!Number.isInteger(options.revision) || options.revision < 0) throw new Error('invalid-goal-revision');
+  mkdirSync(dirname(path), { recursive: true });
+  const ownership = acquireUtilityOwnership(path);
+  let store: SQLiteStore | undefined;
+  try {
+    store = new SQLiteStore(path);
+    return store.reviseGoal(options.id, options.revision, options.change);
+  } finally {
+    try { store?.close(); } finally { ownership.release(); }
+  }
 }
 
 type CliIo = { input?: NodeJS.ReadableStream; output?: NodeJS.WritableStream };
@@ -239,12 +380,10 @@ export async function runAttach(url: string, io: CliIo = {}, options: AttachOpti
     };
     if (paths[verb] && !subverb) { printJson(output, (await request('GET', paths[verb]!)).body); return {}; }
     if (verb === 'doctor') {
-      // Compose the serving Runtime's real capability/status/provider views rather than
-      // printing a static answer. A full doctor report requires the Runtime itself.
-      const [capabilities, status, provider] = await Promise.all([
-        request('GET', '/api/v1/capabilities'), request('GET', '/api/v1/status'), request('GET', '/api/v1/provider'),
-      ]);
-      printJson(output, { capabilities: capabilities.body, status: status.body, provider: provider.body });
+      // The serving Runtime owns the authoritative P21 report. Fetch it through the same
+      // authenticated surface instead of composing a reduced local view that omits
+      // ownership/recovery/store evidence. The server already redacts; printJson redacts again.
+      printJson(output, (await request('GET', '/api/v1/doctor')).body);
       return {};
     }
     if (verb === 'effects') {
@@ -312,30 +451,185 @@ async function listenServer(server: import('fastify').FastifyInstance, host: str
   await server.listen({ port, host });
   const address = server.server.address(); if (!address || typeof address === 'string') throw new Error('server-address-unavailable'); return `http://${host}:${address.port}`;
 }
-export async function runServe(options: { db?: string; host?: string; port?: string; profile?: string; config?: string; pairing?: boolean; pairingCode?: string; cliBearer?: string; webRoot?: string; allowedOrigin?: string }) {
+
+export type ServePairingResolution = { pairingCode?: string; generated: boolean };
+
+/**
+ * Resolve the pairing code before a serving Runtime takes the storage lock. A generated code is
+ * only usable when it can be shown to the owning terminal; non-interactive stdout therefore
+ * requires an explicit code instead of silently starting an unpaired, unreachable daemon.
+ */
+export function resolveServePairingCode(input: { pairing: boolean; explicit?: string; isTty: boolean; generate?: () => string }): ServePairingResolution {
+  if (!input.pairing) return { generated: false };
+  if (input.explicit !== undefined) {
+    if (!input.explicit.trim()) throw new Error('pairing-code-invalid');
+    return { pairingCode: input.explicit, generated: false };
+  }
+  if (!input.isTty) throw new Error('pairing-code-required:non-tty');
+  return { pairingCode: (input.generate ?? generatePairingCode)(), generated: true };
+}
+
+export type ServeProviderReport = {
+  requested: 'openai' | 'anthropic';
+  model?: string;
+  baseUrl?: string;
+  configured: boolean;
+  networkEnabled: boolean;
+  transport: string;
+};
+
+export type ServeStartupFields = {
+  url: string;
+  profile: string;
+  db: string;
+  pairing: boolean;
+  cliBearer?: string;
+  webRoot?: string;
+  config?: { path: string; profile: string | null; allowModelNetwork: boolean };
+  provider?: ServeProviderReport;
+};
+
+/** Startup JSON. A generated pairing code is disclosed only to an interactive TTY. */
+export function buildServeStartupDocument(fields: ServeStartupFields, options: { generatedPairingCode?: string; isTty: boolean }): string {
+  const emitGeneratedCode = Boolean(options.generatedPairingCode) && options.isTty;
+  const document = {
+    listening: fields.url,
+    profile: fields.profile,
+    db: fields.db,
+    pairing: fields.pairing,
+    ...(emitGeneratedCode ? { pairingCode: options.generatedPairingCode } : {}),
+    cliAccess: fields.cliBearer ? 'bearer-configured' : fields.pairing ? 'pair-with-code' : 'loopback-open',
+    webRoot: fields.webRoot ?? './dist/web',
+    ...(fields.config ? { config: fields.config } : {}),
+    ...(fields.provider ? { provider: fields.provider } : {}),
+  };
+  const redacted = redact(document) as Record<string, unknown>;
+  // `pairingCode` is a redaction key by design; restore only the intentional TTY disclosure.
+  if (emitGeneratedCode) redacted.pairingCode = options.generatedPairingCode;
+  return JSON.stringify(redacted);
+}
+
+export type ServeCommandOptions = {
+  db?: string;
+  host?: string;
+  port?: string;
+  profile?: string;
+  config?: string;
+  pairing?: boolean;
+  pairingCode?: string;
+  cliBearer?: string;
+  webRoot?: string;
+  allowedOrigin?: string;
+  /**
+   * Explicit model provider selection. Only meaningful together with a serve config that
+   * sets `allowModelNetwork: true`; without one the gate cannot be honored and serve fails
+   * instead of silently starting the scripted provider.
+   */
+  provider?: string;
+  model?: string;
+  baseUrl?: string;
+  apiKey?: string;
+};
+
+export async function runServe(options: ServeCommandOptions) {
   // A serve config is strict: keys the serving runtime cannot honor (relay target, upstream
   // gate, helper) fail instead of being accepted and ignored.
   const profileConfig = options.config ? loadProfileConfig(resolve(options.config), 'serve') : undefined;
   const db = options.db ?? process.env.MINECRAFT_AGENT_DB ?? '/tmp/minecraft-agent.sqlite';
   const profile = options.profile ?? profileConfig?.profile ?? 'simulated';
+  const host = options.host ?? '127.0.0.1';
+  const pairing = options.pairing ?? true;
+  const explicitPairingCode = options.pairingCode ?? process.env.MINECRAFT_AGENT_PAIRING_CODE;
+  const isTty = process.stdout.isTTY === true;
+  // `allowModelNetwork` is only truthful when a concrete provider is selected. Reject both
+  // an open gate with no provider (it would silently stay scripted) and a provider selection
+  // while the gate is closed (it could never reach the network).
+  const requestedProvider = options.provider;
+  if (requestedProvider !== undefined && requestedProvider !== 'openai' && requestedProvider !== 'anthropic') {
+    throw new Error(`config-invalid:provider:${requestedProvider}`);
+  }
+  const allowModelNetwork = profileConfig?.allowModelNetwork === true;
+  if (requestedProvider !== undefined && !allowModelNetwork) throw new Error('model-network-gate-disabled');
+  if (requestedProvider === undefined && allowModelNetwork) throw new Error('model-provider-required');
+  const apiKey = options.apiKey ?? process.env.MINECRAFT_AGENT_MODEL_API_KEY;
+  if (requestedProvider !== undefined && !apiKey) throw new Error('model-provider-not-configured');
+  // Fail before taking ownership when the generated code could not be delivered to the owner.
+  const startupPairing = resolveServePairingCode({
+    pairing,
+    ...(explicitPairingCode === undefined ? {} : { explicit: explicitPairingCode }),
+    isTty,
+  });
   const runtime = createRuntime({
     profile: profile as 'simulated' | 'simulated-3d' | 'client-offline',
     db,
     ...(profileConfig?.allowModelNetwork === undefined ? {} : { allowModelNetwork: profileConfig.allowModelNetwork }),
+    ...(requestedProvider === undefined ? {} : { modelProvider: requestedProvider as 'openai' | 'anthropic' }),
+    ...(options.model === undefined ? {} : { model: options.model }),
+    ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),
+    ...(apiKey === undefined ? {} : { apiKey }),
   });
-  const host = options.host ?? '127.0.0.1';
-  const pairing = options.pairing ?? true;
-  const explicitPairingCode = options.pairingCode ?? process.env.MINECRAFT_AGENT_PAIRING_CODE;
-  const pairingCode = explicitPairingCode ?? randomBytes(4).toString('hex');
+  // The factory's metadata is the source of truth. A provider selected behind a gate that
+  // produced no configured network transport must not be reported as serving.
+  if (requestedProvider !== undefined && (!runtime.providerMetadata.configured || !runtime.providerMetadata.networkEnabled)) {
+    runtime.close();
+    throw new Error('model-provider-not-configured');
+  }
   const cliBearer = options.cliBearer ?? process.env.MINECRAFT_AGENT_CLI_TOKEN;
-  const server = createControlServer(runtime, { host, pairing, pairingCode, cliBearer, webRoot: options.webRoot, allowedOrigin: options.allowedOrigin });
-  const url = await listenServer(server, host, Number(options.port ?? 3000)); runtime.session.start();
-  // A generated one-time pairing code is printed once to the owning terminal; an explicitly
-  // configured code is not repeated. The CLI bearer and any API key are never logged.
-  console.log(JSON.stringify({ listening: url, profile, db, pairing, ...(pairing && !explicitPairingCode ? { pairingCode } : {}), cliAccess: cliBearer ? 'bearer-configured' : pairing ? 'pair-with-code' : 'loopback-open', webRoot: options.webRoot ?? './dist/web', ...(profileConfig ? { config: { path: resolve(options.config!), profile: profileConfig.profile ?? null, allowModelNetwork: profileConfig.allowModelNetwork ?? false } } : {}) }));
+  let server: ReturnType<typeof createControlServer> | undefined;
   let closing = false;
-  const close = async () => { if (closing) return; closing = true; await server.close(); runtime.close(); };
-  process.once('SIGINT', close); process.once('SIGTERM', close); await new Promise<void>(resolve => { const timer = setInterval(() => { if (closing || runtime.control.status().stopping) { clearInterval(timer); void close().then(resolve); } }, 25); });
+  // Cleanup is shared by normal shutdown and a failed startup. It removes both signal
+  // listeners so a failed serve attempt cannot accumulate duplicate handlers, then closes
+  // the server and releases the Runtime/ownership lock before the error is rethrown.
+  const close = async () => {
+    if (closing) return;
+    closing = true;
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+    try { await server?.close(); } catch { /* the original failure is rethrown by the caller */ }
+    runtime.close();
+  };
+  const onSignal = () => { void close(); };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+  try {
+    server = createControlServer(runtime, {
+      host,
+      pairing,
+      ...(startupPairing.pairingCode === undefined ? {} : { pairingCode: startupPairing.pairingCode }),
+      cliBearer,
+      webRoot: options.webRoot,
+      allowedOrigin: options.allowedOrigin,
+    });
+    const url = await listenServer(server, host, Number(options.port ?? 3000)); runtime.session.start();
+    // A generated one-time pairing code is printed once to the owning terminal; an explicitly
+    // configured code is not repeated. The CLI bearer and any API key are never logged.
+    console.log(buildServeStartupDocument({
+      url,
+      profile,
+      db,
+      pairing,
+      ...(cliBearer === undefined ? {} : { cliBearer }),
+      ...(options.webRoot === undefined ? {} : { webRoot: options.webRoot }),
+      ...(profileConfig ? { config: { path: resolve(options.config!), profile: profileConfig.profile ?? null, allowModelNetwork: profileConfig.allowModelNetwork ?? false } } : {}),
+      ...(requestedProvider === undefined ? {} : {
+        provider: {
+          requested: requestedProvider as 'openai' | 'anthropic',
+          ...(options.model === undefined ? {} : { model: options.model }),
+          ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),
+          configured: runtime.providerMetadata.configured,
+          networkEnabled: runtime.providerMetadata.networkEnabled === true,
+          transport: runtime.providerMetadata.transport,
+        },
+      }),
+    }, {
+      ...(startupPairing.generated && startupPairing.pairingCode ? { generatedPairingCode: startupPairing.pairingCode } : {}),
+      isTty,
+    }));
+  } catch (error) {
+    await close();
+    throw error;
+  }
+  await new Promise<void>(resolve => { const timer = setInterval(() => { if (closing || runtime.control.status().stopping) { clearInterval(timer); void close().then(resolve); } }, 25); });
 }
 
 /**
@@ -382,6 +676,21 @@ export type BridgeServiceCommandOptions = {
   source?: 'loopback-fixture' | 'configured-target';
   target?: { host: string; port: number };
   network?: string;
+  /**
+   * Fork replacement for tests. It receives the effective child config so a regression can
+   * prove exactly what crosses the process boundary. Production always forks the real entry.
+   */
+  spawn?: (config: BridgeServiceChildConfig) => ChildProcessLike;
+};
+
+/**
+ * The child config also carries the caller's target provenance. The service entry only reads
+ * the documented `BridgeServiceEntryConfig` fields, but keeping the provenance here lets the
+ * CLI report the same truthful profile/network/source it actually started with instead of
+ * inventing defaults.
+ */
+export type BridgeServiceChildConfig = BridgeServiceEntryConfig & {
+  source?: 'loopback-fixture' | 'configured-target';
 };
 
 /**
@@ -391,7 +700,18 @@ export type BridgeServiceCommandOptions = {
  * client body is invented.
  */
 export async function runBridgeServiceCommand(config: BridgeServiceEntryConfig, options: BridgeServiceCommandOptions = {}): Promise<Record<string, unknown>> {
-  const supervisor = new ProcessSupervisor({ spawn: () => spawnBridgeServiceProcess(config, options.entryUrl ? { entryUrl: options.entryUrl } : {}), ipcTimeoutMs: 10_000 });
+  // Carry the caller's real labels into the child. Never substitute 'client-offline' or a
+  // 'disabled' network here: an omitted profile stays omitted and the child reports
+  // `unspecified`; an omitted network is derived from the relay gate it was actually given.
+  const serviceConfig: BridgeServiceChildConfig = {
+    ...config,
+    ...(options.network === undefined ? {} : { network: options.network }),
+    ...(options.source === undefined ? {} : { source: options.source }),
+  };
+  const supervisor = new ProcessSupervisor({
+    spawn: () => (options.spawn ?? (() => spawnBridgeServiceProcess(serviceConfig, options.entryUrl ? { entryUrl: options.entryUrl } : {})))(serviceConfig),
+    ipcTimeoutMs: 10_000,
+  });
   try {
     await supervisor.start();
     const sessionEpoch = await supervisor.waitForHello(10_000);
@@ -405,6 +725,12 @@ export async function runBridgeServiceCommand(config: BridgeServiceEntryConfig, 
     // Re-read status after arming so the result reflects what actually happened.
     if (options.arm) status = await supervisor.request<Record<string, unknown>>('status').catch(() => status);
     const shutdown = await supervisor.request<{ stopped: boolean }>('shutdown').catch(error => ({ stopped: false, error: error instanceof Error ? error.message : String(error) }));
+    // A service that never confirmed running/degraded must not be reported as a normal result:
+    // the CLI would otherwise exit 0 while the child never became usable. The supervisor wait
+    // above stays bounded; this is the explicit failure gate after that wait.
+    if (status?.state !== 'running' && status?.state !== 'degraded') {
+      throw new Error(`bridge-service-not-ready:${typeof status?.state === 'string' ? status.state : 'unknown'}`);
+    }
     return {
       mode: 'service',
       orchestration: 'bridge-service',
@@ -454,7 +780,10 @@ async function startEchoUpstream(): Promise<BridgeFixtureUpstream> {
  * uses targetHost/targetPort. The upstream gate must be explicitly true in both modes.
  */
 export async function runBridgeCommand(options: BridgeCommandOptions = {}, deps: BridgeCommandDependencies = {}): Promise<void> {
-  const file = resolve(options.config ?? 'configs/client-offline.example.json');
+  // The default command is the offline fixture. `client-offline.example.json` has the
+  // upstream gate closed by design, so it can never run the default mode; the dedicated
+  // fixture config is the only shipped file whose true gate authorizes the loopback echo.
+  const file = resolve(options.config ?? 'configs/bridge-fixture.example.json');
   const config = loadProfileConfig(file, 'bridge');
   const mode = (options.mode ?? 'fixture') as BridgeMode;
   const write = options.output ?? ((value: unknown) => console.log(JSON.stringify(redact(value))));
@@ -469,6 +798,11 @@ export async function runBridgeCommand(options: BridgeCommandOptions = {}, deps:
     profile: config.profile ?? null,
     allowMinecraftUpstream: config.allowMinecraftUpstream ?? false,
     ...(configuredTarget ? { target: configuredTarget } : {}),
+    ...(config.listenHost === undefined ? {} : { listenHost: config.listenHost }),
+    ...(config.listenPort === undefined ? {} : { listenPort: config.listenPort }),
+    ...(config.rewriteHandshake === undefined ? {} : { rewriteHandshake: config.rewriteHandshake }),
+    ...(config.handshakeLimitBytes === undefined ? {} : { handshakeLimitBytes: config.handshakeLimitBytes }),
+    ...(config.handshakeTimeoutMs === undefined ? {} : { handshakeTimeoutMs: config.handshakeTimeoutMs }),
   };
 
   if (mode === 'live') {
@@ -487,10 +821,27 @@ export async function runBridgeCommand(options: BridgeCommandOptions = {}, deps:
   if (mode === 'service') {
     if (config.allowMinecraftUpstream !== true) throw new Error('service-mode-requires-explicit-upstream-gate');
     const target = bridgeServiceTarget(config);
-    const result = await (deps.runService ?? runBridgeServiceCommand)({
-      relay: { listenHost: '127.0.0.1', listenPort: 0, targetHost: target.host, targetPort: target.port, allowMinecraftUpstream: true, heartbeatMs: 60 },
-      observer: { enabled: true }, shutdownGraceMs: 1_000, helloTimeoutMs: 5_000, maxRestarts: 1, backoffBaseMs: 10, maxIpcMessages: 256,
-    }, { arm: options.arm === true, source: 'configured-target', target, network: 'upstream-explicit' });
+    // This config is also handed to the service child, so it carries the real loaded profile
+    // instead of leaving the child to guess or report `unspecified` for a known profile.
+    const serviceConfig: BridgeServiceChildConfig = {
+      relay: {
+        listenHost: config.listenHost ?? '127.0.0.1',
+        listenPort: config.listenPort ?? 0,
+        targetHost: target.host,
+        targetPort: target.port,
+        allowMinecraftUpstream: true,
+        heartbeatMs: 60,
+        ...(config.rewriteHandshake === undefined ? {} : { rewriteHandshake: config.rewriteHandshake }),
+        ...(config.handshakeLimitBytes === undefined ? {} : { handshakeLimitBytes: config.handshakeLimitBytes }),
+        ...(config.handshakeTimeoutMs === undefined ? {} : { handshakeTimeoutMs: config.handshakeTimeoutMs }),
+      },
+      observer: { enabled: true },
+      ...(config.profile === undefined ? {} : { profile: config.profile }),
+      network: 'upstream-explicit',
+      source: 'configured-target',
+      shutdownGraceMs: 1_000, helloTimeoutMs: 5_000, maxRestarts: 1, backoffBaseMs: 10, maxIpcMessages: 256,
+    };
+    const result = await (deps.runService ?? runBridgeServiceCommand)(serviceConfig, { arm: options.arm === true, source: 'configured-target', target, network: 'upstream-explicit' });
     write({ ...result, profile: versionProfileSummary(profile), protocol: { legacyCodecFixture: minecraftDataSummary(), target: profile }, config: configReport });
     return;
   }
@@ -591,10 +942,27 @@ const numberOption = (name: string, value: string | undefined): number | undefin
   return parsed;
 };
 
+/**
+ * Commander stores a value for duplicate option names (`--db` exists on both the root
+ * program and most subcommands) in the parent Command, not in the subcommand's own options.
+ * The action's local `options` object can therefore be empty; `optsWithGlobals()` is the
+ * only merged view that contains the value the user actually passed.
+ */
+const mergedDb = (command: { optsWithGlobals(): Record<string, unknown> }): string => {
+  const db = command.optsWithGlobals().db;
+  return (typeof db === 'string' && db !== '' ? db : undefined) ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:';
+};
+
 export function main(argv = process.argv) {
   const program = new Command();
   program.name('minecraft-agent').option('--profile <profile>', 'profile').option('--db <path>', 'SQLite path');
-  program.command('demo').option('--db <path>').option('--scenario <scenario>').action((options) => runDemo(options.db, options.scenario));
+  program.command('demo').option('--db <path>').option('--scenario <scenario>').action(async (_options, command) => {
+    const merged = command.optsWithGlobals();
+    await runDemo(
+      typeof merged.db === 'string' ? merged.db : undefined,
+      typeof merged.scenario === 'string' ? merged.scenario : undefined,
+    );
+  });
   program.command('serve').option('--db <path>').option('--host <host>', 'bind host', '127.0.0.1').option('--port <port>', 'bind port', '3000')
     .option('--config <path>', 'strict profile config')
     .option('--no-pairing', 'disable local pairing (loopback-open development mode)')
@@ -602,24 +970,56 @@ export function main(argv = process.argv) {
     .option('--cli-bearer <token>', 'CLI bearer token (prefer MINECRAFT_AGENT_CLI_TOKEN)')
     .option('--web-root <path>', 'static build directory', './dist/web')
     .option('--allowed-origin <origin>', 'extra development origin allowed for the web UI')
-    .action((options, command) => runServe({ ...options, profile: command.parent?.opts().profile }));
+    // Provider selection is only honored when the serve config opens allowModelNetwork.
+    // These options exist so that gate is not inert: the startup document reports the
+    // effective provider metadata, and an open gate without a provider is rejected.
+    .option('--provider <provider>', 'model provider (openai|anthropic); requires allowModelNetwork config')
+    .option('--model <model>', 'model name for the selected provider')
+    .option('--base-url <url>', 'provider base URL')
+    .option('--api-key <key>', 'provider API key (prefer MINECRAFT_AGENT_MODEL_API_KEY)')
+    .action((_options, command) => {
+      const merged = command.optsWithGlobals() as Record<string, string | boolean | undefined>;
+      return runServe({
+        db: merged.db as string | undefined,
+        host: merged.host as string | undefined,
+        port: merged.port as string | undefined,
+        profile: merged.profile as string | undefined,
+        config: merged.config as string | undefined,
+        pairing: merged.pairing as boolean | undefined,
+        pairingCode: merged.pairingCode as string | undefined,
+        cliBearer: merged.cliBearer as string | undefined,
+        webRoot: merged.webRoot as string | undefined,
+        allowedOrigin: merged.allowedOrigin as string | undefined,
+        provider: merged.provider as string | undefined,
+        model: merged.model as string | undefined,
+        baseUrl: merged.baseUrl as string | undefined,
+        apiKey: merged.apiKey as string | undefined,
+      });
+    });
   program.command('attach').requiredOption('--url <url>')
     .option('--token <token>', 'CLI bearer token (defaults to MINECRAFT_AGENT_CLI_TOKEN)')
     .option('--pair-code <code>', 'pair with a local one-time code before attaching')
     .option('--cursor <cursor>', 'initial event cursor', '0')
     .option('--no-subscribe', 'do not open the event/state subscription automatically')
     .action(options => runAttach(options.url, {}, { token: options.token, pairCode: options.pairCode, subscribe: options.subscribe, cursor: options.cursor }));
-  program.command('status').option('--db <path>').action((options, command) => { const db = options.db ?? command.parent?.opts().db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'; const runtime = new SessionRuntime(new FakeClientBridge(), new SQLiteStore(db)); try { console.log(JSON.stringify(redact({ simulated: true, status: runtime.store.listGoals().some(g => g.status === 'active') ? 'active' : 'idle', goals: runtime.store.listGoals(), executions: runtime.store.listExecutions() }))); } finally { runtime.store.close(); } });
-  program.command('doctor').option('--db <path>').action((options, command) => {
-    const profile = command.parent?.opts().profile ?? 'simulated';
-    const db = options.db ?? command.parent?.opts().db;
+  program.command('status').option('--db <path>').action((_options, command) => {
+    console.log(JSON.stringify(redact(runStatusCommand({ db: mergedDb(command) }))));
+  });
+  program.command('doctor').option('--db <path>').action((_options, command) => {
+    const merged = command.optsWithGlobals();
+    const profile = typeof merged.profile === 'string' ? merged.profile : 'simulated';
+    const db = typeof merged.db === 'string' ? merged.db : undefined;
     console.log(JSON.stringify(redact(runDoctorCommand({ profile, ...(db ? { db } : {}) }))));
   });
   program.command('bridge').option('--config <path>', 'profile config').option('--mode <mode>', 'fixture|inspect|service|live', 'fixture')
     .option('--arm', 'send an explicit arm IPC request after service start')
     .action((options) => runBridgeCommand({ ...(options.config ? { config: options.config } : {}), mode: options.mode, arm: options.arm === true }));
-  program.command('goal:revise').requiredOption('--id <goalId>').requiredOption('--revision <revision>').requiredOption('--change <change>').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(redact(store.reviseGoal(options.id, Number(options.revision), options.change)))); } finally { store.close(); } });
-  program.command('events').option('--cursor <cursor>', 'cursor', '0').option('--limit <limit>', '100').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(new SessionRuntime(new FakeClientBridge(), store).events.read(options.cursor, Number(options.limit)))); } finally { store.close(); } });
+  program.command('goal:revise').requiredOption('--id <goalId>').requiredOption('--revision <revision>').requiredOption('--change <change>').option('--db <path>').action((options, command) => {
+    console.log(JSON.stringify(redact(runGoalReviseCommand({ db: mergedDb(command), id: options.id, revision: Number(options.revision), change: options.change }))));
+  });
+  program.command('events').option('--cursor <cursor>', 'cursor', '0').option('--limit <limit>', '100').option('--db <path>').action((options, command) => {
+    console.log(JSON.stringify(redact(runEventsCommand({ db: mergedDb(command), cursor: options.cursor, limit: Number(options.limit) }))));
+  });
   program.command('trace:export')
     .option('--db <path>')
     .option('--out <path>')
@@ -630,8 +1030,8 @@ export function main(argv = process.argv) {
     .option('--retention-ms <n>', 'drop records older than this', '86400000')
     .action((options, command) => {
       // The root program also defines --db; commander stores the value on the parent,
-      // so read globals as a fallback instead of silently using :memory:.
-      const db = options.db ?? (command.optsWithGlobals().db as string | undefined);
+      // so read the merged global view instead of silently using :memory:.
+      const db = command.optsWithGlobals().db as string | undefined;
       const document = runTraceExportCommand({
         ...(db ? { db } : {}),
         cursor: options.cursor,
@@ -669,7 +1069,7 @@ export function main(argv = process.argv) {
         process.exitCode = 1;
       }
     });
-  program.action(() => runDemo(program.opts().db));
+  program.action(async () => { await runDemo(program.opts().db); });
   return program.parseAsync(argv);
 }
 if (process.argv[1]?.endsWith('main.js')) main();

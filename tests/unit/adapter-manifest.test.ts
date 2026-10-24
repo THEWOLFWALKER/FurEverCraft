@@ -13,6 +13,7 @@ import {
   sha256File,
   verifyAdapterManifest,
   type AdapterManifest,
+  type VerifyManifestOptions,
 } from '../../src/bridge/adapter/manifest.js';
 
 const sha = 'a'.repeat(64);
@@ -162,6 +163,17 @@ describe('P07 adapter manifest', () => {
     expect(generated.evidence).toEqual({ dataPath: 'node_modules/minecraft-data/minecraft-data/data/pc/26.3/version.json', dataPresent: false, nativePath: 'native/windows/FurEverCraft.Helper.ps1', nativePresent: true, schemaPresent: false });
     const committed = readFileSync('configs/adapters/target-26.3.candidate.json', 'utf8');
     expect(serializeAdapterManifest(generated.manifest)).toBe(committed);
+  });
+
+  it('fails closed instead of crashing when verification options or rootDir are missing', () => {
+    const manifest = buildCandidate26_3Manifest(process.cwd()).manifest;
+    const missingOptions = verifyAdapterManifest(manifest, undefined as any);
+    expect(missingOptions).toMatchObject({ ok: false, status: 'unsupported', available: false, checked: { artifacts: 0, dependencies: 0, capabilities: 0 } });
+    expect(missingOptions.issues).toContainEqual(expect.objectContaining({ code: 'verification-options-required', severity: 'blocker' }));
+
+    const missingRootDir = verifyAdapterManifest(manifest, { expected: expectedFixture } as unknown as VerifyManifestOptions);
+    expect(missingRootDir).toMatchObject({ ok: false, status: 'unsupported', available: false });
+    expect(missingRootDir.issues).toContainEqual(expect.objectContaining({ code: 'verification-rootdir-required', severity: 'blocker', path: 'rootDir' }));
   });
 
   it('labels the legacy fixture separately and exposes per-domain capability, not a single boolean', () => {

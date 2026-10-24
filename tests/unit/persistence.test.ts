@@ -32,10 +32,15 @@ describe('SQLiteStore W04 persistence', () => {
   });
 
   it('rejects a proposal id reused with a different hash', () => {
-    const store = new SQLiteStore(tempDb());
-    store.saveExecution(execution());
-    expect(() => store.saveExecution({ ...execution(), proposalHash: 'different' })).toThrow('proposal-id-conflict');
-    store.close();
+    const file = tempDb();
+    const store = new SQLiteStore(file);
+    try {
+      store.saveExecution(execution());
+      expect(() => store.saveExecution({ ...execution(), proposalHash: 'different' })).toThrow('proposal-id-conflict');
+    } finally {
+      store.close();
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 
   it('stores checkpoints, durable events, places and episodes with context isolation', () => {
@@ -57,15 +62,20 @@ describe('SQLiteStore W04 persistence', () => {
   });
 
   it('rolls back a transaction as one unit', () => {
-    const store = new SQLiteStore(tempDb());
-    expect(() => store.transaction(() => {
-      store.saveExecution(execution());
-      store.addEffect({ effectId: 'effect-tx', executionId: 'execution-1', context, status: 'prepared', intent: { kind: 'click' } });
-      throw new Error('crash-before-commit');
-    })).toThrow('crash-before-commit');
-    expect(store.getExecution('execution-1')).toBeUndefined();
-    expect(store.pendingEffects()).toHaveLength(0);
-    store.close();
+    const file = tempDb();
+    const store = new SQLiteStore(file);
+    try {
+      expect(() => store.transaction(() => {
+        store.saveExecution(execution());
+        store.addEffect({ effectId: 'effect-tx', executionId: 'execution-1', context, status: 'prepared', intent: { kind: 'click' } });
+        throw new Error('crash-before-commit');
+      })).toThrow('crash-before-commit');
+      expect(store.getExecution('execution-1')).toBeUndefined();
+      expect(store.pendingEffects()).toHaveLength(0);
+    } finally {
+      store.close();
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 });
 
@@ -192,6 +202,20 @@ describe('audit regressions', () => {
     // API compatibility: getEpisode(id) resolves inside the current scope.
     expect(store.getEpisode('ep')).toMatchObject({ context: otherWorld, summary: { text: 'third' } });
     expect(store.getEpisode('missing')).toBeUndefined();
+    store.close();
+  });
+
+  it('preserves stored provenance JSON when a later save omits provenance', () => {
+    const store = new SQLiteStore(':memory:');
+    store.savePlace({ placeId: 'home', context, status: 'valid', lastVerifiedAt: '2026-01-01T00:00:00.000Z', payload: { x: 1, y: 2 }, provenance: { source: 'observed-server', observer: 'fixture' } });
+    expect(store.getPlace('home', context)?.provenance).toEqual({ source: 'observed-server', observer: 'fixture' });
+
+    // A second save without provenance must reuse the raw TEXT column; binding the parsed
+    // object would throw (or corrupt the JSON column).
+    expect(() => store.savePlace({ placeId: 'home', context, status: 'valid', payload: { x: 3, y: 4 } })).not.toThrow();
+    expect(store.getPlace('home', context)).toMatchObject({
+      revision: 1, payload: { x: 3, y: 4 }, provenance: { source: 'observed-server', observer: 'fixture' },
+    });
     store.close();
   });
 });

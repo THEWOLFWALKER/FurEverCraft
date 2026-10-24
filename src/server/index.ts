@@ -26,6 +26,8 @@ export type ControlServerOptions = {
   cliBearer?: string;
   /** Pairing code lifetime (default 5 minutes). */
   pairingTtlMs?: number;
+  /** Failed pairing attempts from one local source before lockout (default 5). */
+  pairingMaxAttempts?: number;
   /** Paired browser session lifetime (default 12 hours). */
   sessionTtlMs?: number;
   /** Injectable clock for credential-expiry tests. */
@@ -34,10 +36,21 @@ export type ControlServerOptions = {
   onSseConnection?: (state: 'open' | 'closed') => void;
 };
 
-type PairingState = { codeHash: string; expiresAt: number; used: boolean; sessions: Map<string, { expiresAt: number; csrfHash: string }> };
+type PairingState = {
+  codeHash: string;
+  expiresAt: number;
+  used: boolean;
+  sessions: Map<string, { expiresAt: number; csrfHash: string }>;
+  /** Bounded per-source failed attempts; a lockout lasts until the one-time code expires. */
+  attempts: Map<string, { failures: number; lockedUntil?: number }>;
+};
 
 const SESSION_COOKIE = 'furevercraft_session';
 const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1', '[::1]'];
+const MAX_PAIRING_SOURCES = 64;
+const DEFAULT_PAIRING_MAX_ATTEMPTS = 5;
+/** One-time local pairing code: 128 bits from the CSPRNG, rendered as 32 hex characters. */
+export function generatePairingCode(): string { return randomBytes(16).toString('hex'); }
 const hash = (value: string) => createHash('sha256').update(value).digest();
 const safeEqual = (a: string, b: string) => { const left = hash(a); const right = hash(b); return timingSafeEqual(left, right); };
 const safeEqualHashes = (left: Buffer, right: string) => timingSafeEqual(left, Buffer.from(right, 'hex'));
@@ -104,11 +117,16 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
   const app = Fastify({ logger: false, bodyLimit: options.maxBodyBytes ?? 1024 * 1024, exposeHeadRoutes: false });
   void app.register(fastifyCookie);
   const now = options.now ?? (() => Date.now());
+  const pairingMaxAttempts = Math.max(1, Math.trunc(options.pairingMaxAttempts ?? DEFAULT_PAIRING_MAX_ATTEMPTS));
+  // An explicitly configured empty/whitespace code would be pair-able with an empty request.
+  // Fail closed before serving rather than accepting an unauthenticated empty secret.
+  if (options.pairing && options.pairingCode !== undefined && !options.pairingCode.trim()) throw new Error('pairing-code-invalid');
   const pairing: PairingState | undefined = options.pairing ? {
-    codeHash: hash(options.pairingCode ?? randomBytes(4).toString('hex')).toString('hex'),
+    codeHash: hash(options.pairingCode ?? generatePairingCode()).toString('hex'),
     expiresAt: now() + (options.pairingTtlMs ?? 5 * 60_000),
     used: false,
     sessions: new Map(),
+    attempts: new Map(),
   } : undefined;
   const sessionTtlMs = options.sessionTtlMs ?? 12 * 3600_000;
   const loopbackHosts = new Set([...LOOPBACK_HOSTS, ...(options.host ?? '127.0.0.1').toLowerCase()]);
@@ -193,19 +211,64 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     return true;
   };
 
+  // Public bootstrap surface: a browser must be able to learn *how* it is expected to
+  // authenticate before it holds any credential. This exposes only the enforcement mode,
+  // never the bearer, pairing code, session cookie or CSRF token. It still obeys the local
+  // loopback/Host/Origin policy so a non-local caller cannot probe the serving mode.
+  app.get('/api/v1/auth-mode', async (request, reply) => {
+    if (!isLoopback(request)) return reply.code(403).send({ error: { code: 'non-loopback-denied' } });
+    if (!hostOk(request)) return reply.code(403).send({ error: { code: 'host-not-allowed' } });
+    if (!originOk(request, reply)) return reply;
+    void reply.header('cache-control', 'no-store');
+    return {
+      mode: pairing ? 'pairing' : options.cliBearer ? 'bearer-only' : 'loopback-open',
+      pairing: Boolean(pairing),
+      bearerRequired: Boolean(!pairing && options.cliBearer),
+      browserAccess: pairing ? 'pairing' : options.cliBearer ? 'disabled' : 'open',
+    };
+  });
+
   app.get('/api/v1/status', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.status(); });
   app.get('/api/v1/capabilities', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.capabilities(); });
   app.get('/api/v1/goals', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.goals(); });
   app.get('/api/v1/tasks', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.goals(); });
   app.get('/api/v1/executions', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.executions(); });
-  app.get('/api/v1/effects', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.effects((request.query as { executionId?: string }).executionId); });
-  app.get('/api/v1/places', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.places(); });
-  app.get('/api/v1/memories', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return { places: control.places(), episodes: runtime?.store.listEpisodes() ?? [] }; });
+  app.get('/api/v1/effects', async (request, reply) => {
+    if (!authorizeRequest(request, reply)) return reply;
+    const query = request.query as { executionId?: string; limit?: string; cursor?: string };
+    try { return control.effects(query.executionId, { ...(query.limit === undefined ? {} : { limit: Number(query.limit) }), ...(query.cursor === undefined ? {} : { cursor: query.cursor }) }); }
+    catch { return reply.code(400).send({ error: { code: 'invalid-effect-cursor' } }); }
+  });
+  app.get('/api/v1/places', async (request, reply) => {
+    if (!authorizeRequest(request, reply)) return reply;
+    const query = request.query as { limit?: string; cursor?: string; status?: string };
+    try { return control.placesPage({ ...(query.limit === undefined ? {} : { limit: Number(query.limit) }), ...(query.cursor === undefined ? {} : { cursor: query.cursor }), ...(query.status === undefined ? {} : { status: query.status }) }); }
+    catch { return reply.code(400).send({ error: { code: 'invalid-memory-cursor' } }); }
+  });
+  app.get('/api/v1/memories', async (request, reply) => {
+    if (!authorizeRequest(request, reply)) return reply;
+    const query = request.query as { limit?: string; cursor?: string; status?: string };
+    try { return control.memories({ ...(query.limit === undefined ? {} : { limit: Number(query.limit) }), ...(query.cursor === undefined ? {} : { cursor: query.cursor }), ...(query.status === undefined ? {} : { status: query.status }) }); }
+    catch { return reply.code(400).send({ error: { code: 'invalid-memory-cursor' } }); }
+  });
   app.get('/api/v1/provider', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.provider(); });
   // The P21 doctor report is a read-only view over the same attached Runtime. It goes through
   // the same pairing/bearer/Origin policy as every other read and is redacted before transmission.
   app.get('/api/v1/doctor', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact(control.diagnostics()); });
-  app.get('/api/v1/config', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact({ provider: control.provider(), profile: control.capabilities().profile, pairing: Boolean(pairing), cliAccess: options.cliBearer ? 'configured' : 'not-configured' }); });
+  app.get('/api/v1/config', async (request, reply) => {
+    if (!authorizeRequest(request, reply)) return reply;
+    const capabilities = control.capabilities();
+    // Keep the attached body/server id and the assembled runtime profile explicitly separate;
+    // `profile` remains the legacy alias for the body/server id.
+    return redact({
+      provider: control.provider(),
+      profile: capabilities.profile,
+      serverProfileId: capabilities.serverProfileId,
+      runtimeProfile: capabilities.runtimeProfile,
+      pairing: Boolean(pairing),
+      cliAccess: options.cliBearer ? 'configured' : 'not-configured',
+    });
+  });
   app.get('/api/v1/events', async (request, reply) => {
     if (!authorizeRequest(request, reply)) return reply;
     const query = request.query as { cursor?: string; limit?: string; filter?: string };
@@ -218,10 +281,40 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     if (!isLoopback(request)) return reply.code(403).send({ error: { code: 'non-loopback-denied' } });
     if (!hostOk(request)) return reply.code(403).send({ error: { code: 'host-not-allowed' } });
     if (!originOk(request, reply)) return reply;
-    if (now() > pairing.expiresAt) return reply.code(410).send({ error: { code: 'pairing-expired' } });
+    const at = now();
+    const source = request.socket.remoteAddress ?? request.ip ?? 'unknown';
+    const attempt = pairing.attempts.get(source);
+    if (attempt?.lockedUntil !== undefined) {
+      if (attempt.lockedUntil > at) return reply.code(429).send({ error: { code: 'pairing-rate-limited', retryAfterMs: Math.max(1, attempt.lockedUntil - at) } });
+      pairing.attempts.delete(source);
+    }
+    if (at > pairing.expiresAt) return reply.code(410).send({ error: { code: 'pairing-expired' } });
     if (pairing.used) return reply.code(409).send({ error: { code: 'pairing-used' } });
     const body = (request.body ?? {}) as { code?: string };
-    if (typeof body.code !== 'string' || !safeEqualHashes(Buffer.from(pairing.codeHash, 'hex'), hash(body.code).toString('hex'))) return reply.code(401).send({ error: { code: 'pairing-code-invalid' } });
+    const code = typeof body.code === 'string' ? body.code : '';
+    // An empty/whitespace code is never a valid credential, even if a caller configures one.
+    const valid = code.trim().length > 0 && safeEqualHashes(Buffer.from(pairing.codeHash, 'hex'), hash(code).toString('hex'));
+    if (!valid) {
+      const failures = (attempt?.failures ?? 0) + 1;
+      if (pairing.attempts.size >= MAX_PAIRING_SOURCES && !pairing.attempts.has(source)) {
+        // Bounded per-source bookkeeping: prefer dropping an expired entry, then the oldest.
+        for (const [key, value] of pairing.attempts) {
+          if (value.lockedUntil !== undefined && value.lockedUntil <= at) { pairing.attempts.delete(key); break; }
+        }
+        if (pairing.attempts.size >= MAX_PAIRING_SOURCES) {
+          const oldest = pairing.attempts.keys().next().value as string | undefined;
+          if (oldest !== undefined) pairing.attempts.delete(oldest);
+        }
+      }
+      if (failures >= pairingMaxAttempts) {
+        // Lock the source out for the remainder of the one-time code's lifetime.
+        pairing.attempts.set(source, { failures, lockedUntil: pairing.expiresAt });
+        return reply.code(429).send({ error: { code: 'pairing-rate-limited', retryAfterMs: Math.max(1, pairing.expiresAt - at) } });
+      }
+      pairing.attempts.set(source, { failures });
+      return reply.code(401).send({ error: { code: 'pairing-code-invalid' } });
+    }
+    pairing.attempts.delete(source);
     pairing.used = true;
     const session = randomBytes(32).toString('hex');
     const csrf = randomBytes(24).toString('hex');
@@ -289,7 +382,12 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     const head = () => control.eventsHead();
     const snapshot = (cursor: string, gap: boolean, windowed: boolean) => {
       try {
-        return { ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(), places: control.places(), provider: control.provider(), cursor, gap, ...(windowed ? { windowed: true } : {}) };
+        const places = control.placesPage();
+        return {
+          ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(),
+          places: places.items, placesTruncated: places.truncated, ...(places.nextCursor ? { placesNextCursor: places.nextCursor } : {}),
+          provider: control.provider(), cursor, gap, ...(windowed ? { windowed: true } : {}),
+        };
       } catch (error) {
         // A closed store during shutdown must end as an explicit gap/unknown snapshot, not a
         // half-written SSE session.

@@ -20,6 +20,8 @@ type CaptureResult = { data?: string; mimeType?: string; source?: string; limita
 export type BridgeCapabilities = {
   profile: ClientBridgeProfile['profile']; protocolObservation: boolean; protocolForwarding: boolean;
   nativeInput: boolean; windowHealth: boolean; screenCapture: boolean; authentication: boolean;
+  /** True when the attached helper is synthetic (dry-run); such actions are never advertised as real. */
+  dryRun: boolean;
   stableNavigation: false; source: 'fixture' | 'simulated' | 'client'; limitations: string[];
 };
 export type AuthPrompt = 'login' | 'register' | 'reject' | 'unknown' | 'ordinary';
@@ -47,18 +49,48 @@ export class CompositeClientBridge {
     if (this.profile.profile === 'unsupported') throw new Error('unsupported-profile');
     const clientProfile = this.profile.profile === 'client-offline';
     const source = this.profile.profile === 'simulated' ? 'simulated' : options.protocol?.source ?? 'fixture';
+    // A driver's booleans alone are not capability: the driver has independent OS-input and
+    // screen-capture gates, and a dry-run helper executes synthetically. Derive the advertised
+    // capabilities from its effective state so the report cannot promise an action the driver
+    // would reject (or mislabel a synthetic action as real).
+    const helper = options.windows?.effectiveState();
+    const helperEnabled = helper?.enabled === true;
+    const helperDryRun = helper?.dryRun === true;
+    const helperReal = Boolean(helperEnabled && !helperDryRun);
+    const nativeInput = Boolean(clientProfile && options.windows && this.profile.allowOsInput && helperReal);
+    const screenCapture = Boolean(clientProfile && options.windows && this.profile.allowScreenCapture && helperReal && helper?.captureEnabled === true);
+    const windowHealth = Boolean(clientProfile && options.windows && helperReal);
     const limitations: string[] = [];
-    if (!options.protocol) limitations.push('protocol-observer-unavailable');
-    if (!clientProfile || !this.profile.allowOsInput || !options.windows) limitations.push('native-input-disabled');
-    if (!clientProfile || !this.profile.allowScreenCapture || !options.windows) limitations.push('screen-capture-disabled');
-    if (!clientProfile || !this.profile.allowAuth || !options.authExecutor || !options.credentials) limitations.push('authentication-disabled');
-    if (!clientProfile) limitations.push('offline-profile-required-for-real-client-actions');
+    const addLimit = (limitation: string) => { if (!limitations.includes(limitation)) limitations.push(limitation); };
+    if (!options.protocol) addLimit('protocol-observer-unavailable');
+    if (!clientProfile) addLimit('offline-profile-required-for-real-client-actions');
+    if (!clientProfile || !this.profile.allowOsInput || !options.windows) addLimit('native-input-disabled');
+    if (!clientProfile || !this.profile.allowScreenCapture || !options.windows) addLimit('screen-capture-disabled');
+    if (!clientProfile || !this.profile.allowAuth || !options.authExecutor || !options.credentials) addLimit('authentication-disabled');
+    if (options.windows && !helperEnabled) {
+      addLimit('windows-helper-disabled');
+      addLimit('window-health-disabled');
+      if (clientProfile && this.profile.allowOsInput) addLimit('native-input-disabled');
+      if (clientProfile && this.profile.allowScreenCapture) addLimit('screen-capture-disabled');
+    } else if (options.windows && helperDryRun) {
+      // The helper is in dry-run: it accepts commands, but only synthetically.
+      addLimit('windows-helper-dry-run');
+      addLimit('window-health-synthetic');
+      if (clientProfile && this.profile.allowOsInput) addLimit('native-input-synthetic');
+      if (clientProfile && this.profile.allowScreenCapture) addLimit('screen-capture-synthetic');
+    } else if (options.windows && helperEnabled && clientProfile && this.profile.allowScreenCapture && helper?.captureEnabled !== true) {
+      addLimit('screen-capture-disabled');
+    }
+    if (!options.windows) addLimit('window-health-disabled');
+    // Window health is an OS action surface too: a non-client profile never gains it.
+    if (!windowHealth && !helperDryRun) addLimit('window-health-disabled');
     this.capabilities = {
       profile: this.profile.profile, protocolObservation: Boolean(options.protocol),
       protocolForwarding: Boolean(clientProfile && options.protocol && this.profile.allowMinecraftUpstream),
-      nativeInput: Boolean(clientProfile && options.windows && this.profile.allowOsInput), windowHealth: Boolean(options.windows),
-      screenCapture: Boolean(clientProfile && options.windows && this.profile.allowScreenCapture),
+      nativeInput, windowHealth,
+      screenCapture,
       authentication: Boolean(clientProfile && this.profile.allowAuth && options.authExecutor && options.credentials),
+      dryRun: Boolean(options.windows && helperDryRun),
       stableNavigation: false, source, limitations,
     };
     this.identity = { connectionEpoch: options.protocol?.sessionEpoch ?? nextId('connection') };

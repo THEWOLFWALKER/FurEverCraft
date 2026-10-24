@@ -9,6 +9,7 @@ import { SimulatedBody } from '../../src/fixtures/simulated-body.js';
 import { SimulatedBodyAdapter } from '../../src/fixtures/body-adapter.js';
 import { SparseVoxelWorld } from '../../src/motor/geometry.js';
 import { collectDoctorReport, unavailableDoctorReport } from '../../src/diagnostics/doctor.js';
+import { SQLiteStore } from '../../src/persistence/store.js';
 import { runDoctorCommand } from '../../src/cli/main.js';
 import { BridgeService } from '../../src/bridge/service/orchestrator.js';
 
@@ -80,6 +81,29 @@ describe('P21 doctor reports actual Runtime/Store capabilities', () => {
     } finally { three.runtime.close(); legacy.close(); }
   });
 
+  it('reports the attached body/server context in profile while the simulated-3d assembly is 3D', () => {
+    // `profile` is a BodyContext summary, not the Runtime assembly profile string. The
+    // simulated-3d runtime is attached to a simulated body/server, so id/source stay
+    // "simulated"; the assembled 3D path is carried explicitly by `body` and `runtimeProfile`.
+    const runtime = createRuntime({ profile: 'simulated-3d', clock: new ManualClock() });
+    try {
+      const report = collectDoctorReport(runtime);
+      expect(report).toMatchObject({ runtimeProfile: 'simulated-3d', profile: { id: 'simulated', simulated: true, source: 'simulated' } });
+      expect(report.body).toMatchObject({
+        mode: '3d', threeDimensional: true, legacy2d: false, source: 'simulated',
+      });
+    } finally { runtime.close(); }
+
+    const cli = runDoctorCommand({ profile: 'simulated-3d', generatedAt: 3 });
+    expect(cli).toMatchObject({ runtimeProfile: 'simulated-3d', profile: { id: 'simulated', simulated: true, source: 'simulated' } });
+    expect(cli.body).toMatchObject({ mode: '3d', threeDimensional: true, source: 'simulated' });
+
+    const legacy = createRuntime({ clock: new ManualClock() });
+    try {
+      expect(collectDoctorReport(legacy)).toMatchObject({ runtimeProfile: 'simulated', body: { mode: 'legacy-2d' } });
+    } finally { legacy.close(); }
+  });
+
   it('reports the real store path, ownership lock, session state and absent optional subsystems', () => {
     const db = tempDb();
     const runtime = createRuntime({ db, clock: new ManualClock() });
@@ -122,6 +146,23 @@ describe('P21 doctor reports actual Runtime/Store capabilities', () => {
       expect(report.knowledge).toMatchObject({ state: 'available', activeReleaseId: 'release-doctor', activeVersion: '1.0.0', releaseCount: 1 });
       expect(report.knowledge.coverage).toMatchObject({ unknown: false, conflicts: 0, sources: { verified: 1, unverified: 0, total: 1 } });
     } finally { runtime.close(); }
+  });
+
+  it('reports counts only for the attached stable scope via bounded aggregates', () => {
+    const store = new SQLiteStore(':memory:');
+    const runtime = createRuntime({ store, clock: new ManualClock() });
+    const foreign: BodyContext = { serverProfileId: 'simulated', worldGenerationId: 'other-world', connectionEpoch: '1', bodyEpoch: '1', dimension: 'the_nether' };
+    try {
+      store.saveExecution({ executionId: 'foreign-exec', proposalId: 'foreign-proposal', proposalHash: 'h', goalId: 'foreign-goal', skillId: 'place_one', skillVersion: '1.0.0', status: 'running', context: foreign });
+      store.addEffect({ effectId: 'foreign-effect', executionId: 'foreign-exec', context: foreign, status: 'prepared', intent: { kind: 'place', x: 1, y: 0 } });
+      store.saveGoal({ goalId: 'foreign-goal', revision: 1, status: 'active', text: 'foreign', context: foreign });
+      const report = collectDoctorReport(runtime, { generatedAt: 1 });
+      expect(report.store).toMatchObject({ state: 'available', executions: 0, effects: 0, goals: 0 });
+      expect(report.recovery).toMatchObject({ pendingEffects: 0, effectCounts: {} });
+    } finally {
+      runtime.close();
+      store.close();
+    }
   });
 
   it('does not start a session or mutate the store while reporting', () => {

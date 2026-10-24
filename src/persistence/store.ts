@@ -30,22 +30,77 @@ const receiptTerminal = new Set(['completed', 'unknown', 'sent', 'ambiguous', 'c
 const effectRank: Record<string, number> = { prepared: 0, 'may-have-dispatched': 1, verifying: 2, ambiguous: 3, partial: 4, confirmed: 5 };
 const executionTerminal = new Set(['succeeded', 'failed', 'canceled']);
 const MEMORY_SCOPE_KEYS = ['serverProfileId', 'accountId', 'worldGenerationId', 'dimensionId'] as const;
-const coreScope = (value: unknown): Partial<Record<(typeof MEMORY_SCOPE_KEYS)[number], string>> | undefined => {
+export type StableScope = { serverProfileId: string; accountId?: string; worldGenerationId?: string; dimensionId?: string };
+/**
+ * Normalise a body context or memory scope to the stable identity fields. Connection/body epochs
+ * are deliberately excluded: they fence evidence, not world identity. A legacy string context is
+ * treated as a server profile with no world/account/dimension, so it only matches the same shape.
+ */
+export function stableScopeOf(value: unknown): StableScope | undefined {
+  if (typeof value === 'string') return value ? { serverProfileId: value } : undefined;
   if (!value || typeof value !== 'object') return undefined;
   const record = value as Record<string, unknown>;
   if (typeof record.serverProfileId !== 'string' || !record.serverProfileId) return undefined;
-  const scope: Partial<Record<(typeof MEMORY_SCOPE_KEYS)[number], string>> = {};
-  for (const key of MEMORY_SCOPE_KEYS) if (typeof record[key] === 'string' && record[key]) scope[key] = record[key] as string;
+  const scope: StableScope = { serverProfileId: record.serverProfileId };
+  for (const key of ['accountId', 'worldGenerationId'] as const) {
+    if (typeof record[key] === 'string' && record[key]) scope[key] = record[key] as string;
+  }
+  const dimension = typeof record.dimensionId === 'string' && record.dimensionId
+    ? record.dimensionId
+    : typeof record.dimension === 'string' && record.dimension ? record.dimension : undefined;
+  if (dimension) scope.dimensionId = dimension;
   return scope;
+}
+export const stableScopeKey = (scope: StableScope): string => JSON.stringify([
+  scope.serverProfileId, scope.accountId ?? null, scope.worldGenerationId ?? null, scope.dimensionId ?? null,
+]);
+export function sameStableScope(left: unknown, right: unknown): boolean {
+  const a = stableScopeOf(left); const b = stableScopeOf(right);
+  return Boolean(a && b && stableScopeKey(a) === stableScopeKey(b));
+}
+const coreScope = (value: unknown) => stableScopeOf(value);
+/**
+ * Strict SQL scope predicate: an omitted stable field matches only rows that also omit it.
+ * Stored body contexts use `dimension`; memory scopes use `dimensionId`, so both are accepted.
+ */
+const scopeExpression = (column: string, key: (typeof MEMORY_SCOPE_KEYS)[number]): string => {
+  if (key === 'serverProfileId') {
+    // Legacy rows may store a bare profile string instead of a body context object.
+    return `COALESCE(json_extract(${column}, '$.serverProfileId'), CASE WHEN json_type(${column})='text' THEN json_extract(${column}, '$') END)`;
+  }
+  if (key === 'dimensionId') return `COALESCE(json_extract(${column}, '$.dimensionId'), json_extract(${column}, '$.dimension'))`;
+  return `json_extract(${column}, '$.${key}')`;
 };
-/** Strict scope predicate: an omitted stable field matches only rows that also omit it. */
-const scopePredicate = (scope: Partial<Record<(typeof MEMORY_SCOPE_KEYS)[number], string>>) => {
+/** Strict SQL scope predicate: an omitted stable field matches only rows that also omit it. */
+const scopePredicate = (scope: StableScope) => {
   const clauses: string[] = []; const values: unknown[] = [];
   for (const key of MEMORY_SCOPE_KEYS) {
-    if (scope[key] !== undefined) { clauses.push(`json_extract(context, '$.${key}')=?`); values.push(scope[key]!); }
-    else clauses.push(`json_extract(context, '$.${key}') IS NULL`);
+    const expression = scopeExpression('context', key);
+    if (scope[key] !== undefined) { clauses.push(`${expression}=?`); values.push(scope[key]!); }
+    else clauses.push(`${expression} IS NULL`);
   }
   return { sql: clauses.join(' AND '), values };
+};
+/** Scope predicate over a specific JSON column (goals.body_context, executions.context, ...). */
+const columnScopePredicate = (scope: StableScope, column: string) => {
+  const clauses: string[] = []; const values: unknown[] = [];
+  for (const key of MEMORY_SCOPE_KEYS) {
+    const expression = scopeExpression(column, key);
+    if (scope[key] !== undefined) { clauses.push(`${expression}=?`); values.push(scope[key]!); }
+    else clauses.push(`${expression} IS NULL`);
+  }
+  return { sql: clauses.join(' AND '), values };
+};
+const boundedLimit = (value: number | undefined, fallback = 100, maximum = 500) => {
+  if (value === undefined) return Math.min(fallback, maximum);
+  if (!Number.isFinite(value)) throw new Error('invalid-limit');
+  return Math.min(Math.max(Math.trunc(value), 1), maximum);
+};
+const boundedCursor = (value: string | undefined) => {
+  if (value === undefined) return 0;
+  const cursor = Number(value);
+  if (!Number.isInteger(cursor) || cursor < 0) throw new Error('invalid-cursor');
+  return cursor;
 };
 
 export class SQLiteStore {
@@ -67,7 +122,7 @@ export class SQLiteStore {
         body_context TEXT NOT NULL, spec_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS executions(execution_id TEXT PRIMARY KEY, proposal_id TEXT UNIQUE NOT NULL,
         proposal_hash TEXT NOT NULL, goal_id TEXT NOT NULL, skill_id TEXT NOT NULL, skill_version TEXT NOT NULL,
-        status TEXT NOT NULL, reason TEXT, outcome TEXT, checkpoint_json TEXT);
+        status TEXT NOT NULL, reason TEXT, outcome TEXT, checkpoint_json TEXT, context TEXT);
       CREATE TABLE IF NOT EXISTS effects(effect_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL REFERENCES executions(execution_id) ON DELETE CASCADE, context TEXT NOT NULL,
         status TEXT NOT NULL, intent_json TEXT NOT NULL, evidence_json TEXT);
       CREATE TABLE IF NOT EXISTS critical_events(event_seq TEXT PRIMARY KEY, event_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -91,6 +146,10 @@ export class SQLiteStore {
     `);
     const receiptColumns = this.db.prepare('PRAGMA table_info(action_receipts)').all() as Array<{ name: string }>;
     if (!receiptColumns.some(column => column.name === 'payload_hash')) this.db.exec('ALTER TABLE action_receipts ADD COLUMN payload_hash TEXT');
+    // Executions are scoped to the stable body identity. Existing rows keep a NULL scope and are
+    // hidden from control reads until an effect or goal supplies their context (fail closed).
+    const executionColumns = this.db.prepare('PRAGMA table_info(executions)').all() as Array<{ name: string }>;
+    if (!executionColumns.some(column => column.name === 'context')) this.db.exec('ALTER TABLE executions ADD COLUMN context TEXT');
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)').run(now());
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)').run(now());
     this.db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)').run(now());
@@ -152,20 +211,42 @@ export class SQLiteStore {
 
   saveExecution(e: any) {
     const existing = this.db.prepare('SELECT * FROM executions WHERE proposal_id=?').get(e.proposalId) as any;
+    // Scope is captured once, from the explicit context or a reliable durable mapping:
+    // the originating goal's body context, or the context of an effect already written for
+    // this execution. An unscoped execution is never shown by a scoped control read.
+    const contextJson = this.executionContextJson(e);
     if (existing) {
       if (existing.proposal_hash !== e.proposalHash) throw new Error('proposal-id-conflict');
       // A late writer must not resurrect or overwrite a terminal execution.
       if (executionTerminal.has(existing.status) && existing.status !== e.status) return this.getExecution(existing.execution_id) ?? this.getExecution(existing.proposal_id);
       this.db.prepare(`UPDATE executions SET status=?, reason=COALESCE(?,reason), outcome=COALESCE(?,outcome),
-        checkpoint_json=COALESCE(?,checkpoint_json) WHERE proposal_id=?`)
-        .run(e.status, e.reason ?? null, e.outcome ?? null, e.checkpoint ? json(e.checkpoint) : null, e.proposalId);
+        checkpoint_json=COALESCE(?,checkpoint_json), context=COALESCE(?,context) WHERE proposal_id=?`)
+        .run(e.status, e.reason ?? null, e.outcome ?? null, e.checkpoint ? json(e.checkpoint) : null, contextJson, e.proposalId);
       return this.getExecution(e.executionId) ?? this.getExecution(e.proposalId);
     }
     this.db.prepare(`INSERT INTO executions(execution_id,proposal_id,proposal_hash,goal_id,skill_id,skill_version,
-      status,reason,outcome,checkpoint_json) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      status,reason,outcome,checkpoint_json,context) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
       .run(e.executionId, e.proposalId, e.proposalHash, e.goalId, e.skillId, e.skillVersion, e.status,
-        e.reason ?? null, e.outcome ?? null, e.checkpoint ? json(e.checkpoint) : null);
+        e.reason ?? null, e.outcome ?? null, e.checkpoint ? json(e.checkpoint) : null, contextJson);
     return e;
+  }
+
+  private executionContextJson(e: any): string | null {
+    if (e.context !== undefined) return json(e.context);
+    if (typeof e.goalId === 'string') {
+      const goal = this.getGoal(e.goalId);
+      if (goal && goal.context !== undefined) return json(goal.context);
+    }
+    if (typeof e.executionId === 'string') {
+      const effect = this.db.prepare('SELECT context FROM effects WHERE execution_id=? ORDER BY effect_id LIMIT 1').get(e.executionId) as { context?: string } | undefined;
+      if (effect?.context) return effect.context;
+    }
+    return null;
+  }
+
+  private linkExecutionScope(executionId: string, context: unknown) {
+    if (context === undefined) return;
+    this.db.prepare('UPDATE executions SET context=? WHERE execution_id=? AND context IS NULL').run(json(context), executionId);
   }
 
   getExecution(id: string) {
@@ -181,6 +262,7 @@ export class SQLiteStore {
       reason: row.reason ?? undefined,
       outcome: row.outcome ?? undefined,
       checkpoint: row.checkpoint_json ? parse(row.checkpoint_json) : undefined,
+      context: row.context ? parse(row.context) : undefined,
       execution_id: row.execution_id,
       proposal_id: row.proposal_id,
       proposal_hash: row.proposal_hash,
@@ -206,10 +288,12 @@ export class SQLiteStore {
       if ((effectRank[e.status] ?? -1) < (effectRank[existing.status] ?? -1)) return this.getEffect(e.effectId);
       this.db.prepare('UPDATE effects SET status=?, evidence_json=COALESCE(?, evidence_json) WHERE effect_id=?')
         .run(e.status, e.evidence === undefined ? null : json(e.evidence), e.effectId);
+      this.linkExecutionScope(e.executionId, e.context);
       return this.getEffect(e.effectId);
     }
     this.db.prepare(`INSERT INTO effects(effect_id,execution_id,context,status,intent_json,evidence_json)
       VALUES (?,?,?,?,?,?)`).run(e.effectId, e.executionId, json(e.context), e.status, json(e.intent), e.evidence === undefined ? null : json(e.evidence));
+    this.linkExecutionScope(e.executionId, e.context);
     return this.getEffect(e.effectId);
   }
 
@@ -293,10 +377,14 @@ export class SQLiteStore {
       VALUES (?,?,?,?,?)`).run(String(e.seq), e.eventId, e.kind, json(e.context ?? 'simulated'), json(e.payload));
   }
 
-  getCriticalEvents(after = '0', limit = 100, kind?: string) {
-    const sql = `SELECT * FROM critical_events WHERE CAST(event_seq AS INTEGER)>CAST(? AS INTEGER) ${kind ? 'AND kind=?' : ''}
-      ORDER BY CAST(event_seq AS INTEGER) LIMIT CAST(? AS INTEGER)`;
-    const values = kind ? [String(after), kind, String(limit)] : [String(after), String(limit)];
+  getCriticalEvents(after = '0', limit = 100, kind?: string, scopeValue?: unknown) {
+    const scope = scopeValue === undefined ? undefined : stableScopeOf(scopeValue);
+    const clauses = ['CAST(event_seq AS INTEGER)>CAST(? AS INTEGER)'];
+    const values: unknown[] = [String(after)];
+    if (kind) { clauses.push('kind=?'); values.push(kind); }
+    if (scope) { const predicate = scopePredicate(scope); clauses.push(predicate.sql); values.push(...predicate.values); }
+    values.push(String(limit));
+    const sql = `SELECT * FROM critical_events WHERE ${clauses.join(' AND ')} ORDER BY CAST(event_seq AS INTEGER) LIMIT CAST(? AS INTEGER)`;
     return (this.db.prepare(sql).all(...values) as any[])
       .map(row => ({ seq: row.event_seq, eventId: row.event_id, kind: row.kind, durable: true, context: parse(row.context), payload: parse(row.payload_json) }));
   }
@@ -311,11 +399,62 @@ export class SQLiteStore {
       .map(row => this.getExecution(row.execution_id)).filter((row): row is NonNullable<typeof row> => Boolean(row));
   }
 
+  /**
+   * Bounded scoped reads for the control surface. Rows from another world/account are never
+   * returned; rows whose scope could not be derived are hidden rather than guessed current.
+   */
+  listExecutionsForScope(scopeValue: unknown, options: { limit?: number; cursor?: string } = {}) {
+    const limit = boundedLimit(options.limit);
+    const start = boundedCursor(options.cursor);
+    const predicate = this.scopeWhere(scopeValue, 'context');
+    const rows = (this.db.prepare(`SELECT * FROM executions WHERE ${predicate.sql} ORDER BY execution_id LIMIT CAST(? AS INTEGER) OFFSET CAST(? AS INTEGER)`)
+      .all(...predicate.values, limit + 1, start) as any[]).map(row => this.getExecution(row.execution_id)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+    return { items: rows.slice(0, limit), truncated: rows.length > limit, ...(rows.length > limit ? { nextCursor: String(start + limit) } : {}) };
+  }
+
+  countExecutionsForScope(scopeValue: unknown): number {
+    const predicate = this.scopeWhere(scopeValue, 'context');
+    return Number((this.db.prepare(`SELECT COUNT(*) AS count FROM executions WHERE ${predicate.sql}`).get(...predicate.values) as { count?: number } | undefined)?.count ?? 0);
+  }
+
   listEffects(executionId?: string) {
     const rows = (executionId
       ? this.db.prepare('SELECT * FROM effects WHERE execution_id=? ORDER BY effect_id').all(executionId)
       : this.db.prepare('SELECT * FROM effects ORDER BY effect_id').all()) as any[];
-    return rows.map(row => ({ ...row, effectId: row.effect_id, executionId: row.execution_id, context: parse(row.context), intent: parse(row.intent_json), evidence: row.evidence_json ? parse(row.evidence_json) : undefined }));
+    return rows.map(row => this.effectRow(row));
+  }
+
+  private effectRow(row: any) {
+    return { ...row, effectId: row.effect_id, executionId: row.execution_id, context: parse(row.context), intent: parse(row.intent_json), evidence: row.evidence_json ? parse(row.evidence_json) : undefined };
+  }
+
+  listEffectsForScope(scopeValue: unknown, options: { executionId?: string; limit?: number; cursor?: string } = {}) {
+    const limit = boundedLimit(options.limit);
+    const start = boundedCursor(options.cursor);
+    const predicate = this.scopeWhere(scopeValue, 'context');
+    const clauses = [predicate.sql];
+    const values: unknown[] = [...predicate.values];
+    if (options.executionId) { clauses.push('execution_id=?'); values.push(options.executionId); }
+    values.push(limit + 1, start);
+    const rows = (this.db.prepare(`SELECT * FROM effects WHERE ${clauses.join(' AND ')} ORDER BY effect_id LIMIT CAST(? AS INTEGER) OFFSET CAST(? AS INTEGER)`)
+      .all(...values) as any[]).map(row => this.effectRow(row));
+    return { items: rows.slice(0, limit), truncated: rows.length > limit, ...(rows.length > limit ? { nextCursor: String(start + limit) } : {}) };
+  }
+
+  countEffectsForScope(scopeValue: unknown): number {
+    const predicate = this.scopeWhere(scopeValue, 'context');
+    return Number((this.db.prepare(`SELECT COUNT(*) AS count FROM effects WHERE ${predicate.sql}`).get(...predicate.values) as { count?: number } | undefined)?.count ?? 0);
+  }
+
+  countPendingEffectsForScope(scopeValue: unknown): number {
+    const predicate = this.scopeWhere(scopeValue, 'context');
+    return Number((this.db.prepare(`SELECT COUNT(*) AS count FROM effects WHERE ${predicate.sql} AND status NOT IN ('confirmed','partial')`).get(...predicate.values) as { count?: number } | undefined)?.count ?? 0);
+  }
+
+  effectStatusCountsForScope(scopeValue: unknown): Record<string, number> {
+    const predicate = this.scopeWhere(scopeValue, 'context');
+    const rows = this.db.prepare(`SELECT status, COUNT(*) AS count FROM effects WHERE ${predicate.sql} GROUP BY status`).all(...predicate.values) as Array<{ status: string; count: number }>;
+    return Object.fromEntries(rows.map(row => [row.status, Number(row.count)]));
   }
 
   listActionReceipts(scope?: string) {
@@ -328,6 +467,35 @@ export class SQLiteStore {
   listGoals() {
     return (this.db.prepare('SELECT goal_id FROM goals ORDER BY goal_id').all() as { goal_id: string }[])
       .map(row => this.getGoal(row.goal_id)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+  }
+
+  listGoalsForScope(scopeValue: unknown, options: { limit?: number; cursor?: string } = {}) {
+    const limit = boundedLimit(options.limit);
+    const start = boundedCursor(options.cursor);
+    const predicate = this.scopeWhere(scopeValue, 'body_context');
+    const rows = (this.db.prepare(`SELECT goal_id FROM goals WHERE ${predicate.sql} ORDER BY goal_id LIMIT CAST(? AS INTEGER) OFFSET CAST(? AS INTEGER)`)
+      .all(...predicate.values, limit + 1, start) as Array<{ goal_id: string }>)
+      .map(row => this.getGoal(row.goal_id)).filter((row): row is NonNullable<typeof row> => Boolean(row));
+    return { items: rows.slice(0, limit), truncated: rows.length > limit, ...(rows.length > limit ? { nextCursor: String(start + limit) } : {}) };
+  }
+
+  countGoalsForScope(scopeValue: unknown): number {
+    const predicate = this.scopeWhere(scopeValue, 'body_context');
+    return Number((this.db.prepare(`SELECT COUNT(*) AS count FROM goals WHERE ${predicate.sql}`).get(...predicate.values) as { count?: number } | undefined)?.count ?? 0);
+  }
+
+  /** The first active/paused goal in this exact scope; bounded to one row. */
+  findGoalForScope(scopeValue: unknown, statuses: string[] = ['active', 'paused']) {
+    const predicate = this.scopeWhere(scopeValue, 'body_context');
+    const placeholders = statuses.map(() => '?').join(',');
+    const row = this.db.prepare(`SELECT goal_id FROM goals WHERE ${predicate.sql}${statuses.length ? ` AND status IN (${placeholders})` : ''} ORDER BY goal_id LIMIT 1`)
+      .get(...predicate.values, ...statuses) as { goal_id?: string } | undefined;
+    return row?.goal_id ? this.getGoal(row.goal_id) : undefined;
+  }
+
+  private scopeWhere(scopeValue: unknown, column: string) {
+    const scope = stableScopeOf(scopeValue);
+    return scope ? columnScopePredicate(scope, column) : { sql: '1=1', values: [] as unknown[] };
   }
 
   reviseGoal(goalId: string, expectedRevision: number, change: string) {
@@ -359,12 +527,14 @@ export class SQLiteStore {
   savePlace(place: { placeId: string; context: unknown; status: string; lastVerifiedAt?: string; payload: unknown; provenance?: unknown; revision?: number; expectedRevision?: number; invalidatedReason?: string }) {
     // A place id is only unique inside its scope: the same place in another world must not
     // overwrite this one. Legacy single-column layouts are widened to (place_id, context).
-    const reuse = place.context === undefined ? undefined : this.findPlaceByScope(place.placeId, place.context) as { rowid: number; revision: number; provenance?: unknown } | undefined;
+    const reuse = place.context === undefined ? undefined : this.findPlaceByScope(place.placeId, place.context) as { rowid: number; revision: number; provenance_json?: string | null } | undefined;
     const timestamp = now();
     if (reuse) {
       if (place.expectedRevision !== undefined && Number(reuse.revision ?? 0) !== place.expectedRevision) throw new Error(`place-revision-conflict:${Number(reuse.revision ?? 0)}`);
       const revision = Number(reuse.revision ?? 0) + 1;
-      const provenance = place.provenance === undefined ? reuse.provenance ?? null : json(place.provenance);
+      // The raw TEXT value from the row must be reused verbatim. Binding the parsed provenance
+      // object to a TEXT column throws (or corrupts JSON) when a later save omits provenance.
+      const provenance = place.provenance === undefined ? reuse.provenance_json ?? null : json(place.provenance);
       this.db.prepare(`UPDATE places SET context=?, status=?, last_verified_at=?, payload_json=?, revision=?, provenance_json=?,
         invalidated_reason=?, updated_at=? WHERE rowid=?`)
         .run(json(place.context), place.status, place.lastVerifiedAt ?? null, json(place.payload), revision, provenance,

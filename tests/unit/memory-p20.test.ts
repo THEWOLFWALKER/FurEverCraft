@@ -12,7 +12,7 @@ const scope = { serverProfileId: 'fixture', accountId: 'account-a', worldGenerat
 const otherWorld = { ...scope, worldGenerationId: 'world-b' };
 const nether = { ...scope, dimensionId: 'the_nether' };
 const otherAccount = { ...scope, accountId: 'account-b' };
-const memoryFor = (store: SQLiteStore) => new MemoryService(store, [], { now: () => now, freshnessMaxAgeMs: 60_000 });
+const memoryFor = (store: SQLiteStore) => new MemoryService(store, [], { wallNow: () => now, freshnessMaxAgeMs: 60_000 });
 
 function knowledgeRelease(): KnowledgeRelease {
   return {

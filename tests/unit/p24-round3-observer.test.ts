@@ -212,7 +212,8 @@ describe('Round 3 — relay IPC backpressure is explicit and bounded', () => {
     let accept = false;
     const sent: Array<Record<string, any>> = [];
     const publisher = createRelayObserverPublisher(
-      { send: message => { if (accept) sent.push(message as Record<string, any>); return accept; } },
+      // A throw is the only rejection signal; false would mean "queued" (see Round 5).
+      { send: message => { if (!accept) throw new Error('channel-unavailable'); sent.push(message as Record<string, any>); return true; } },
       'relay_synthetic_session',
     );
     const observation = (frameSequence: string): ObserverEvent => ({

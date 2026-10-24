@@ -3,6 +3,11 @@
  * than the parent drains them, so sends must never grow without bound. Control messages are
  * tracked separately: losing one makes the reported state unknown instead of silently
  * pretending the parent saw it.
+ *
+ * Channel contract: the `send` callback returns false when Node accepted and queued the
+ * message on a backed-up channel. That is a successful hand-off, not a rejection, so the
+ * entry is removed from this queue and is never retried. A synchronous throw is the only
+ * signal that the message was not handed off; that entry stays queued for a later flush.
  */
 export type IpcOutboxOptions = {
   maxMessages: number;
@@ -13,7 +18,7 @@ export type IpcOutboxOptions = {
 export type IpcMessageLike = { type?: string; [key: string]: unknown };
 type Entry = { message: IpcMessageLike; bytes: number; control: boolean };
 export type OutboxPushResult = { accepted: boolean; dropped: number; controlLost: boolean; bytes: number };
-export type OutboxFlushResult = { sent: number; queued: number; bytes: number; controlLost: boolean };
+export type OutboxFlushResult = { sent: number; queued: number; bytes: number; controlLost: boolean; transportError: boolean };
 
 const CONTROL_TYPES = new Set(['state', 'relay-exit', 'relay-restart', 'fatal', 'shutdown', 'ipc-overflow', 'control-revoked']);
 
@@ -54,14 +59,25 @@ export class BoundedIpcOutbox {
 
   flush(send: (message: IpcMessageLike) => boolean): OutboxFlushResult {
     let sent = 0;
+    let transportError = false;
     while (this.entries.length > 0) {
       const entry = this.entries[0]!;
-      if (!send(entry.message)) break;
+      let queuedByChannel: boolean;
+      try {
+        // false = accepted and queued by the channel, so it is a successful hand-off.
+        queuedByChannel = send(entry.message) === false;
+      } catch {
+        transportError = true;
+        break;
+      }
       this.entries.shift();
       this.bytes -= entry.bytes;
       sent += 1;
+      // Stop duty flushing when the channel is backed up, but never retain/retry this
+      // message: Node already owns it and a second send would duplicate it.
+      if (queuedByChannel) break;
     }
-    return { sent, queued: this.entries.length, bytes: this.bytes, controlLost: this.controlLost };
+    return { sent, queued: this.entries.length, bytes: this.bytes, controlLost: this.controlLost, transportError };
   }
 
   queued(): { messages: number; bytes: number; dropped: number; controlLost: boolean } {

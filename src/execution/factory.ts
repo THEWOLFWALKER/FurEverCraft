@@ -50,6 +50,13 @@ export type RuntimeFactoryOptions = {
   store?: SQLiteStore;
   events?: EventHub;
   provider?: ModelProvider;
+  /**
+   * Explicit provider registry for the canonical loop (for example `{ openai, anthropic }`).
+   * Supplying this enables provider switching: every entry is registered, and the initial
+   * provider is selected by `modelProvider` (or the first entry). These providers are injected
+   * dependencies, hence offline (`networkEnabled: false`).
+   */
+  providers?: Record<string, ModelProvider>;
   /** Explicit body adapter. `bridge` is the legacy alias for the same dependency. */
   body?: ClientBridgeCapabilities;
   bridge?: ClientBridgeCapabilities;
@@ -81,6 +88,8 @@ export type RuntimeFactoryOptions = {
 };
 export type RuntimeAssembly = {
   bridge: ClientBridgeCapabilities;
+  /** The profile this runtime was actually assembled from, separate from the body/server id. */
+  runtimeProfile: RuntimeProfile;
   store: SQLiteStore;
   session: SessionRuntime;
   router: ToolRouter;
@@ -144,37 +153,88 @@ function assertBodyAdapterContext(bridge: ClientBridgeCapabilities, adapter: Bod
   if (actual.dimension !== expected.dimension) throw mismatch('dimension');
 }
 
-type ResolvedProvider = { provider: ModelProvider; metadata: ProviderMetadata; canonical: boolean; providerName: ProviderMetadata['provider'] };
+type ResolvedProvider = {
+  provider: ModelProvider;
+  metadata: ProviderMetadata;
+  canonical: boolean;
+  /** Registry key used by ProviderSession/AgentLoop (may be a caller-defined name). */
+  providerName: string;
+  registry: Record<string, ModelProvider>;
+  metadataByName: Record<string, ProviderMetadata>;
+};
+
+function metadataProviderName(name: string): ProviderMetadata['provider'] {
+  return name === 'openai' || name === 'anthropic' || name === 'scripted' ? name : 'unknown';
+}
+
+/** Injected providers are fixture/offline dependencies; metadata must say so. */
+function injectedMetadata(name: string, provider: ModelProvider, model?: string): ProviderMetadata {
+  return {
+    provider: metadataProviderName(name),
+    configured: !(provider instanceof UnavailableProvider),
+    ...(model ? { model } : {}),
+    networkEnabled: false,
+    transport: 'fixture',
+  };
+}
 
 /**
  * The only provider gate. A configured network provider is built by createConfiguredProvider;
  * the factory never constructs a FetchTransport directly and metadata comes from that result.
+ *
+ * Every resolved assembly also returns a registry of all providers it could switch to. A
+ * singleton configuration registers only itself (an honest boundary); an explicit injected
+ * registry registers every entry.
  */
 function resolveProvider(options: RuntimeFactoryOptions): ResolvedProvider {
+  if (options.providers) {
+    const registry: Record<string, ModelProvider> = { ...options.providers };
+    // An explicitly injected single provider is also registered when its inferred key is free.
+    if (options.provider) {
+      const inferred = inferProviderName(options.provider);
+      if (!(inferred in registry)) registry[inferred] = options.provider;
+    }
+    if (Object.keys(registry).length === 0) throw new Error('provider-registry-empty');
+    const requested = options.modelProvider;
+    if (requested && !registry[requested]) throw new Error(`provider-registry-missing:${requested}`);
+    const providerName = requested ?? Object.keys(registry)[0]!;
+    const metadataByName: Record<string, ProviderMetadata> = Object.fromEntries(
+      Object.entries(registry).map(([name, provider]) => [name, injectedMetadata(name, provider, options.model)]),
+    );
+    return {
+      provider: registry[providerName]!,
+      metadata: { ...metadataByName[providerName]! },
+      canonical: true,
+      providerName,
+      registry,
+      metadataByName,
+    };
+  }
   if (options.provider) {
     // Injected providers are the scripted/fixture path. They are never treated as
     // network-enabled and keep the legacy AgentLoop.
     const providerName = options.modelProvider ?? inferProviderName(options.provider);
+    const metadata = injectedMetadata(providerName, options.provider, options.model);
     return {
       provider: options.provider,
-      metadata: {
-        provider: providerName,
-        configured: !(options.provider instanceof UnavailableProvider),
-        ...(options.model ? { model: options.model } : {}),
-        networkEnabled: false,
-        transport: 'fixture',
-      },
+      metadata: { ...metadata },
       canonical: false,
       providerName,
+      registry: { [providerName]: options.provider },
+      metadataByName: { [providerName]: metadata },
     };
   }
   const requested = options.modelProvider ?? 'scripted';
   if (requested === 'scripted') {
+    const metadata: ProviderMetadata = { provider: 'scripted', configured: false, ...(options.model ? { model: options.model } : {}), networkEnabled: false, transport: 'unavailable' };
+    const provider = new UnavailableProvider('scripted provider not configured');
     return {
-      provider: new UnavailableProvider('scripted provider not configured'),
-      metadata: { provider: 'scripted', configured: false, ...(options.model ? { model: options.model } : {}), networkEnabled: false, transport: 'unavailable' },
+      provider,
+      metadata: { ...metadata },
       canonical: false,
       providerName: 'scripted',
+      registry: { scripted: provider },
+      metadataByName: { scripted: metadata },
     };
   }
   const configured = createConfiguredProvider({
@@ -185,20 +245,23 @@ function resolveProvider(options: RuntimeFactoryOptions): ResolvedProvider {
     model: options.model,
     transport: options.transport,
   });
+  const metadata: ProviderMetadata = {
+    provider: configured.name,
+    configured: configured.configured,
+    ...(options.model ? { model: options.model } : {}),
+    // Truth comes from the gate, not from the raw option: an injected transport is offline
+    // and a disabled gate can never report networkEnabled=true.
+    networkEnabled: configured.networkEnabled,
+    transport: options.transport ? 'fixture' : configured.networkEnabled ? 'network' : 'unavailable',
+  };
   return {
     provider: configured.provider,
-    metadata: {
-      provider: configured.name,
-      configured: configured.configured,
-      ...(options.model ? { model: options.model } : {}),
-      // Truth comes from the gate, not from the raw option: an injected transport is offline
-      // and a disabled gate can never report networkEnabled=true.
-      networkEnabled: configured.networkEnabled,
-      transport: options.transport ? 'fixture' : configured.networkEnabled ? 'network' : 'unavailable',
-    },
+    metadata: { ...metadata },
     // The canonical ProviderSession path is the production path only for a configured provider.
     canonical: configured.configured,
     providerName: configured.name,
+    registry: { [configured.name]: configured.provider },
+    metadataByName: { [configured.name]: metadata },
   };
 }
 
@@ -270,22 +333,32 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     const resolvedProvider = resolveProvider(options);
     const provider = resolvedProvider.provider;
     const memory = new MemoryService(store, [], { now: () => clock.now() });
-    const memoryScope = memoryScopeOf(bridge.context);
+    // The stable scope is derived from the current body context. Connection/body epochs are
+    // excluded, but a dimension/account/world change must move control reads to the new scope
+    // instead of leaving them pointed at the scope captured at assembly time.
+    const scopeOf = () => memoryScopeOf(bridge.context);
+    const memoryScope = scopeOf();
     const knowledge = new KnowledgeService({ store });
     const lifecycle = new SkillLifecycle(undefined, { now: () => clock.now() });
     const nav: RuntimeNavPort = options.nav ?? { navigate };
     const motor = options.motor;
     const router = new ToolRouter(bridge, store, session.events, executor, memory, () => clock.now(), admission, { knowledge, lifecycle, memoryScope, nav, ...(motor ? { motor } : {}) });
-    const loop = new AgentLoop(provider, router, 8, { canonical: resolvedProvider.canonical, providerName: resolvedProvider.providerName });
+    const loop = new AgentLoop(provider, router, 8, {
+      canonical: resolvedProvider.canonical,
+      providerName: resolvedProvider.providerName,
+      providers: resolvedProvider.registry,
+      providerMetadata: resolvedProvider.metadata,
+      providerMetadataByName: resolvedProvider.metadataByName,
+    });
     const providerMetadata = resolvedProvider.metadata;
     const control = new ControlService(undefined, providerMetadata);
-    const goalManager = new GoalManager(store, session.events);
+    const goalManager = new GoalManager(store, session.events, () => bridge.context);
     // The scheduler's wake hook really advances one decision turn through the same AgentLoop.
     const scheduler = new TaskScheduler(session.events, async (reason) => {
       if (control.pausedValue || control.stoppingValue) return;
-      // Use the actual active goal (and its revision) so user goals can progress; without one
-      // there is nothing to drive and the wake is a no-op.
-      const active = store.listGoals().find(goal => goal.status === 'active');
+      // Only a goal in this exact body scope may drive a turn: a goal from another
+      // account/world/dimension is not this runtime's work.
+      const active = store.findGoalForScope(scopeOf(), ['active']);
       if (!active) return;
       await loop.run([{ role: 'user', content: `Scheduler wake: ${reason}. Continue the active goal or report the next blocked step.` }], undefined, undefined, { goalId: active.goal_id, goalRevision: active.revision, store, owner: session.ownerId });
     }, 25);
@@ -308,8 +381,10 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     let closed = false;
     const startBridgeService = bridgeService ? async () => { await bridgeService.start(); } : undefined;
     const assembly = {
-      bridge, store, session, router, provider, providerMetadata, loop, clock, control, goalManager, scheduler, sessionSupervisor,
-      memory, memoryScope, knowledge, lifecycle, ...(bodyAdapter ? { bodyAdapter } : {}),
+      bridge, runtimeProfile: profile, store, session, router, provider, providerMetadata, loop, clock, control, goalManager, scheduler, sessionSupervisor,
+      memory, knowledge, lifecycle, ...(bodyAdapter ? { bodyAdapter } : {}),
+      /** Recomputed on read so a dimension/world change closes the previous scope immediately. */
+      get memoryScope() { return scopeOf(); },
       providerSession: loop.providerSession, canonicalProviderPath: loop.canonicalPath,
       ...(bridgeService ? { bridgeService, startBridgeService } : {}),
       dependencies, ownerId: session.ownerId, inputsEnabled, controlOpen, ownership,

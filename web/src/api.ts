@@ -32,14 +32,33 @@ export type Place = {
   payload?: unknown; context?: unknown; freshness?: string; fresh?: boolean; revision?: number;
 };
 export type Provider = { provider?: string; configured?: boolean; model?: string; networkEnabled?: boolean; transport?: string };
+export type InputControl = { open?: boolean; state?: 'available' | 'disabled'; reason?: string };
 export type Capabilities = {
-  profile?: string; provider?: Provider;
+  profile?: string;
+  /** Attached body/server identity; `profile` is the legacy alias for this value. */
+  serverProfileId?: string;
+  /** The assembled Runtime profile (for example `simulated-3d`), not the body identity. */
+  runtimeProfile?: string;
+  provider?: Provider;
   bridge?: Record<string, unknown> & { limitations?: string[]; source?: string };
   skills?: string[] | boolean;
   inputsEnabled?: boolean;
+  effectiveInputsEnabled?: boolean;
+  inputControl?: InputControl;
   limitations?: string[];
 };
-export type Config = { provider?: Provider; profile?: string; pairing?: boolean; cliAccess?: string };
+export type Config = { provider?: Provider; profile?: string; serverProfileId?: string; runtimeProfile?: string; pairing?: boolean; cliAccess?: string };
+/**
+ * Public, non-secret bootstrap document. It tells the browser whether reads/writes need a
+ * pairing session, a CLI bearer (browser access disabled) or nothing (explicit loopback-open).
+ * It never carries the bearer, pairing code, session cookie or CSRF token.
+ */
+export type AuthMode = {
+  mode: 'pairing' | 'bearer-only' | 'loopback-open';
+  pairing: boolean;
+  bearerRequired: boolean;
+  browserAccess: 'pairing' | 'disabled' | 'open';
+};
 export type EventRecord = { seq: string; eventId: string; kind: string; payload?: unknown; durable?: boolean };
 export type EventRead = { events: EventRecord[]; gap: boolean; next: string; scannedCursor: string; availableFrom: string };
 export type Snapshot = Omit<Status, 'executions'> & {
@@ -77,6 +96,7 @@ const json = async <T>(response: Response): Promise<T> => {
 };
 
 export const api = {
+  authMode: () => fetch('/api/v1/auth-mode', { credentials: 'same-origin' }).then(r => json<AuthMode>(r)),
   status: () => fetch('/api/v1/status', { credentials: 'same-origin' }).then(r => json<Status>(r)),
   goals: () => fetch('/api/v1/goals', { credentials: 'same-origin' }).then(r => json<Goal[]>(r)),
   executions: () => fetch('/api/v1/executions', { credentials: 'same-origin' }).then(r => json<Execution[]>(r)),

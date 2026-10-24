@@ -1,5 +1,5 @@
 import type { ModelMessage, ModelProvider, ModelResponse, ToolCall } from './scripted/index.js';
-import { admitToolCalls, CanonicalHistory, isToolHistoryComplete, ToolExecutionLedger } from './canonical.js';
+import { admitToolCalls, assertModelResponse, CanonicalHistory, isToolHistoryComplete, ToolExecutionLedger } from './canonical.js';
 import { ProviderError } from './shared.js';
 
 export type ProviderSessionOptions = {
@@ -38,6 +38,8 @@ export class ProviderSession {
   private readonly execute: ProviderSessionOptions['execute'];
   private readonly maxTurns: number;
   private readonly maxParallelCalls: number;
+  /** Guards the ledger against a late read completion from an already-aborted run. */
+  private runEpoch = 0;
   readonly turns: ProviderSessionTurn[] = [];
 
   constructor(options: ProviderSessionOptions) {
@@ -67,6 +69,11 @@ export class ProviderSession {
   async run(input: string | ModelMessage, options: ProviderSessionRunOptions = {}): Promise<{ response: ModelResponse; turns: ProviderSessionTurn[] }> {
     const { signal } = options;
     if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+    // Replay suppression is scoped to this top-level user turn. The model-turn retry chain
+    // below still dedupes identical writes, while the next legitimate user turn can perform
+    // the same write again. Durable execution/proposal records cover restarts.
+    const runEpoch = ++this.runEpoch;
+    this.ledger.reset();
     this.history.append(typeof input === 'string' ? { role: 'user', content: input } : input);
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
@@ -81,10 +88,13 @@ export class ProviderSession {
         if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
         throw error;
       }
+      // Guard injected providers too: a malformed/truncated body is not a completed turn.
+      assertModelResponse(response, this.providerName);
       const calls = response.toolCalls?.length ? admitToolCalls(response, this.maxParallelCalls) : [];
       if (!calls.length) return { response, turns: this.turns };
-      // Persist the assistant turn exactly once, before any tool result exists.
-      this.history.appendAssistant(response, this.providerName);
+      // Persist the assistant turn exactly once, before any tool result exists. Use admitted
+      // calls so empty argument payloads are stored as valid JSON (`{}`).
+      this.history.appendAssistant({ ...response, toolCalls: calls }, this.providerName);
       const results = new Map<string, unknown>();
       const executed: string[] = [];
       const replayed: string[] = [];
@@ -97,44 +107,62 @@ export class ProviderSession {
       // Read-only calls may fan out; a write tool forces the whole batch through the ordered,
       // serial path so concurrent input cannot interleave at the body.
       const hasWrite = pending.some(call => this.ledger.isWrite(call.name));
-      if (!hasWrite) {
-        const settled = await Promise.all(pending.map(async call => {
-          if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
-          try {
-            const result = await this.execute(call, signal);
-            this.ledger.record(call, result);
-            executed.push(call.id);
-            return [call.id, result] as const;
-          } catch (error) {
-            // Tool failure is a tool result, not a provider failure; let the model see it.
-            const failure = { ok: false, error: error instanceof Error ? error.message : String(error) };
-            this.ledger.record(call, failure);
-            executed.push(call.id);
-            return [call.id, failure] as const;
-          }
-        }));
-        for (const [id, result] of settled) results.set(id, result);
-      } else {
-        for (const call of pending) {
-          if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
-          try {
-            const result = await this.execute(call, signal);
-            this.ledger.record(call, result);
-            executed.push(call.id);
-            results.set(call.id, result);
-          } catch (error) {
-            const failure = { ok: false, error: error instanceof Error ? error.message : String(error) };
-            this.ledger.record(call, failure);
-            executed.push(call.id);
-            results.set(call.id, failure);
+      try {
+        if (!hasWrite) {
+          await Promise.all(pending.map(async call => {
+            if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+            try {
+              const result = await this.execute(call, signal);
+              // A read that completed after this run was aborted/closed must not leak into a
+              // newer run's ledger.
+              if (runEpoch !== this.runEpoch) return;
+              this.ledger.record(call, result);
+              executed.push(call.id);
+              results.set(call.id, result);
+            } catch (error) {
+              // An abort is not a tool outcome: stop the chain and let the catch below close
+              // the turn with complete pairing.
+              if (signal?.aborted) throw error;
+              // A read that failed after this run was superseded must not leak into a newer run.
+              if (runEpoch !== this.runEpoch) return;
+              // Tool failure is a tool result, not a provider failure; let the model see it.
+              const failure = { ok: false, error: error instanceof Error ? error.message : String(error) };
+              this.ledger.record(call, failure);
+              executed.push(call.id);
+              results.set(call.id, failure);
+            }
+          }));
+        } else {
+          for (const call of pending) {
+            if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+            try {
+              const result = await this.execute(call, signal);
+              this.ledger.record(call, result);
+              executed.push(call.id);
+              results.set(call.id, result);
+            } catch (error) {
+              if (signal?.aborted) throw error;
+              const failure = { ok: false, error: error instanceof Error ? error.message : String(error) };
+              this.ledger.record(call, failure);
+              executed.push(call.id);
+              results.set(call.id, failure);
+            }
           }
         }
+      } catch (error) {
+        // An abort between sequential calls must not leave an assistant tool call without a
+        // result: the transcript would be poisoned and a provider switch would be refused.
+        // Record an explicit outcome for every call that has none yet (queued or canceled).
+        const aborted = { ok: false, error: 'aborted', canceled: true, reason: error instanceof Error ? error.message : String(error) };
+        for (const call of calls) if (!results.has(call.id)) results.set(call.id, aborted);
+        this.history.appendToolResults(calls, results);
+        throw error;
       }
       // Preserve assistant call order in the canonical tool results even when reads completed in
       // a different order. Anthropic requires this contiguous order.
       this.history.appendToolResults(calls, results);
-      this.turns.push({ provider: this.providerName, response, replayed, executed });
+      this.turns.push({ provider: this.providerName, response: { ...response, toolCalls: calls }, replayed, executed });
     }
-    return { response: { stopReason: 'max-turns', text: '' }, turns: this.turns };
+    throw new ProviderError('provider-max-turns', undefined, this.providerName);
   }
 }

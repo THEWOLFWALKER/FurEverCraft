@@ -2,11 +2,30 @@ import type { BodyContext } from '../contracts/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import { getAttachedBodyAdapter } from '../motor/contracts.js';
 import type { SQLiteStore } from '../persistence/store.js';
+import { findSkill, skillManifests } from '../skills/registry.js';
+
+/**
+ * Manifest resources that can only be exercised by driving body input. `ui` alone is
+ * deliberately excluded: observe_ui reads a snapshot without submitting input. Deriving
+ * the set from the registry keeps new input skills covered without a second hand list.
+ */
+const INPUT_RESOURCES: ReadonlySet<string> = new Set(['movement', 'view', 'hands', 'textEntry']);
 
 /** Skills that submit input to the body. Read-only observation skills are not listed. */
-export const INPUT_SKILLS: ReadonlySet<string> = new Set([
-  'navigate_to', 'send_chat', 'place_one', 'look_at', 'dig_one', 'collect_nearby', 'gather_blocks', 'return_to_place',
-]);
+export const INPUT_SKILLS: ReadonlySet<string> = new Set(
+  skillManifests
+    .filter(manifest => manifest.resources.some(resource => INPUT_RESOURCES.has(resource)))
+    .map(manifest => manifest.id),
+);
+
+/**
+ * Fail closed for input: an unregistered/unmapped skill cannot be proven read-only, so it
+ * must pass the input gate exactly like a known input-driving skill.
+ */
+export function skillRequiresInput(skillId: string): boolean {
+  const manifest = findSkill(skillId);
+  return manifest === undefined ? true : INPUT_SKILLS.has(manifest.id);
+}
 
 export type AdmissionCode =
   | 'goal-revision-conflict'
@@ -103,7 +122,7 @@ export class ExecutionAdmission {
     // Control lost (relay/observer/helper failure, IPC control loss) is a hard admission gate.
     // It is re-evaluated immediately before the dispatch barrier, not only at plan time.
     if (!this.controlOpen()) return { ok: false, code: 'control-revoked', message: 'bridge-control-revoked' };
-    if (INPUT_SKILLS.has(request.skillId) && !this.inputsEnabled()) {
+    if (skillRequiresInput(request.skillId) && !this.inputsEnabled()) {
       return { ok: false, code: 'input-disabled', message: 'input-disabled' };
     }
     if (request.signal?.aborted) return { ok: false, code: 'aborted', message: 'execution-aborted' };

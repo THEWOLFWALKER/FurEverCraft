@@ -39,6 +39,8 @@ export type TraceInputIntent = {
   context?: unknown;
   observedAt: number;
   source?: string;
+  /** True when replay reduced this entry to stay within the record-byte bound. */
+  truncated?: boolean;
 };
 
 export type TraceEffectState = {
@@ -49,6 +51,8 @@ export type TraceEffectState = {
   evidence?: unknown;
   context?: unknown;
   observedAt: number;
+  /** True when replay reduced this entry to stay within the record-byte bound. */
+  truncated?: boolean;
 };
 
 export type TracePolicy = {
@@ -103,18 +107,57 @@ type Entry<T> = { value: T; bytes: number; at: number };
 const jsonBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value) ?? 'null', 'utf8');
 const clone = <T>(value: T): T => structuredClone(value);
 
+/** Redaction/serialisation must never let a crafted value escape as an uncontrolled throw. */
+function redactSafely(value: unknown): unknown {
+  try { return redact(value); } catch { return '[UNAVAILABLE]'; }
+}
+
+function serializeSafely(value: unknown): { text: string; bytes: number; serializable: boolean } {
+  try {
+    const text = JSON.stringify(value) ?? 'null';
+    return { text, bytes: Buffer.byteLength(text, 'utf8'), serializable: true };
+  } catch {
+    // Circular, BigInt or otherwise non-JSON values are bounded to a marker instead.
+    const text = JSON.stringify({ truncated: true, serialization: 'unavailable' })!;
+    return { text, bytes: Buffer.byteLength(text, 'utf8'), serializable: false };
+  }
+}
+
+function safeJsonBytes(value: unknown): number { return serializeSafely(value).bytes; }
+
+/** Replace values JSON cannot represent so a bounded display entry stays serialisable. */
+function sanitizeJson<T>(value: T): T {
+  try { JSON.stringify(value); return value; } catch { /* fall through to per-field repair */ }
+  if (Array.isArray(value)) return value.map(item => sanitizeJson(item)) as T;
+  if (value && typeof value === 'object') {
+    const repaired: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(value)) {
+      try { JSON.stringify(nested); repaired[key] = nested; }
+      catch { repaired[key] = sanitizeJson(nested); }
+    }
+    return repaired as T;
+  }
+  return (typeof value === 'bigint' ? value.toString() : '[UNAVAILABLE]') as T;
+}
+
+/** Clone a value without allowing a non-cloneable crafted payload to abort replay. */
+function cloneSafely<T>(value: T): T {
+  try { return structuredClone(value); } catch { try { return JSON.parse(JSON.stringify(value)) as T; } catch { return { truncated: true } as T; } }
+}
+
 /**
  * Bound one payload to `maxBytes`. Any secret was already removed by `redact`
  * before serialisation, so even the preview cannot carry credentials.
  */
 function boundPayload(value: unknown, maxBytes: number): { payload: unknown; truncated: boolean } {
-  const redacted = redact(value);
-  const text = JSON.stringify(redacted) ?? 'null';
-  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return { payload: redacted, truncated: false };
+  const redacted = redactSafely(value);
+  const serialized = serializeSafely(redacted);
+  if (!serialized.serializable) return { payload: { truncated: true, serialization: 'unavailable' }, truncated: true };
+  if (serialized.bytes <= maxBytes) return { payload: redacted, truncated: false };
   // Reserve room for the wrapper fields; the preview is just a string slice.
   const keep = Math.max(0, maxBytes - 256);
   return {
-    payload: { truncated: true, originalBytes: Buffer.byteLength(text, 'utf8'), preview: text.slice(0, keep) },
+    payload: { truncated: true, originalBytes: serialized.bytes, preview: serialized.text.slice(0, keep) },
     truncated: true,
   };
 }
@@ -291,6 +334,16 @@ export type ReplayBoundaries = {
   sideEffects: 'not-resent';
 };
 
+export type ReplayTruncationReason = 'records' | 'record-bytes' | 'total-bytes' | 'input-intents' | 'effects' | 'gaps';
+/**
+ * Explicit evidence that replay applied the same boundary policy as capture.
+ * `omitted` counts document entries that were not delivered/rendered.
+ */
+export type ReplayTruncation = {
+  reasons: ReplayTruncationReason[];
+  omitted: { records: number; inputIntents: number; effects: number; gaps: number };
+};
+
 export type ReplayResult = {
   records: number;
   firstSeq?: string;
@@ -300,7 +353,14 @@ export type ReplayResult = {
   gap: boolean;
   gaps: ReplayGap[];
   dropped: number;
+  /** True when the document itself or the replay was bounded/truncated. */
   truncated: boolean;
+  /** True when replay had to omit input because it exceeded DEFAULT_TRACE_POLICY. */
+  replayTruncated: boolean;
+  /** Present only when replay was bounded; explains what was omitted. */
+  truncation?: ReplayTruncation;
+  /** Policy limits replay enforces regardless of what a crafted document declares. */
+  bounds: ReplayPolicyBounds;
   retentionGap?: ReplayRetentionGap;
   categories: { event: number; inputIntent: number; effectState: number };
   inputIntents: number;
@@ -310,6 +370,22 @@ export type ReplayResult = {
   faults: ReplayFault[];
   boundaries: ReplayBoundaries;
 };
+
+export type ReplayPolicyBounds = {
+  maxRecords: number;
+  maxRecordBytes: number;
+  maxBytes: number;
+};
+
+const REPLAY_BOUNDS: ReplayPolicyBounds = {
+  maxRecords: DEFAULT_TRACE_POLICY.maxRecords,
+  maxRecordBytes: DEFAULT_TRACE_POLICY.maxRecordBytes,
+  maxBytes: DEFAULT_TRACE_POLICY.maxBytes,
+};
+/** One gap can be produced per record, so the record bound also bounds the gap list. */
+const MAX_REPLAY_GAPS = DEFAULT_TRACE_POLICY.maxRecords;
+/** Guards BigInt parsing and keeps identity fields from dominating a record. */
+const MAX_SEQUENCE_DIGITS = 64;
 
 export type ReplayOptions = {
   /** Start replaying after this event cursor; a missing range is reported as a gap. */
@@ -358,12 +434,78 @@ function detectFaults(records: TraceRecord[]): ReplayFault[] {
 }
 
 /**
+ * Reduce one record to the per-record byte bound while preserving its identity
+ * (seq/kind/category) so gap detection and fault classification still work.
+ */
+function boundReplayRecord(record: TraceRecord, maxBytes: number): { value: TraceRecord; reduced: boolean } {
+  const base: TraceRecord = {
+    seq: record.seq,
+    eventId: typeof record.eventId === 'string' ? record.eventId : String(record.eventId ?? ''),
+    kind: typeof record.kind === 'string' ? record.kind : String(record.kind ?? ''),
+    payload: redactSafely(record.payload),
+    durable: record.durable === true,
+    ...(typeof record.observedAt === 'number' && Number.isFinite(record.observedAt) ? { observedAt: record.observedAt } : {}),
+    ...(record.category === 'event' || record.category === 'input-intent' || record.category === 'effect-state' ? { category: record.category } : {}),
+    ...(record.context === undefined ? {} : { context: redactSafely(record.context) }),
+    ...(record.truncated === true ? { truncated: true } : {}),
+  };
+  const baseSerialized = serializeSafely(base);
+  if (baseSerialized.serializable && baseSerialized.bytes <= maxBytes) return { value: base, reduced: false };
+  const reduced: TraceRecord = {
+    ...base,
+    eventId: base.eventId.length > 256 ? `${base.eventId.slice(0, 256)}…` : base.eventId,
+    kind: base.kind.length > 256 ? `${base.kind.slice(0, 256)}…` : base.kind,
+    payload: boundPayload(base.payload, Math.max(256, Math.floor(maxBytes / 2))).payload,
+    ...(base.context === undefined ? {} : { context: boundPayload(base.context, Math.max(256, Math.floor(maxBytes / 4))).payload }),
+    truncated: true,
+  };
+  if (safeJsonBytes(reduced) <= maxBytes) return { value: reduced, reduced: true };
+  // Identity fields themselves are oversized: keep a minimal renderable record.
+  return {
+    value: {
+      seq: base.seq.slice(0, MAX_SEQUENCE_DIGITS),
+      eventId: `truncated-${base.eventId.length}`,
+      kind: base.kind.slice(0, 64),
+      payload: { truncated: true, serialization: 'record-too-large' },
+      durable: base.durable,
+      ...(base.observedAt === undefined ? {} : { observedAt: base.observedAt }),
+      ...(base.category === undefined ? {} : { category: base.category }),
+      truncated: true,
+    },
+    reduced: true,
+  };
+}
+
+/** Apply the per-entry byte bound to recorded input intents / effect states. */
+function boundReplayAux<T>(entry: T, maxBytes: number): { value: T; reduced: boolean } {
+  const redacted = sanitizeJson(redactSafely(entry)) as T;
+  const serialized = serializeSafely(redacted);
+  if (serialized.serializable && serialized.bytes <= maxBytes) return { value: redacted, reduced: false };
+  const small = { ...(redacted as unknown as Record<string, unknown>) };
+  for (const key of ['intent', 'evidence', 'context']) {
+    if (key in small) small[key] = boundPayload(small[key], Math.max(256, Math.floor(maxBytes / 4))).payload;
+  }
+  for (const [key, current] of Object.entries(small)) {
+    if (typeof current === 'string' && current.length > 256) small[key] = `${current.slice(0, 256)}…`;
+  }
+  small.truncated = true;
+  if (safeJsonBytes(small) > maxBytes) { small.evidence = undefined; small.context = undefined; }
+  return { value: small as T, reduced: true };
+}
+
+/**
  * Replay a trace for diagnostics only.
  *
  * This function has no input sink, transport, provider or store. Historical
  * effects are rendered from their recorded state and are never re-dispatched.
  * Gaps in the event cursor are reported explicitly in `gaps` rather than hidden
  * by renumbering the remaining records.
+ *
+ * Replay enforces the same DEFAULT_TRACE_POLICY bounds as capture: a crafted or
+ * stale document cannot make it materialise unbounded records, oversized
+ * payloads, effect states or gap entries. When a bound is hit the result is
+ * returned with `replayTruncated`/`truncation` instead of growing without limit;
+ * structurally invalid documents are rejected with a controlled error.
  */
 export function replayTrace(
   document: TraceDocument,
@@ -374,8 +516,11 @@ export function replayTrace(
   if (!Array.isArray(document.records)) throw new Error('invalid-trace-records');
   const options: ReplayOptions = typeof onRecordOrOptions === 'function' ? { onRecord: onRecordOrOptions } : onRecordOrOptions ?? {};
   const cursor = options.cursor ?? document.startCursor;
-  if (cursor !== undefined && !/^\d+$/.test(cursor)) throw new Error('invalid-trace-cursor');
+  if (cursor !== undefined && (!/^\d+$/.test(cursor) || cursor.length > MAX_SEQUENCE_DIGITS)) throw new Error('invalid-trace-cursor');
   const start = cursor === undefined ? undefined : BigInt(cursor);
+
+  const truncation: ReplayTruncation = { reasons: [], omitted: { records: 0, inputIntents: 0, effects: 0, gaps: 0 } };
+  const mark = (reason: ReplayTruncationReason) => { if (!truncation.reasons.includes(reason)) truncation.reasons.push(reason); };
 
   const gaps: ReplayGap[] = [];
   let previous: bigint | undefined = start;
@@ -385,55 +530,123 @@ export function replayTrace(
   let eventCount = 0;
   let inputCategoryCount = 0;
   let effectCategoryCount = 0;
+  let totalBytes = 0;
   const byStatus: Record<string, number> = {};
+  const deliveredRecords: TraceRecord[] = [];
   const effectRecords: Array<{ effectId: string; status: string }> = [];
 
-  for (const record of document.records) {
-    if (!record || typeof record.seq !== 'string' || !/^\d+$/.test(record.seq)) throw new Error('invalid-trace-sequence');
-    const sequence = BigInt(record.seq);
+  const pushGap = (gap: ReplayGap) => {
+    if (gaps.length < MAX_REPLAY_GAPS) { gaps.push(gap); return; }
+    truncation.omitted.gaps += 1;
+    mark('gaps');
+  };
+
+  for (let index = 0; index < document.records.length; index += 1) {
+    const record: unknown = document.records[index];
+    if (!record || typeof record !== 'object' || typeof (record as TraceRecord).seq !== 'string' || !/^\d+$/.test((record as TraceRecord).seq) || (record as TraceRecord).seq.length > MAX_SEQUENCE_DIGITS) throw new Error('invalid-trace-sequence');
+    const typed = record as TraceRecord;
+    const sequence = BigInt(typed.seq);
     if (start !== undefined && sequence <= start) continue;
-    firstSeq ??= record.seq;
-    lastSeq = record.seq;
+    if (deliveredRecords.length >= REPLAY_BOUNDS.maxRecords) {
+      mark('records');
+      truncation.omitted.records = document.records.length - index;
+      break;
+    }
+    const bounded = boundReplayRecord(typed, REPLAY_BOUNDS.maxRecordBytes);
+    if (bounded.reduced) mark('record-bytes');
+    const bytes = safeJsonBytes(bounded.value);
+    if (deliveredRecords.length > 0 && totalBytes + bytes > REPLAY_BOUNDS.maxBytes) {
+      mark('total-bytes');
+      truncation.omitted.records = document.records.length - index;
+      break;
+    }
+    totalBytes += bytes;
+    firstSeq ??= bounded.value.seq;
+    lastSeq = bounded.value.seq;
     eventCount += 1;
-    if (record.category === 'input-intent') inputCategoryCount += 1;
-    if (record.category === 'effect-state') effectCategoryCount += 1;
+    if (bounded.value.category === 'input-intent') inputCategoryCount += 1;
+    if (bounded.value.category === 'effect-state') effectCategoryCount += 1;
     if (previous !== undefined && sequence <= previous) {
       // A non-monotonic stream is reported as a gap (missing=0) instead of being reordered.
-      gaps.push({ after: previous.toString(), before: record.seq, missing: 0 });
+      pushGap({ after: previous.toString(), before: typed.seq, missing: 0 });
     } else if (expectedNext !== undefined && sequence !== expectedNext) {
-      gaps.push({ after: previous!.toString(), before: record.seq, missing: Number(sequence - expectedNext) });
+      pushGap({ after: previous!.toString(), before: typed.seq, missing: Number(sequence - expectedNext) });
     }
     previous = sequence;
     expectedNext = sequence + 1n;
-    options.onRecord?.(clone(record));
+    deliveredRecords.push(cloneSafely(bounded.value));
+    options.onRecord?.(cloneSafely(bounded.value));
   }
 
   const inputIntents = Array.isArray(document.inputIntents) ? document.inputIntents : [];
-  for (const input of inputIntents) options.onInputIntent?.(clone(input));
+  const deliveredInputs: TraceInputIntent[] = [];
+  for (let index = 0; index < inputIntents.length; index += 1) {
+    const input = inputIntents[index];
+    if (!input || typeof input !== 'object') continue;
+    if (deliveredInputs.length >= REPLAY_BOUNDS.maxRecords) {
+      mark('input-intents');
+      truncation.omitted.inputIntents = inputIntents.length - index;
+      break;
+    }
+    const bounded = boundReplayAux(input, REPLAY_BOUNDS.maxRecordBytes);
+    if (bounded.reduced) mark('record-bytes');
+    const bytes = safeJsonBytes(bounded.value);
+    if (deliveredInputs.length > 0 && totalBytes + bytes > REPLAY_BOUNDS.maxBytes) {
+      mark('total-bytes');
+      truncation.omitted.inputIntents = inputIntents.length - index;
+      break;
+    }
+    totalBytes += bytes;
+    deliveredInputs.push(cloneSafely(bounded.value));
+    options.onInputIntent?.(cloneSafely(bounded.value));
+  }
 
   const effects = Array.isArray(document.effects) ? document.effects : [];
-  for (const effect of effects) {
-    byStatus[effect.status] = (byStatus[effect.status] ?? 0) + 1;
-    effectRecords.push({ effectId: effect.effectId, status: effect.status });
-    options.onEffectState?.(clone(effect));
+  const deliveredEffects: TraceEffectState[] = [];
+  for (let index = 0; index < effects.length; index += 1) {
+    const effect = effects[index];
+    if (!effect || typeof effect !== 'object') continue;
+    if (deliveredEffects.length >= REPLAY_BOUNDS.maxRecords) {
+      mark('effects');
+      truncation.omitted.effects = effects.length - index;
+      break;
+    }
+    const bounded = boundReplayAux(effect, REPLAY_BOUNDS.maxRecordBytes);
+    if (bounded.reduced) mark('record-bytes');
+    const bytes = safeJsonBytes(bounded.value);
+    if (deliveredEffects.length > 0 && totalBytes + bytes > REPLAY_BOUNDS.maxBytes) {
+      mark('total-bytes');
+      truncation.omitted.effects = effects.length - index;
+      break;
+    }
+    totalBytes += bytes;
+    const status = String(bounded.value.status);
+    byStatus[status] = (byStatus[status] ?? 0) + 1;
+    effectRecords.push({ effectId: String(bounded.value.effectId), status });
+    deliveredEffects.push(cloneSafely(bounded.value));
+    options.onEffectState?.(cloneSafely(bounded.value));
   }
 
   const dropped = Number.isInteger(document.dropped) && (document.dropped ?? 0) > 0 ? document.dropped! : 0;
   const retentionGap: ReplayRetentionGap | undefined = dropped > 0 ? { dropped, ...(firstSeq ? { firstSeq } : {}) } : undefined;
+  const replayTruncated = truncation.reasons.length > 0;
   const result: ReplayResult = {
     records: eventCount,
     ...(firstSeq === undefined ? {} : { firstSeq, lastSeq }),
-    contiguous: gaps.length === 0 && dropped === 0,
+    contiguous: gaps.length === 0 && dropped === 0 && !replayTruncated,
     gap: gaps.length > 0,
     gaps,
     dropped,
-    truncated: document.truncated === true,
+    truncated: document.truncated === true || replayTruncated,
+    replayTruncated,
+    ...(replayTruncated ? { truncation } : {}),
+    bounds: { ...REPLAY_BOUNDS },
     ...(retentionGap ? { retentionGap } : {}),
-    categories: { event: eventCount - inputCategoryCount - effectCategoryCount, inputIntent: inputCategoryCount + inputIntents.length, effectState: effectCategoryCount + effects.length },
-    inputIntents: inputIntents.length,
-    effects: { count: effects.length, byStatus, records: effectRecords },
-    effectStates: effects.map(effect => clone(effect)),
-    faults: detectFaults(document.records.filter(record => start === undefined || BigInt(record.seq) > start)),
+    categories: { event: eventCount - inputCategoryCount - effectCategoryCount, inputIntent: inputCategoryCount + deliveredInputs.length, effectState: effectCategoryCount + deliveredEffects.length },
+    inputIntents: deliveredInputs.length,
+    effects: { count: deliveredEffects.length, byStatus, records: effectRecords },
+    effectStates: deliveredEffects.map(effect => cloneSafely(effect)),
+    faults: detectFaults(deliveredRecords),
     boundaries,
   };
   return result;
@@ -449,6 +662,8 @@ export type StoreTraceExportOptions = {
   source?: TraceDocument['source'];
   /** Maximum effect rows copied into the trace (bounded independently of records). */
   maxEffects?: number;
+  /** Stable world/account/dimension scope; omitted means the whole store (store-level export). */
+  scope?: unknown;
 };
 
 /**
@@ -471,7 +686,7 @@ export function exportTraceFromStore(store: SQLiteStore, options: StoreTraceExpo
   for (;;) {
     const remaining = capacity - readCount;
     if (remaining <= 0) break;
-    const page = store.getCriticalEvents(cursor, Math.min(250, remaining)) as Event[];
+    const page = store.getCriticalEvents(cursor, Math.min(250, remaining), undefined, options.scope) as Event[];
     if (!page.length) break;
     for (const event of page) recorder.append(event);
     readCount += page.length;
@@ -481,7 +696,11 @@ export function exportTraceFromStore(store: SQLiteStore, options: StoreTraceExpo
     if (page.length < Math.min(250, remaining)) break;
   }
   const maxEffects = Math.max(0, Math.floor(options.maxEffects ?? capacity));
-  const effects = store.listEffects().slice(0, maxEffects);
+  // The store applies LIMIT/scope in SQL. A whole-table read followed by slice() would
+  // materialise every effect of every world before discarding all but `maxEffects`.
+  const effects = maxEffects === 0
+    ? []
+    : store.listEffectsForScope(options.scope, { limit: maxEffects }).items;
   for (const effect of effects) {
     const normalized = effect as unknown as {
       effectId?: string; effect_id?: string; executionId?: string; execution_id?: string;

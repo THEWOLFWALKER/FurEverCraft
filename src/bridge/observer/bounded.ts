@@ -107,11 +107,11 @@ export class BoundedObserver {
   private draining = false;
   private inflight = 0;
   /**
-   * A global gap parks both directions. Attach processing and draining stop until an
-   * explicit reset/resync clears the latch, so no post-gap observation is emitted as if
-   * continuity had been preserved.
+   * A global gap parks both directions. Neither direction may resume until it has been
+   * explicitly reset; resetting one direction must not silently un-park the other one that
+   * never regained an anchor. `resetAll()` clears the park for both directions atomically.
    */
-  private globalParked = false;
+  private readonly parkedDirections = new Set<ObserverDirection>();
   private readonly limits: ObserverLimits;
   private readonly now: () => number;
 
@@ -133,7 +133,7 @@ export class BoundedObserver {
   queued(): { frames: number; bytes: number } { return { frames: this.pending.length, bytes: this.queuedBytes }; }
 
   attach(direction: ObserverDirection, chunk: Uint8Array): void {
-    if (this.stopped || this.globalParked) return;
+    if (this.stopped || this.parkedDirections.has(direction)) return;
     const decoder = this.decoders[direction];
     if (decoder.stopped) return;
     const result = decoder.attach(chunk);
@@ -180,7 +180,7 @@ export class BoundedObserver {
 
   markUnknown(reason = 'framing-loss', direction?: ObserverDirection): void {
     this.healthValue = 'unknown';
-    this.globalParked = true;
+    this.parkBoth();
     if (direction) {
       this.decoders[direction].markUnknown(reason);
     } else {
@@ -192,13 +192,30 @@ export class BoundedObserver {
     this.gap('global', reason, direction);
   }
 
+  /**
+   * Reset one direction. This does not clear the global park for the other direction:
+   * after a global gap both directions lost their anchor and each must be reset.
+   */
   reset(direction: ObserverDirection): void {
-    // A reset starts a new session/sequence for one direction only. It clears framing
-    // and control state for that direction and lifts the global parking latch; the other
-    // direction's decoder state is untouched.
     this.decoders[direction].reset();
     this.dropPending(direction);
-    this.globalParked = false;
+    this.parkedDirections.delete(direction);
+    this.recomputeHealth();
+  }
+
+  /** Reset both directions together, clearing a global park only once both are re-anchored. */
+  resetAll(): void {
+    for (const key of Object.keys(this.decoders) as ObserverDirection[]) this.decoders[key].reset();
+    this.dropPending();
+    this.parkedDirections.clear();
+    this.recomputeHealth();
+  }
+
+  private parkBoth(): void {
+    for (const key of Object.keys(this.decoders) as ObserverDirection[]) this.parkedDirections.add(key);
+  }
+
+  private recomputeHealth(): void {
     const directions = this.directionStates();
     if (directions.some(state => state.availability === 'unknown')) this.healthValue = 'unknown';
     else if (directions.some(state => state.phase === 'UNKNOWN')) this.healthValue = 'degraded';
@@ -216,7 +233,7 @@ export class BoundedObserver {
         compression: decoder.compression,
         ...(decoder.compressionAssumed === undefined ? {} : { assumedCompression: decoder.compressionAssumed }),
         payloadKind: PAYLOAD_KIND,
-        availability: decoder.stopped || this.globalParked ? 'unknown' : 'degraded',
+        availability: decoder.stopped || this.parkedDirections.has(direction) ? 'unknown' : 'degraded',
         ...(decoder.stopReason === undefined ? {} : { stoppedReason: decoder.stopReason }),
       };
     });
@@ -224,7 +241,7 @@ export class BoundedObserver {
 
   private markUnknownFromDecoder(direction: ObserverDirection, reason: string): void {
     this.healthValue = 'unknown';
-    this.globalParked = true;
+    this.parkBoth();
     this.dropPending();
     this.gap('global', reason, direction);
   }
@@ -235,7 +252,7 @@ export class BoundedObserver {
       // control packet, so continuity is lost globally; stop interpreting rather than
       // skipping frames and pretending later state is authoritative.
       this.decoders[frame.direction].markUnknown('queue-overflow');
-      this.globalParked = true;
+      this.parkBoth();
       this.dropPending();
       this.healthValue = 'unknown';
       this.gap('global', 'queue-overflow', frame.direction, frame.frameSequence);
@@ -271,8 +288,9 @@ export class BoundedObserver {
 
   private async dispatch(item: PendingFrame): Promise<void> {
     // A global gap that landed while this frame was inflight invalidates it; do not
-    // present an observation after continuity was declared lost.
-    if (this.globalParked) return;
+    // present an observation after continuity was declared lost. A reset of this
+    // direction lifts its park, but the other direction remains parked independently.
+    if (this.parkedDirections.has(item.direction)) return;
     // Frame metadata only: the outer length is framing, not a decoded packet ID; no
     // packet fields are parsed or exposed.
     const event: ObserverEvent = {

@@ -13,8 +13,9 @@ class FakeRelay implements RelayMonitor {
   stops: string[] = [];
   failNextStart = false;
   private readonly exits = new Set<(reason: string) => void>();
-  async start(): Promise<void> { this.starts += 1; if (this.failNextStart) { this.failNextStart = false; throw new Error('spawn-failed'); } this.state = 'running'; }
-  async stop(reason = 'stop'): Promise<void> { this.stops.push(reason); this.state = 'stopped'; }
+  constructor(private readonly order?: string[]) {}
+  async start(): Promise<void> { this.starts += 1; this.order?.push('relay:start'); if (this.failNextStart) { this.failNextStart = false; throw new Error('spawn-failed'); } this.state = 'running'; }
+  async stop(reason = 'stop'): Promise<void> { this.stops.push(reason); this.order?.push(`relay:stop:${reason}`); this.state = 'stopped'; }
   onExit(listener: (reason: string) => void): () => void { this.exits.add(listener); return () => this.exits.delete(listener); }
   emitExit(reason: string): void { for (const listener of this.exits) listener(reason); }
 }
@@ -23,8 +24,9 @@ class FakeObserver implements ObserverMonitor {
   started = 0;
   stopped = 0;
   failures = new Set<(reason: string) => void>();
-  start(): void { this.started += 1; }
-  async stop(): Promise<void> { this.stopped += 1; }
+  constructor(private readonly order?: string[]) {}
+  start(): void { this.started += 1; this.order?.push('observer:start'); }
+  async stop(): Promise<void> { this.stopped += 1; this.order?.push('observer:stop'); }
   state(): unknown { return { running: this.started > this.stopped }; }
   onFailure(listener: (reason: string) => void): () => void { this.failures.add(listener); return () => this.failures.delete(listener); }
   fail(reason: string): void { for (const listener of this.failures) listener(reason); }
@@ -35,8 +37,9 @@ class FakeHelper implements HelperMonitor {
   releases = 0;
   hangShutdown = false;
   private readonly exits = new Set<(reason: string) => void>();
-  async shutdown(): Promise<void> { this.shutdowns += 1; if (this.hangShutdown) await new Promise<void>(() => undefined); }
-  async releaseOwnedInputs(): Promise<unknown> { this.releases += 1; return { released: true }; }
+  constructor(private readonly order?: string[]) {}
+  async shutdown(): Promise<void> { this.shutdowns += 1; this.order?.push('helper:shutdown'); if (this.hangShutdown) await new Promise<void>(() => undefined); }
+  async releaseOwnedInputs(): Promise<unknown> { this.releases += 1; this.order?.push('helper:release'); return { released: true }; }
   onExit(listener: (reason: string) => void): () => void { this.exits.add(listener); return () => this.exits.delete(listener); }
   emitExit(reason: string): void { for (const listener of this.exits) listener(reason); }
   state(): unknown { return { running: true }; }
@@ -44,9 +47,10 @@ class FakeHelper implements HelperMonitor {
 
 describe('P09 process orchestration', () => {
   it('starts and stops relay, observer and helper in order with a graceful shutdown', async () => {
-    const relay = new FakeRelay();
-    const observer = new FakeObserver();
-    const helper = new FakeHelper();
+    const order: string[] = [];
+    const relay = new FakeRelay(order);
+    const observer = new FakeObserver(order);
+    const helper = new FakeHelper(order);
     const service = new BridgeService({ relay, observer, helper });
     await service.start();
     expect(observer.started).toBe(1);
@@ -62,6 +66,17 @@ describe('P09 process orchestration', () => {
     expect(helper.releases).toBe(1);
     expect(helper.shutdowns).toBe(1);
     expect(service.state).toBe('stopped');
+    // Exact lifecycle order: observer before relay on start; held input is released before the
+    // relay/observer/helper are shut down, and the helper shutdown is last.
+    expect(order).toEqual([
+      'observer:start',
+      'relay:start',
+      'helper:release',
+      'relay:stop:quit',
+      'observer:stop',
+      'helper:shutdown',
+    ]);
+    expect(order.indexOf('helper:release')).toBeLessThan(order.indexOf('helper:shutdown'));
   });
 
   it('revokes control on unexpected relay exit and restarts with backoff without re-arming', async () => {
@@ -117,7 +132,8 @@ describe('P09 process orchestration', () => {
     const relay = new FakeRelay();
     const sent: unknown[] = [];
     let accept = false;
-    const service = new BridgeService({ relay, ipc: { send: message => { if (accept) sent.push(message); return accept; } }, maxIpcMessages: 2 });
+    // A throw means the channel rejected the hand-off (as opposed to false = queued).
+    const service = new BridgeService({ relay, ipc: { send: message => { if (!accept) throw new Error('channel-unavailable'); sent.push(message); return true; } }, maxIpcMessages: 2 });
     await service.start();
     expect(service.status().ipc.messages).toBe(2);
     service.publishObserver({ kind: 'observation', frameSequence: '1' });
@@ -131,7 +147,7 @@ describe('P09 process orchestration', () => {
     accept = true;
     service.flush();
     expect(sent).toHaveLength(2);
-    expect(service.status().ipc).toMatchObject({ messages: 0, bytes: 0 });
+    expect(service.status().ipc).toMatchObject({ messages: 0, bytes: 0, globalUnknown: false, backpressured: false });
   });
 
   it('closes admission synchronously on observer failure without stopping forwarding', async () => {
@@ -191,7 +207,7 @@ describe('P09 process orchestration', () => {
     let accept = false;
     const sent: unknown[] = [];
     const service = new BridgeService({
-      ipc: { send: message => { if (accept) sent.push(message); return accept; } },
+      ipc: { send: message => { if (!accept) throw new Error('channel-unavailable'); sent.push(message); return true; } },
       maxIpcMessages: 1,
     });
     const overflow: BridgeServiceEvent[] = [];
@@ -225,7 +241,7 @@ describe('P09 process orchestration', () => {
 
   it('treats an observation-only IPC overflow as global uncertainty with a synthesized gap', async () => {
     let accept = true;
-    const service = new BridgeService({ ipc: { send: () => accept }, maxIpcMessages: 1 });
+    const service = new BridgeService({ ipc: { send: () => { if (!accept) throw new Error('channel-unavailable'); return true; } }, maxIpcMessages: 1 });
     const events: BridgeServiceEvent[] = [];
     service.on(event => events.push(event));
     service.armControl('fresh-observation');
@@ -288,20 +304,34 @@ describe('P09 bounded IPC outbox', () => {
     expect(outbox.queued()).toMatchObject({ messages: 2, controlLost: true });
   });
 
-  it('stops duty flushing on backpressure and preserves order', () => {
+  it('treats false as queued exactly once and preserves order without duplicates', () => {
     const outbox = new BoundedIpcOutbox({ maxMessages: 8 });
     outbox.push({ type: 'observer-event', payload: 'a' });
     outbox.push({ type: 'observer-event', payload: 'b' });
     outbox.push({ type: 'observer-event', payload: 'c' });
     const attempted: unknown[] = [];
+    // Node returns false when it accepted the message onto a backed-up channel. It was
+    // still handed off, so the outbox must drop its copy and stop for this duty cycle.
     const first = outbox.flush(message => { attempted.push(message); return false; });
-    expect(first.sent).toBe(0);
-    expect(first.queued).toBe(3);
+    expect(first).toMatchObject({ sent: 1, queued: 2, transportError: false });
+    expect(attempted.map(message => (message as { payload: string }).payload)).toEqual(['a']);
     const drained: unknown[] = [];
     const second = outbox.flush(message => { drained.push(message); return true; });
-    expect(second.sent).toBe(3);
-    expect(drained.map(message => (message as { payload: string }).payload)).toEqual(['a', 'b', 'c']);
+    expect(second).toMatchObject({ sent: 2, queued: 0, transportError: false });
+    expect(drained.map(message => (message as { payload: string }).payload)).toEqual(['b', 'c']);
+    // Every message crossed exactly once: no duplicate of the queued-accepted `a`.
+    expect([...attempted, ...drained].map(message => (message as { payload: string }).payload)).toEqual(['a', 'b', 'c']);
     expect(outbox.queued()).toMatchObject({ messages: 0, bytes: 0 });
+  });
+
+  it('retains an entry only when the channel throws (not handed off) and reports the transport error', () => {
+    const outbox = new BoundedIpcOutbox({ maxMessages: 8 });
+    outbox.push({ type: 'observer-event', payload: 'a' });
+    const failed = outbox.flush(() => { throw new Error('ipc-closed'); });
+    expect(failed).toMatchObject({ sent: 0, queued: 1, transportError: true });
+    const drained: unknown[] = [];
+    expect(outbox.flush(message => { drained.push(message); return false; })).toMatchObject({ sent: 1, queued: 0 });
+    expect(drained.map(message => (message as { payload: string }).payload)).toEqual(['a']);
   });
 
   it('rejects a message larger than the byte budget', () => {

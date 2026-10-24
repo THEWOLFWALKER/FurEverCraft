@@ -16,14 +16,17 @@ export type RelayConfig = {
   budgets?: Partial<RelayBudgets>;
   /**
    * Passive observation tap. It receives every source chunk (including bytes the observer
-   * cannot interpret) and is invoked inside a try/catch so an observer failure can never
-   * block or alter forwarding.
+   * cannot interpret) together with the owning TCP session identity. It is invoked inside
+   * a try/catch so an observer failure can never block or alter forwarding. Observer state
+   * must be scoped by `session.sessionEpoch`: concurrent sessions are independent.
    */
-  onChunk?: (direction: RelayDirection, chunk: Buffer) => void;
+  onChunk?: (direction: RelayDirection, chunk: Buffer, session: RelayChunkContext) => void;
   /** Injected network layer for offline lifecycle tests; defaults to node:net. */
   network?: RelayNetwork;
 };
 export type RelayDirection = 'client-to-server'|'server-to-client';
+/** Stable identity of the TCP session a chunk belongs to. */
+export type RelayChunkContext = { readonly sessionEpoch:string };
 export type RelaySessionState = 'connecting'|'handshaking'|'forwarding'|'half-closed'|'closing'|'closed'|'failed';
 export type RelayMetrics = { queuedBytes:Record<RelayDirection,number>; forwardedBytes:Record<RelayDirection,number>; undeliveredBytes:Record<RelayDirection,number>; state:RelaySessionState; closeReason?:string };
 
@@ -82,22 +85,29 @@ function rewriteHandshake(frame:Buffer, host:string, port:number, allowedNextSta
   return Buffer.concat([encodeVarInt(rest.length),rest]);
 }
 
-export interface RelaySession { readonly sessionEpoch:string; readonly client:RelaySocket; readonly server:RelaySocket; readonly state:RelaySessionState; metrics():RelayMetrics; close(reason?:string):Promise<void>; }
+export interface RelaySession { readonly sessionEpoch:string; readonly client:RelaySocket; readonly server:RelaySocket; readonly state:RelaySessionState; metrics():RelayMetrics; close(reason?:string):Promise<void>; /** Notify when this session is fully closed (observer state must be discarded). */ onClose(listener:()=>void):()=>void; }
 export interface RawTcpRelay { readonly address:AddressInfo; start():Promise<void>; stop():Promise<void>; sessions():readonly RelaySession[]; onSession(listener:(s:RelaySession)=>void):()=>void; }
 
 class Session implements RelaySession {
   readonly sessionEpoch=`relay_${randomUUID()}`; state:RelaySessionState='connecting';
   private closed=false; private reason?:string; private finishing?:Promise<void>;
+  private readonly closeListeners=new Set<()=>void>();
+  private readonly chunkContext:RelayChunkContext;
   private handshakeTimer?:ReturnType<typeof setTimeout>;
   private connectTimer?:ReturnType<typeof setTimeout>;
   private halfCloseTimer?:ReturnType<typeof setTimeout>;
   private readonly stats:RelayMetrics={queuedBytes:{'client-to-server':0,'server-to-client':0},forwardedBytes:{'client-to-server':0,'server-to-client':0},undeliveredBytes:{'client-to-server':0,'server-to-client':0},state:'connecting'};
-  constructor(readonly client:RelaySocket, readonly server:RelaySocket, private readonly config:{targetHost:string;targetPort:number;rewriteHandshake:boolean;handshakeLimitBytes:number;handshakeTimeoutMs:number;allowedNextStates:Set<number>;budgets:RelayBudgets;onChunk?:(direction:RelayDirection, chunk:Buffer)=>void}, private readonly onClosed:()=>void){ this.stats.state='handshaking'; this.state='handshaking'; this.install(); }
+  constructor(readonly client:RelaySocket, readonly server:RelaySocket, private readonly config:{targetHost:string;targetPort:number;rewriteHandshake:boolean;handshakeLimitBytes:number;handshakeTimeoutMs:number;allowedNextStates:Set<number>;budgets:RelayBudgets;onChunk?:(direction:RelayDirection, chunk:Buffer, session:RelayChunkContext)=>void}, private readonly onClosed:()=>void){ this.chunkContext=Object.freeze({sessionEpoch:this.sessionEpoch}); this.stats.state='handshaking'; this.state='handshaking'; this.install(); }
   metrics(){return {...this.stats,queuedBytes:{...this.stats.queuedBytes},forwardedBytes:{...this.stats.forwardedBytes},undeliveredBytes:{...this.stats.undeliveredBytes}};}
   /** Observer failures are isolated from the forwarding path. */
   private notifyObserver(direction:RelayDirection, chunk:Buffer){
     if(!this.config.onChunk)return;
-    try { this.config.onChunk(direction, chunk); } catch { /* observation must never block relay forwarding */ }
+    try { this.config.onChunk(direction, chunk, this.chunkContext); } catch { /* observation must never block relay forwarding */ }
+  }
+  onClose(listener:()=>void):()=>void {
+    if(this.closed){listener();return()=>undefined;}
+    this.closeListeners.add(listener);
+    return()=>{this.closeListeners.delete(listener);};
   }
   private install(){ let first=Buffer.alloc(0); let handshakeDone=!this.config.rewriteHandshake;
     // Upstream connects asynchronously. Client bytes are buffered only up to the hard
@@ -179,6 +189,8 @@ class Session implements RelaySession {
     await this.flush(clients);
     for(const s of clients) s.destroy();
     this.state=reason==='closed'||reason==='relay-stop'||reason==='client-closed'?'closed':'failed'; this.stats.state=this.state; this.stats.closeReason=reason; this.onClosed();
+    const listeners=[...this.closeListeners]; this.closeListeners.clear();
+    for(const listener of listeners){ try{listener();}catch{ /* observer cleanup is isolated */ } }
   }
   private flush(clients:RelaySocket[]):Promise<void>{
     return new Promise<void>(resolve=>{

@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ObserverWorkerHost, type WorkerLike } from '../../src/bridge/observer/host.js';
 import type { ObserverEvent } from '../../src/bridge/observer/bounded.js';
+
+afterEach(() => { vi.useRealTimers(); });
 
 class FakeWorker implements WorkerLike {
   readonly posted: unknown[] = [];
@@ -73,6 +75,69 @@ describe('observer worker host', () => {
     expect(host.state()).toMatchObject({ running: false, availability: 'unknown' });
     expect(host.state().directions['server-to-client'].availability).toBe('unknown');
     expect(host.state().directions['client-to-server'].availability).toBe('unknown');
+    await host.stop();
+  });
+
+  it('enforces the decompression deadline by terminating a worker that never acknowledges', async () => {
+    vi.useFakeTimers();
+    const worker = new FakeWorker();
+    const events: ObserverEvent[] = [];
+    const failures: string[] = [];
+    const host = new ObserverWorkerHost({
+      createWorker: () => worker,
+      onEvent: event => events.push(event),
+      onFailure: reason => failures.push(reason),
+      taskTimeoutMs: 25,
+    });
+    host.start();
+    expect(host.attach('client-to-server', new Uint8Array([1, 2, 3]))).toBe(true);
+    expect(worker.terminated).toBe(false);
+    expect(failures).toEqual([]);
+    expect(host.state()).toMatchObject({ running: true, availability: 'unknown' });
+
+    // The worker is "stuck" in synchronous inflate: no ack is ever emitted. The host-side
+    // wall-clock deadline must still fire (the sync maxDecompressMs check cannot have run).
+    await vi.advanceTimersByTimeAsync(25);
+
+    expect(worker.terminated).toBe(true);
+    expect(failures).toContain('observer-ack-timeout');
+    expect(events.at(-1)).toMatchObject({
+      kind: 'observer_gap',
+      gap: { scope: 'global', reason: 'observer-ack-timeout', direction: 'client-to-server' },
+    });
+    expect(host.state()).toMatchObject({ running: false, availability: 'unknown' });
+    expect(host.state().directions['client-to-server']).toMatchObject({
+      availability: 'unknown', stoppedReason: 'observer-ack-timeout',
+    });
+    expect(host.state().directions['server-to-client'].availability).toBe('unknown');
+    // The direction stays stopped and the host never hangs waiting for the dead worker.
+    expect(host.attach('client-to-server', new Uint8Array([4]))).toBe(false);
+    await host.stop();
+  });
+
+  it('cancels the deadline when the worker acknowledges the chunk in time', async () => {
+    vi.useFakeTimers();
+    const worker = new FakeWorker();
+    const failures: string[] = [];
+    const host = new ObserverWorkerHost({
+      createWorker: () => worker,
+      onEvent: () => {},
+      onFailure: reason => failures.push(reason),
+      ackTimeoutMs: 50,
+    });
+    host.start();
+    expect(host.attach('server-to-client', new Uint8Array([1, 2]))).toBe(true);
+    worker.emit('message', { type: 'ack', direction: 'server-to-client', bytes: 2, frames: 1 });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(failures).toEqual([]);
+    expect(worker.terminated).toBe(false);
+    // A later chunk gets its own fresh deadline.
+    expect(host.attach('server-to-client', new Uint8Array([3]))).toBe(true);
+    await vi.advanceTimersByTimeAsync(49);
+    expect(failures).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(failures).toContain('observer-ack-timeout');
+    expect(worker.terminated).toBe(true);
     await host.stop();
   });
 });

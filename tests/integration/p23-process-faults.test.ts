@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
@@ -16,7 +16,15 @@ import { createRuntime } from '../../src/execution/factory.js';
 
 const relayEntry = new URL('../../dist/bridge/relay/entry.js', import.meta.url);
 const serviceEntry = new URL('../../dist/bridge/service/entry.js', import.meta.url);
-const built = existsSync(fileURLToPath(relayEntry)) && existsSync(fileURLToPath(serviceEntry));
+
+beforeAll(() => {
+  const missing = [relayEntry, serviceEntry]
+    .map(url => fileURLToPath(url))
+    .filter(path => !existsSync(path));
+  if (missing.length > 0) {
+    throw new Error(`missing-built-entry: P23 child-process tests require built entries (${missing.join(', ')}). Run \`npm run build\` before running this test file.`);
+  }
+});
 
 const listen = (server: net.Server) => new Promise<void>((resolve, reject) => {
   server.once('error', reject);
@@ -74,7 +82,7 @@ function serviceConfig(listenPort: number, targetPort: number): BridgeServiceEnt
 }
 
 describe('P23 real child-process faults', () => {
-  it.skipIf(!built)('kills the relay child, revokes control, restarts within budget and shuts down cleanly', async () => {
+  it('kills the relay child, revokes control, restarts within budget and shuts down cleanly', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'furevercraft-p23-relay-'));
     const upstream = net.createServer(socket => socket.on('data', chunk => socket.write(chunk)));
     await listen(upstream);
@@ -111,7 +119,7 @@ describe('P23 real child-process faults', () => {
         expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true, restarts: { attempts: attempt, max: 2 } });
         const status = await supervisor.request<{ address?: { port?: number } }>('status');
         const port = status?.address?.port;
-        expect(typeof port).toBe('number');
+        expect(port).toBeGreaterThan(0);
         // Forwarding resumes; the fault is confined to control/observation.
         const payload = Buffer.from(`relay-after-crash-${attempt}`);
         expect(await echo(port!, payload)).toEqual(payload);
@@ -135,7 +143,7 @@ describe('P23 real child-process faults', () => {
     }
   }, 30_000);
 
-  it.skipIf(!built)('propagates an unexpected service-child exit to its supervisor', async () => {
+  it('propagates an unexpected service-child exit to its supervisor', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'furevercraft-p23-service-'));
     const upstream = net.createServer(socket => socket.on('data', chunk => socket.write(chunk)));
     await listen(upstream);
@@ -177,7 +185,7 @@ describe('P23 real child-process faults', () => {
     }
   }, 20_000);
 
-  it.skipIf(!built)('runs a short wall-clock service smoke with real timers and clean shutdown', async () => {
+  it('runs a short wall-clock service smoke with real timers and clean shutdown', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'furevercraft-p23-smoke-'));
     const upstream = net.createServer(socket => socket.on('data', chunk => socket.write(chunk)));
     await listen(upstream);

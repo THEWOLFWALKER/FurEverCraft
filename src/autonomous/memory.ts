@@ -79,13 +79,25 @@ const cursorOf = (value: string | undefined) => {
   if (cursor > 10_000) throw new Error('memory-cursor-limit');
   return cursor;
 };
-const pageLimit = (value: number | undefined) => Math.min(Math.max(Math.trunc(value ?? 20), 1), 20);
+const pageLimit = (value: number | undefined) => {
+  if (value === undefined) return 20;
+  if (!Number.isFinite(value)) throw new Error('invalid-memory-limit');
+  return Math.min(Math.max(Math.trunc(value), 1), 20);
+};
 
 export class MemoryService {
+  /** Monotonic runtime timing only. Never persisted and never compared with stored ISO times. */
   private readonly now: () => number;
+  /** Wall-clock time used for persisted ISO timestamps and freshness comparisons. */
+  private readonly wallNow: () => number;
   private readonly freshnessMaxAgeMs: number;
-  constructor(private readonly store: SQLiteStore, private readonly rules: KnowledgeRule[] = [], options: { now?: () => number; freshnessMaxAgeMs?: number } = {}) {
+  constructor(private readonly store: SQLiteStore, private readonly rules: KnowledgeRule[] = [], options: { now?: () => number; wallNow?: () => number; freshnessMaxAgeMs?: number } = {}) {
+    // `now` may be a monotonic runtime clock (performance.now()/ManualClock). Persisted
+    // timestamps and age checks must use the wall clock, otherwise a fresh process with a
+    // low monotonic value reads yesterday's place as "current". Callers that need a
+    // deterministic wall clock inject `wallNow`; the runtime clock never leaks into storage.
     this.now = options.now ?? (() => Date.now());
+    this.wallNow = options.wallNow ?? (() => Date.now());
     this.freshnessMaxAgeMs = Math.max(0, options.freshnessMaxAgeMs ?? 5 * 60_000);
   }
 
@@ -100,7 +112,7 @@ export class MemoryService {
 
   rememberPlace(place: { placeId: string; context: unknown; status?: string; payload: unknown; lastVerifiedAt?: string; provenance?: unknown; expectedRevision?: number }): PlaceView {
     normalizeMemoryScope(place.context);
-    const lastVerifiedAt = place.lastVerifiedAt ?? new Date(this.now()).toISOString();
+    const lastVerifiedAt = place.lastVerifiedAt ?? new Date(this.wallNow()).toISOString();
     this.store.savePlace({ placeId: place.placeId, context: place.context, status: place.status ?? 'known', lastVerifiedAt, payload: place.payload, provenance: place.provenance, expectedRevision: place.expectedRevision });
     const stored = this.store.findPlaceByScope(place.placeId, place.context);
     if (!stored) throw new Error('place-not-found');
@@ -183,7 +195,7 @@ export class MemoryService {
     };
     const row = this.store.saveEpisode({
       episodeId: input.episodeId, context: scope, eventRefs: input.evidence.map(item => item.ref).filter(Boolean),
-      summary, provenance: input.provenance ?? { source: 'execution', recordedAt: new Date(this.now()).toISOString() },
+      summary, provenance: input.provenance ?? { source: 'execution', recordedAt: new Date(this.wallNow()).toISOString() },
     });
     void row;
     const stored = this.store.getEpisode(input.episodeId, scope);
@@ -239,7 +251,21 @@ export class MemoryService {
     if (!view.lastVerifiedAt) return 'unknown';
     const verified = Date.parse(view.lastVerifiedAt);
     if (!Number.isFinite(verified)) return 'unknown';
-    return (nowOverride ?? this.now()) - verified > this.freshnessMaxAgeMs ? 'stale' : 'current';
+    return (this.wallTime(nowOverride)) - verified > this.freshnessMaxAgeMs ? 'stale' : 'current';
+  }
+
+  /**
+   * Treat a supplied `now` as an override only when it is in the wall-clock domain. Callers such
+   * as the runtime's place resolver historically passed `clock.now()`, which is monotonic
+   * (performance.now()/ManualClock). Comparing that with a stored ISO time makes every place look
+   * current, so a low value falls back to the actual wall clock; an injected test wall time is
+   * still honoured.
+   */
+  private wallTime(override: number | undefined): number {
+    const WALL_CLOCK_FLOOR_MS = Date.parse('2001-01-01T00:00:00.000Z');
+    return typeof override === 'number' && Number.isFinite(override) && override >= WALL_CLOCK_FLOOR_MS
+      ? override
+      : this.wallNow();
   }
 }
 function scopeMatches(value: MemoryScope, wanted?: MemoryScope) { return !wanted || Object.entries(wanted).every(([key, item]) => item === undefined || value[key as keyof MemoryScope] === item); }

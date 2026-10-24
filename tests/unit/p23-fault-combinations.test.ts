@@ -234,7 +234,7 @@ describe('P23 goal race and lease revival', () => {
     const runtime = createRuntime({ bridge, clock: new ManualClock() });
     store = runtime.store;
     try {
-      runtime.store.saveGoal({ goalId: 'goal-race', revision: 1, status: 'active', text: 'original target' });
+      runtime.store.saveGoal({ goalId: 'goal-race', revision: 1, status: 'active', text: 'original target', context: bridge.context });
       const racedResult = await runtime.router.invoke(placeCall('goal-race-1', 1, 0), { goalId: 'goal-race', goalRevision: 1 });
       expect(racedResult.ok).toBe(false);
       expect(String(racedResult.error)).toContain('goal-revision-conflict');
@@ -305,7 +305,7 @@ describe('P23 goal race and lease revival', () => {
     let accept = true;
     const service = new BridgeService({
       relay, observer, helper,
-      ipc: { send: () => accept },
+      ipc: { send: () => { if (!accept) throw new Error('channel-unavailable'); return true; } },
       maxIpcMessages: 2,
       maxRestarts: 1,
       restartWindowMs: 60_000,

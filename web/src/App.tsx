@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api, isAuthError, pair, subscribeEvents,
-  type Capabilities, type Config, type Effect, type EventRecord, type Execution, type Goal, type Place,
+  type AuthMode, type Capabilities, type Config, type Effect, type EventRecord, type Execution, type Goal, type Place,
   type Provider, type Snapshot, type Status, type StreamState,
 } from './api';
 
@@ -36,7 +36,7 @@ function Dot({ tone }: { tone: 'ok' | 'warn' | 'bad' | 'idle' }) { return <span 
 function tagTone(status?: string): 'ok' | 'warn' | 'bad' | 'idle' {
   if (!status) return 'idle';
   if (['succeeded', 'running', 'active', 'terminal', 'confirmed', 'current', 'enabled'].includes(status)) return 'ok';
-  if (['suspended', 'ambiguous', 'partial', 'accepted', 'unknown', 'pausing', 'stopping', 'idle', 'stale', 'prepared', 'may-have-dispatched', 'verifying', 'recoverable-failure', 'canceling'].includes(status)) return 'warn';
+  if (['suspended', 'ambiguous', 'partial', 'accepted', 'unknown', 'pausing', 'stopping', 'idle', 'stale', 'prepared', 'may-have-dispatched', 'verifying', 'recoverable-failure', 'canceling', 'unavailable'].includes(status)) return 'warn';
   if (['failed', 'canceled', 'disabled', 'closed'].includes(status)) return 'bad';
   return 'idle';
 }
@@ -64,7 +64,7 @@ function ObservationPanel({ status }: { status?: Status }) {
           <div className="kv">
             <div className="kv-row"><span className="kv-key">Source</span><span className="kv-value">{value(observation.source)}</span></div>
             <div className="kv-row"><span className="kv-key">Freshness</span><span className="kv-value"><Tag status={observation.freshness} /></span></div>
-            <div className="kv-row"><span className="kv-key">Body contract</span><span className="kv-value">{body ? <Tag status={body.threeDimensional ? 'current' : 'stale'} /> : '--'} {value(body?.mode)}</span></div>
+            <div className="kv-row"><span className="kv-key">Body contract</span><span className="kv-value">{body ? <Tag status={body.threeDimensional ? 'current' : 'stale'} /> : '--'} <span data-testid="body-mode">{value(body?.mode)}</span></span></div>
             {body?.threeDimensional ? (
               <>
                 <div className="kv-row"><span className="kv-key">World pose x / y / z</span><span className="kv-value">{value(body.x)}, {value(body.y)}, {value(body.z)}</span></div>
@@ -114,6 +114,7 @@ export default function App() {
   const [gap, setGap] = useState<string>();
   const [error, setError] = useState<string>();
   const [feedback, setFeedback] = useState<string>();
+  const [turnWarning, setTurnWarning] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [activeTab, setActiveTab] = useState<'overview'|'conversation'|'tasks'|'world'|'settings'>('overview');
   const [conversation, setConversation] = useState<Array<{ role: string; text: string; state?: string }>>([]);
@@ -122,11 +123,18 @@ export default function App() {
   const [goalText, setGoalText] = useState('Explore the local area and return');
   const [message, setMessage] = useState('Check the surroundings and report status');
   const [selectedExecution, setSelectedExecution] = useState('');
+  const [authMode, setAuthMode] = useState<AuthMode>();
   const [pairingRequired, setPairingRequired] = useState(false);
   const [pairCode, setPairCode] = useState('');
   const [pairError, setPairError] = useState<string>();
   const [streamEpoch, setStreamEpoch] = useState(0);
   const cursor = useRef('0');
+  // The public bootstrap document decides how a 401 is interpreted. In token mode the browser
+  // can never obtain a session, so it must not offer a pairing dialog that would 404.
+  const authModeRef = useRef<AuthMode>();
+  // A rejected command is a durable operator-visible error. Periodic reads must not erase it
+  // before the operator sees it; only a later successful command (or re-pairing) clears it.
+  const commandError = useRef(false);
   const worldCells = (status?.context as { cells?: Record<string, string> } | undefined)?.cells ?? {};
 
   const applySnapshot = useCallback((snapshot: Snapshot) => {
@@ -143,22 +151,55 @@ export default function App() {
   }, []);
 
   const refresh = useCallback(async () => {
+    // Token mode has no browser credential at all; polling the protected surface would only
+    // produce guaranteed 401s. The bootstrap panel explains the CLI-bearer requirement instead.
+    if (authModeRef.current?.browserAccess === 'disabled') { setPairingRequired(false); return; }
     try {
       const [nextStatus, nextGoals, nextExecutions, nextEffects, nextPlaces, nextCapabilities, nextProvider, nextConfig] = await Promise.all([
         api.status(), api.goals(), api.executions(), api.effects(), api.places(), api.capabilities(), api.provider(), api.config(),
       ]);
       setStatus(nextStatus); setGoals(nextGoals); setExecutions(nextExecutions); setEffects(nextEffects); setPlaces(nextPlaces);
       setCapabilities(nextCapabilities); setProvider(nextProvider); setConfig(nextConfig);
-      setError(undefined); setPairingRequired(false); setLastUpdated(new Date().toLocaleTimeString());
+      if (!commandError.current) setError(undefined);
+      setPairingRequired(false); setLastUpdated(new Date().toLocaleTimeString());
     } catch (cause) {
-      if (isAuthError(cause)) { setPairingRequired(true); setError(undefined); }
-      else setError(cause instanceof Error ? cause.message : 'request failed');
+      if (isAuthError(cause)) {
+        // Only a server that actually advertised pairing may show the pairing dialog. Otherwise
+        // the operator gets a truthful error instead of a code that will never be issued.
+        if (authModeRef.current?.pairing) { setPairingRequired(true); setError(undefined); }
+        else { setPairingRequired(false); setError('authentication required; this server advertised no pairing mode'); }
+      } else setError(cause instanceof Error ? cause.message : 'request failed');
     }
   }, []);
 
-  useEffect(() => { void refresh(); const timer = setInterval(() => void refresh(), 2500); return () => clearInterval(timer); }, [refresh]);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    void (async () => {
+      try {
+        const mode = await api.authMode();
+        if (cancelled) return;
+        authModeRef.current = mode;
+        setAuthMode(mode);
+        if (mode.browserAccess === 'disabled') {
+          setPairingRequired(false);
+          setStream('closed');
+        } else {
+          await refresh();
+        }
+      } catch (cause) {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : 'request failed');
+      }
+      if (cancelled) return;
+      timer = setInterval(() => void refresh(), 2500);
+    })();
+    return () => { cancelled = true; if (timer) clearInterval(timer); };
+  }, [refresh]);
 
   useEffect(() => {
+    // Do not open an EventSource the browser can never authenticate; that is expected in token
+    // mode and is not a stream failure.
+    if (!authMode || authMode.browserAccess === 'disabled') return;
     const stop = subscribeEvents({
       onEvent: event => {
         cursor.current = event.seq;
@@ -171,29 +212,48 @@ export default function App() {
       onGap: next => { setGap(next.reason ?? 'event gap'); if (next.cursor) cursor.current = next.cursor; void refresh(); },
     }, cursor.current);
     return stop;
-  }, [applySnapshot, refresh, streamEpoch]);
+  }, [applySnapshot, refresh, streamEpoch, authMode]);
 
   const submitPair = async () => {
     setPairError(undefined);
     try {
       await pair(pairCode.trim());
+      commandError.current = false;
+      setError(undefined);
       setPairingRequired(false); setPairCode(''); setStreamEpoch(previous => previous + 1); await refresh();
     } catch (cause) { setPairError(cause instanceof Error ? cause.message : 'pairing failed'); }
   };
 
   const run = useCallback(async (command: string, payload: Record<string, unknown>, expectedRevision?: number) => {
-    setBusy(true); setFeedback(undefined);
+    setBusy(true); setFeedback(undefined); setError(undefined); setTurnWarning(undefined); commandError.current = false;
     try {
       const result = await api.command(command, payload, expectedRevision);
       const state = String((result.body as { state?: string }).state ?? (result.status >= 400 ? 'rejected' : 'unknown'));
-      if (command === 'message' || command === 'chat') setConversation(previous => [...previous.slice(-40), { role: 'you', text: String(payload.text ?? ''), state }]);
-      if (result.status === 401) { setPairingRequired(true); setError('Pairing session required or expired.'); }
-      else if (result.status >= 400) setError(String((result.body as { code?: string }).code ?? `http-${result.status}`));
-      else { setError(undefined); setFeedback(`${command}: ${state}`); }
+      // A terminal command receipt is not a successful agent turn. The provider may have
+      // stopped for an unavailable/truncated reason; never paint that as a green success.
+      const response = (result.body as { result?: { response?: { stopReason?: unknown } } }).result?.response;
+      const stopReason = typeof response?.stopReason === 'string' ? response.stopReason : undefined;
+      const incompleteTurn = command === 'message' && stopReason !== undefined && !['end_turn', 'stop_sequence', 'stop', 'tool_calls', 'tool_use', 'function_call'].includes(stopReason) ? stopReason : undefined;
+      if (command === 'message' || command === 'chat') setConversation(previous => [...previous.slice(-40), { role: 'you', text: String(payload.text ?? ''), state: incompleteTurn ?? state }]);
+      if (result.status === 401) {
+        commandError.current = true;
+        if (authModeRef.current?.pairing) { setPairingRequired(true); setError('Pairing session required or expired.'); }
+        else if (authModeRef.current?.browserAccess === 'disabled') { setPairingRequired(false); setError('browser access disabled; use the CLI bearer'); }
+        else { setPairingRequired(false); setError('authentication required; this server advertised no pairing mode'); }
+      } else if (result.status >= 400) { commandError.current = true; setError(String((result.body as { code?: string }).code ?? `http-${result.status}`)); }
+      else {
+        commandError.current = false; setError(undefined);
+        setFeedback(incompleteTurn ? undefined : `${command}: ${state}`);
+        setTurnWarning(incompleteTurn ? `Agent turn ended with "${incompleteTurn}". No successful response was recorded, and no effect is implied.` : undefined);
+      }
       await refresh();
     } catch (cause) {
-      if (isAuthError(cause)) setPairingRequired(true);
-      else setError(cause instanceof Error ? cause.message : 'command failed');
+      commandError.current = !isAuthError(cause);
+      if (isAuthError(cause)) {
+        if (authModeRef.current?.pairing) setPairingRequired(true);
+        else if (authModeRef.current?.browserAccess === 'disabled') { setPairingRequired(false); setError('browser access disabled; use the CLI bearer'); }
+        else { setPairingRequired(false); setError('authentication required; this server advertised no pairing mode'); }
+      } else setError(cause instanceof Error ? cause.message : 'command failed');
     } finally { setBusy(false); }
   }, [refresh]);
 
@@ -231,16 +291,29 @@ export default function App() {
         <div className="app-bar-actions">
           <Dot tone={stream === 'open' ? 'ok' : stream === 'error' ? 'bad' : 'idle'} />
           <span className="row-meta">{stream === 'open' ? 'live' : stream === 'error' ? 'stream unavailable' : stream}</span>
-          <span className="row-meta">cursor {value(cursor.current)}</span>
+          <span className="row-meta" data-testid="stream-cursor">cursor {value(cursor.current)}</span>
           <button onClick={() => void refresh()} disabled={busy}>Refresh</button>
         </div>
       </header>
 
       {gap && <div className="panel notice" role="status">Event stream gap ({gap}); full state was reloaded. The cursor is {value(cursor.current)}.</div>}
-      {error && <div className="panel error" role="alert">Command or read failed: {error}. Values shown as -- are unavailable.</div>}
+      {error && <div className="panel error" role="alert" data-testid="command-error">Command or read failed: {error}. Values shown as -- are unavailable.</div>}
       {feedback && <div className="panel notice" role="status">{feedback}. The state below was re-read from the service.</div>}
+      {turnWarning && <div className="panel notice" role="alert" data-testid="turn-warning">{turnWarning}</div>}
 
-      {pairingRequired && (
+      {authMode?.browserAccess === 'disabled' && (
+        <section className="panel notice" role="status" data-testid="bearer-mode-notice">
+          <h2>Browser access disabled; use the CLI bearer</h2>
+          <p>
+            This serving Runtime runs in token mode: pairing is disabled and the loopback API requires a
+            CLI bearer. This browser holds no such credential, so reads and writes from here are refused.
+            Use the attached CLI (or another local HTTP client) with the bearer configured on the server.
+            The bearer is never sent to or displayed by this page.
+          </p>
+        </section>
+      )}
+
+      {pairingRequired && authMode?.pairing && (
         <section className="panel primary pairing" role="dialog" aria-modal="true" aria-labelledby="pair-title">
           <h2 id="pair-title">Pair this browser</h2>
           <p className="hero-explain">The serving Runtime requires a local pairing session. Enter the one-time code printed in its terminal. The session cookie is HttpOnly; the CSRF token is kept in sessionStorage and is never used as a bearer substitute.</p>
@@ -266,7 +339,8 @@ export default function App() {
               <div className="hero-status"><Dot tone={tone} /> {headline}</div>
               <p className="hero-explain">{activeGoal?.spec?.text ?? activeGoal?.text ?? 'No active goal. Set one to start autonomous work.'}</p>
               <div className="hero-meta">
-                <span>profile {value(capabilities?.profile)}</span>
+                <span data-testid="runtime-profile">runtime profile {value(capabilities?.runtimeProfile ?? config?.runtimeProfile)}</span>
+                <span data-testid="server-profile">server profile {value(capabilities?.serverProfileId ?? capabilities?.profile)}</span>
                 <span>provider {value(provider?.provider)}</span>
                 <span>session {value(sessionState)} ({value(status?.session?.recoveryAttempts)}/{value(status?.session?.recoveryBudget)})</span>
                 <span>updated {value(lastUpdated)}</span>
@@ -419,9 +493,11 @@ export default function App() {
               <div className="kv-row"><span className="kv-key">Network</span><span className="kv-value">{provider?.networkEnabled ? 'enabled' : 'disabled'}</span></div>
               <div className="kv-row"><span className="kv-key">Configured</span><span className="kv-value">{provider?.configured === undefined ? '--' : provider.configured ? 'yes' : 'no'}</span></div>
               <div className="kv-row"><span className="kv-key">Transport</span><span className="kv-value">{value(provider?.transport)}</span></div>
-              <div className="kv-row"><span className="kv-key">Profile</span><span className="kv-value">{value(config?.profile ?? capabilities?.profile)}</span></div>
-              <div className="kv-row"><span className="kv-key">Browser pairing</span><span className="kv-value">{config?.pairing === undefined ? '--' : config.pairing ? 'required' : 'loopback-open'}</span></div>
-              <div className="kv-row"><span className="kv-key">CLI token</span><span className="kv-value">{value(config?.cliAccess)}</span></div>
+              <div className="kv-row"><span className="kv-key">Runtime profile</span><span className="kv-value" data-testid="config-runtime-profile">{value(config?.runtimeProfile ?? capabilities?.runtimeProfile)}</span></div>
+              <div className="kv-row"><span className="kv-key">Server profile id</span><span className="kv-value" data-testid="config-server-profile">{value(config?.serverProfileId ?? capabilities?.serverProfileId ?? config?.profile ?? capabilities?.profile)}</span></div>
+              <div className="kv-row"><span className="kv-key">Access mode</span><span className="kv-value" data-testid="access-mode">{value(authMode?.mode)}</span></div>
+              <div className="kv-row"><span className="kv-key">Browser access</span><span className="kv-value" data-testid="browser-access">{authMode ? (authMode.browserAccess === 'disabled' ? 'disabled (CLI bearer required)' : authMode.browserAccess) : '--'}</span></div>
+              <div className="kv-row"><span className="kv-key">CLI token</span><span className="kv-value">{value(config?.cliAccess ?? (authMode?.bearerRequired ? 'configured' : undefined))}</span></div>
             </div>
           </section>
           <section className="panel">
@@ -434,7 +510,8 @@ export default function App() {
                 </div>
               ))}
               <div className="kv-row"><span className="kv-key">Skills</span><span className="kv-value">{Array.isArray(capabilities?.skills) ? capabilities.skills.join(', ') || 'none' : value(capabilities?.skills)}</span></div>
-              <div className="kv-row"><span className="kv-key">Inputs enabled</span><span className="kv-value">{capabilities?.inputsEnabled === undefined ? '--' : capabilities.inputsEnabled ? 'yes' : 'no'}</span></div>
+              <div className="kv-row"><span className="kv-key">Inputs enabled (raw)</span><span className="kv-value" data-testid="raw-inputs">{capabilities?.inputsEnabled === undefined ? '--' : capabilities.inputsEnabled ? 'yes' : 'no'}</span></div>
+              <div className="kv-row"><span className="kv-key">Inputs effective</span><span className="kv-value" data-testid="effective-inputs"><Tag status={capabilities?.effectiveInputsEnabled === undefined ? undefined : capabilities.effectiveInputsEnabled ? 'enabled' : 'disabled'} /> {value(capabilities?.inputControl?.reason ?? capabilities?.inputControl?.state)}</span></div>
               <div className="kv-row"><span className="kv-key">Limitations</span><span className="kv-value">{capabilities?.limitations?.length ? capabilities.limitations.join(', ') : 'none reported'}</span></div>
             </div>
           </section>
@@ -442,7 +519,7 @@ export default function App() {
             <h2>Diagnostics</h2>
             <div className="kv">
               <div className="kv-row"><span className="kv-key">SSE</span><span className="kv-value"><Tag status={stream === 'open' ? 'enabled' : stream === 'error' ? 'failed' : stream} /></span></div>
-              <div className="kv-row"><span className="kv-key">Snapshot cursor</span><span className="kv-value">{value(cursor.current)}</span></div>
+              <div className="kv-row"><span className="kv-key">Snapshot cursor</span><span className="kv-value" data-testid="snapshot-cursor">{value(cursor.current)}</span></div>
               <div className="kv-row"><span className="kv-key">Last event gap</span><span className="kv-value">{value(gap)}</span></div>
               <div className="kv-row"><span className="kv-key">Last refresh</span><span className="kv-value">{value(lastUpdated)}</span></div>
             </div>
