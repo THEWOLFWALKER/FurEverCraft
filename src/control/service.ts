@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { RuntimeAssembly } from '../execution/factory.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import { redact } from '../diagnostics/redaction.js';
+import { collectDoctorReport, type DoctorOptions, type DoctorReport } from '../diagnostics/doctor.js';
 import { bodyStateView, legacyBodyStateView, type BodyStateView } from '../motor/contracts.js';
 import {
   CancelPayloadSchema, ChatPayloadSchema, CommandRequestSchema, GoalRevisePayloadSchema, GoalSetPayloadSchema,
@@ -167,6 +168,9 @@ export class ControlService {
   /** Current event sequence head; SSE snapshots are labelled with it so snapshot and cursor agree. */
   eventsHead() { return this.runtime.session.events.head(); }
   provider() { return redact(this.providerMetadata); }
+  /** Read-only capability report over the same attached Runtime (no start/dispatch). */
+  diagnostics(options?: DoctorOptions): DoctorReport { return collectDoctorReport(this.runtime, options); }
+  doctor(options?: DoctorOptions): DoctorReport { return this.diagnostics(options); }
 
   async command(input: unknown): Promise<CommandResult> {
     const parsed = CommandRequestSchema.safeParse(input);

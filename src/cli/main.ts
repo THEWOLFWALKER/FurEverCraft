@@ -16,7 +16,8 @@ import { randomBytes } from 'node:crypto';
 import type { Server } from 'node:http';
 import { getGameVersionProfile, versionProfileSummary } from '../bridge/version-profile.js';
 import { createControlServer } from '../server/index.js';
-import { TraceRecorder, replayTrace } from '../diagnostics/trace.js';
+import { replayTrace, exportTraceFromStore } from '../diagnostics/trace.js';
+import { collectDoctorReport, unavailableDoctorReport, type DoctorReport } from '../diagnostics/doctor.js';
 import { ProcessSupervisor } from '../bridge/supervisor.js';
 import { spawnBridgeServiceProcess } from '../bridge/service/spawn.js';
 import type { BridgeServiceEntryConfig } from '../bridge/service/entry.js';
@@ -233,9 +234,18 @@ export async function runAttach(url: string, io: CliIo = {}, options: AttachOpti
     if (verb === 'shutdown' || verb === 'runtime-quit') { printJson(output, (await postCommand('quit', {})).body); return {}; }
     const paths: Record<string, string> = {
       status: '/api/v1/status', state: '/api/v1/status', executions: '/api/v1/executions', places: '/api/v1/places',
-      provider: '/api/v1/provider', capabilities: '/api/v1/capabilities', config: '/api/v1/config', doctor: '/api/v1/capabilities',
+      provider: '/api/v1/provider', capabilities: '/api/v1/capabilities', config: '/api/v1/config',
     };
     if (paths[verb] && !subverb) { printJson(output, (await request('GET', paths[verb]!)).body); return {}; }
+    if (verb === 'doctor') {
+      // Compose the serving Runtime's real capability/status/provider views rather than
+      // printing a static answer. A full doctor report requires the Runtime itself.
+      const [capabilities, status, provider] = await Promise.all([
+        request('GET', '/api/v1/capabilities'), request('GET', '/api/v1/status'), request('GET', '/api/v1/provider'),
+      ]);
+      printJson(output, { capabilities: capabilities.body, status: status.body, provider: provider.body });
+      return {};
+    }
     if (verb === 'effects') {
       const query = subverb ? `?executionId=${encodeURIComponent(subverb)}` : '';
       printJson(output, (await request('GET', `/api/v1/effects${query}`)).body); return {};
@@ -354,6 +364,68 @@ export async function runBridgeServiceCommand(config: BridgeServiceEntryConfig, 
   }
 }
 
+export type DoctorCommandOptions = { profile?: string; db?: string; generatedAt?: number };
+
+/**
+ * Assemble the requested profile and report what it actually has. A profile that
+ * cannot be assembled (for example client-offline with no real body) is reported
+ * as unavailable with the real reason instead of a static optimistic answer.
+ */
+export function runDoctorCommand(options: DoctorCommandOptions = {}): DoctorReport {
+  const profile = options.profile ?? 'simulated';
+  let runtime: ReturnType<typeof createRuntime> | undefined;
+  try {
+    runtime = createRuntime({ profile: profile as 'simulated' | 'client-offline', ...(options.db ? { db: options.db } : {}) });
+    return collectDoctorReport(runtime, options.generatedAt === undefined ? {} : { generatedAt: options.generatedAt });
+  } catch (error) {
+    return unavailableDoctorReport({
+      profile,
+      reason: error instanceof Error ? error.message : String(error),
+      ...(options.db ? { dbPath: options.db } : {}),
+      ...(options.generatedAt === undefined ? {} : { generatedAt: options.generatedAt }),
+    });
+  } finally {
+    runtime?.close();
+  }
+}
+
+export type TraceExportCommandOptions = {
+  db?: string;
+  cursor?: string;
+  maxRecords?: number;
+  maxRecordBytes?: number;
+  maxBytes?: number;
+  retentionMs?: number;
+};
+
+export function runTraceExportCommand(options: TraceExportCommandOptions = {}) {
+  const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:');
+  try {
+    return exportTraceFromStore(store, {
+      ...(options.cursor === undefined ? {} : { cursor: options.cursor }),
+      ...(options.maxRecords === undefined ? {} : { maxRecords: options.maxRecords }),
+      ...(options.maxRecordBytes === undefined ? {} : { maxRecordBytes: options.maxRecordBytes }),
+      ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+      ...(options.retentionMs === undefined ? {} : { retentionMs: options.retentionMs }),
+    });
+  } finally {
+    store.close();
+  }
+}
+
+export type TraceReplayCommandOptions = { cursor?: string };
+
+export function runTraceReplayCommand(document: unknown, options: TraceReplayCommandOptions = {}) {
+  return replayTrace(document as Parameters<typeof replayTrace>[0], options.cursor === undefined ? {} : { cursor: options.cursor });
+}
+
+const numberOption = (name: string, value: string | undefined): number | undefined => {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`invalid-${name}`);
+  return parsed;
+};
+
 export function main(argv = process.argv) {
   const program = new Command();
   program.name('minecraft-agent').option('--profile <profile>', 'profile', 'simulated').option('--db <path>', 'SQLite path');
@@ -372,7 +444,11 @@ export function main(argv = process.argv) {
     .option('--no-subscribe', 'do not open the event/state subscription automatically')
     .action(options => runAttach(options.url, {}, { token: options.token, pairCode: options.pairCode, subscribe: options.subscribe, cursor: options.cursor }));
   program.command('status').option('--db <path>').action((options, command) => { const db = options.db ?? command.parent?.opts().db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'; const runtime = new SessionRuntime(new FakeClientBridge(), new SQLiteStore(db)); try { console.log(JSON.stringify(redact({ simulated: true, status: runtime.store.listGoals().some(g => g.status === 'active') ? 'active' : 'idle', goals: runtime.store.listGoals(), executions: runtime.store.listExecutions() }))); } finally { runtime.store.close(); } });
-  program.command('doctor').action((_, command) => { const profile = command.parent?.opts().profile ?? 'simulated'; const runtime = createRuntime({ profile }); try { const provider = runtime.control.provider() as { networkEnabled?: boolean; provider?: string; configured?: boolean; transport?: string }; console.log(JSON.stringify(redact({ profile, simulated: profile === 'simulated', network: provider.networkEnabled ? 'enabled' : 'disabled', provider, body: runtime.control.status().body ?? null, canonicalProviderPath: runtime.canonicalProviderPath, credentials: 'not-required-offline', capabilities: { capture_view: 'synthetic-only', skills: runtime.router.availableSkills() }, status: runtime.session.start() }))); } finally { runtime.close(); } });
+  program.command('doctor').option('--db <path>').action((options, command) => {
+    const profile = command.parent?.opts().profile ?? 'simulated';
+    const db = options.db ?? command.parent?.opts().db;
+    console.log(JSON.stringify(redact(runDoctorCommand({ profile, ...(db ? { db } : {}) }))));
+  });
   program.command('bridge').option('--config <path>', 'profile config').option('--mode <mode>', 'fixture|inspect|service|live', 'fixture').action(async (options) => { const file = resolve(options.config ?? 'configs/client-offline.example.json'); const config = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; const mode = options.mode as string; if (!['fixture', 'inspect', 'service', 'live'].includes(mode)) throw new Error('invalid-bridge-mode'); if (mode === 'live') { if (config.allowMinecraftUpstream !== true) throw new Error('live-mode-requires-explicit-upstream-gate'); throw new Error('live-mode-requires-real-client-environment'); } const profile=getGameVersionProfile(); if (mode === 'inspect') { console.log(JSON.stringify(redact({ mode, source: 'fixture', network: 'disabled', profile: versionProfileSummary(profile), protocol: { legacyCodecFixture: minecraftDataSummary(), target: profile }, config }))); return; }
     const upstream=net.createServer(socket=>{socket.on('data',chunk=>socket.write(chunk));}); await new Promise<void>((resolve,reject)=>{upstream.once('error',reject);upstream.listen(0,'127.0.0.1',resolve);}); const targetPort=(upstream.address() as import('node:net').AddressInfo).port;
     if (mode === 'service') {
@@ -392,8 +468,55 @@ export function main(argv = process.argv) {
   });
   program.command('goal:revise').requiredOption('--id <goalId>').requiredOption('--revision <revision>').requiredOption('--change <change>').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(redact(store.reviseGoal(options.id, Number(options.revision), options.change)))); } finally { store.close(); } });
   program.command('events').option('--cursor <cursor>', 'cursor', '0').option('--limit <limit>', '100').option('--db <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { console.log(JSON.stringify(new SessionRuntime(new FakeClientBridge(), store).events.read(options.cursor, Number(options.limit)))); } finally { store.close(); } });
-  program.command('trace:export').option('--db <path>').option('--out <path>').action((options) => { const store = new SQLiteStore(options.db ?? process.env.MINECRAFT_AGENT_DB ?? ':memory:'); try { const recorder = new TraceRecorder(); recorder.appendRead(new SessionRuntime(new FakeClientBridge(), store).events.read('0', 10000)); const document = recorder.export(); if (options.out) { writeFileSync(options.out, JSON.stringify(document)); console.log(JSON.stringify({ written: options.out, records: document.records.length })); } else console.log(JSON.stringify(document)); } finally { store.close(); } });
-  program.command('trace:replay').requiredOption('--file <path>').action((options) => { const document = JSON.parse(readFileSync(options.file, 'utf8')) as ReturnType<TraceRecorder['export']>; const result = replayTrace(document); console.log(JSON.stringify(redact(result))); });
+  program.command('trace:export')
+    .option('--db <path>')
+    .option('--out <path>')
+    .option('--cursor <cursor>', 'export events after this cursor', '0')
+    .option('--max-records <n>', 'bounded event records', '4096')
+    .option('--max-record-bytes <n>', 'bound per payload', '16384')
+    .option('--max-bytes <n>', 'bounded total trace size', '4194304')
+    .option('--retention-ms <n>', 'drop records older than this', '86400000')
+    .action((options, command) => {
+      // The root program also defines --db; commander stores the value on the parent,
+      // so read globals as a fallback instead of silently using :memory:.
+      const db = options.db ?? (command.optsWithGlobals().db as string | undefined);
+      const document = runTraceExportCommand({
+        ...(db ? { db } : {}),
+        cursor: options.cursor,
+        maxRecords: numberOption('max-records', options.maxRecords),
+        maxRecordBytes: numberOption('max-record-bytes', options.maxRecordBytes),
+        maxBytes: numberOption('max-bytes', options.maxBytes),
+        retentionMs: numberOption('retention-ms', options.retentionMs),
+      });
+      const summary = {
+        source: document.source,
+        records: document.records.length,
+        inputIntents: (document.inputIntents ?? []).length,
+        effects: (document.effects ?? []).length,
+        dropped: document.dropped ?? 0,
+        truncated: document.truncated === true,
+        policy: document.policy,
+      };
+      if (options.out) {
+        writeFileSync(options.out, JSON.stringify(document));
+        console.log(JSON.stringify(redact({ written: options.out, ...summary })));
+      } else console.log(JSON.stringify(redact(document)));
+    });
+  program.command('trace:replay')
+    .requiredOption('--file <path>')
+    .option('--cursor <cursor>', 'replay only events after this cursor')
+    .option('--strict', 'exit 2 when the trace is not contiguous')
+    .action((options) => {
+      try {
+        const document = JSON.parse(readFileSync(options.file, 'utf8')) as unknown;
+        const result = runTraceReplayCommand(document, options.cursor === undefined ? {} : { cursor: options.cursor });
+        console.log(JSON.stringify(redact(result)));
+        if (options.strict && !result.contiguous) process.exitCode = 2;
+      } catch (error) {
+        console.log(JSON.stringify({ error: redact(error instanceof Error ? error.message : String(error)) }));
+        process.exitCode = 1;
+      }
+    });
   program.action(() => runDemo(program.opts().db));
   return program.parseAsync(argv);
 }
