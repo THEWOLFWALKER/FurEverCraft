@@ -55,7 +55,7 @@ export const DEFAULT_MOVEMENT_CAPABILITIES: readonly ActionCapability[] = [...EV
 /** Motor primitives with an implementation in this batch. */
 export const EVIDENCED_MOTOR_PRIMITIVES = ['turn', 'walk', 'stop', 'jump_short'] as const;
 
-export type PlanStatus = 'COMPLETE' | 'PARTIAL' | 'NEEDS_OBSERVATION' | 'BUDGET_EXHAUSTED' | 'NO_PATH_IN_KNOWN_GRAPH' | 'UNSUPPORTED_TRANSITION';
+export type PlanStatus = 'COMPLETE' | 'PARTIAL' | 'NEEDS_OBSERVATION' | 'BUDGET_EXHAUSTED' | 'NO_PATH_IN_KNOWN_GRAPH' | 'UNSUPPORTED_TRANSITION' | 'CANCELED';
 export type PlanResult = { status: PlanStatus; edges: ActionEdge[]; expanded: number; snapshotRevision: string; stableEndpoint?: Pose3D; dependencies: string[]; supportedActions: readonly ActionKind[]; reason?: string };
 
 /** A planned edge plus the observation it was planned against and its tolerances. */

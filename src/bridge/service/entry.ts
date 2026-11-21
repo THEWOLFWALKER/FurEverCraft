@@ -1,34 +1,129 @@
 import { randomUUID } from 'node:crypto';
 import { redact } from '../../diagnostics/redaction.js';
+import { stoppedObserverState } from '../observer/host.js';
 import { IpcRequestSchema, type IpcRequest } from '../ipc/protocol.js';
 import { spawnRelayProcess } from '../relay/spawn.js';
 import type { RelayEntryConfig } from '../relay/entry.js';
 import { ProcessSupervisor } from '../supervisor.js';
-import { BridgeService, type BridgeShutdownResult, type ObserverMonitor } from './orchestrator.js';
+import { BridgeService, type ObserverMonitor } from './orchestrator.js';
+
+type ObserverCommand = 'start-observer' | 'stop-observer';
+type ObserverCommandResult = { completed?: boolean; status?: string; observer?: unknown };
+
+const AWAITING_RELAY_STATE = { running: false, stopped: true, availability: 'unknown', limitation: 'awaiting-relay-child' };
 
 /**
  * Passive observer monitor over the relay child's IPC stream. The worker lives in the relay
  * process (it needs the raw chunks); this service only tracks its reported state and failures.
+ * Explicit start-observer/stop-observer requests are forwarded to the relay child, and only an
+ * actual worker transition is reported as completed.
  */
-class RelayObserverMonitor implements ObserverMonitor {
-  private stateValue: unknown = { running: false, availability: 'unknown', limitation: 'awaiting-relay-child' };
+export class RelayObserverMonitor implements ObserverMonitor {
+  private stateValue: unknown = AWAITING_RELAY_STATE;
   private readonly failures = new Set<(reason: string) => void>();
-  constructor(private readonly onEvent: (event: unknown) => void) {}
+  private stopped = true;
+  private epoch?: string;
+  private generation = 0;
+  /**
+   * Whether observer events from the current relay generation are dropped. Distinct from the
+   * reported worker `stopped` state: a monitor is only constructed when observation is enabled,
+   * and the relay child starts that worker at boot from its own config. So events are forwarded
+   * as soon as a relay hello has named the generation, until an explicit stop halts them. Gating
+   * forwarding on `startLive()` having run would silently drop every boot-enabled observation.
+   */
+  private eventsHalted = false;
 
-  start(): void { /* the relay child owns the worker lifecycle */ }
-  async stop(): Promise<void> { /* stopping the relay child stops the worker */ }
-  state(): unknown { return this.stateValue; }
-  onFailure(listener: (reason: string) => void): () => void { this.failures.add(listener); return () => this.failures.delete(listener); }
+  constructor(
+    private readonly onEvent: (event: unknown) => void,
+    private readonly request?: (command: ObserverCommand, payload?: unknown) => Promise<unknown>,
+    private readonly relayRunning?: () => boolean,
+  ) {}
 
-  /** Adopt the observer state returned by a relay recovery/stop command. */
-  applyResult(result: unknown): void {
-    const observer = (result as { observer?: unknown } | undefined)?.observer;
-    if (observer !== undefined) this.stateValue = observer;
+  async start(): Promise<void> {
+    // Boot-time observer enablement is driven by the relay child config. When the relay is
+    // already live (an explicit restart), drive the real worker through IPC.
+    if (this.relayRunning?.() !== true) return;
+    await this.startLive();
   }
 
+  /** Explicit control-plane start; failures are surfaced instead of returning a false ack. */
+  async startLive(): Promise<void> {
+    const generation = ++this.generation;
+    if (this.relayRunning && !this.relayRunning()) throw new Error('relay-not-running');
+    if (!this.request) throw new Error('observer-control-unavailable');
+    const result = await this.send('start-observer') as ObserverCommandResult | undefined;
+    if (generation !== this.generation) throw new Error('observer-control-superseded');
+    if (result?.completed !== true) {
+      this.stopped = true;
+      this.stateValue = stoppedObserverState();
+      throw new Error('observer-start-not-completed');
+    }
+    this.stopped = false;
+    // An explicit start also resumes forwarding for the current generation.
+    this.eventsHalted = false;
+    if (result.observer !== undefined) this.stateValue = result.observer;
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.eventsHalted = true;
+    this.generation += 1;
+    this.stateValue = stoppedObserverState();
+    if (this.relayRunning?.() !== true) return;
+    try { await this.send('stop-observer'); } catch { /* relay teardown owns the worker */ }
+  }
+
+  /** Explicit control-plane stop; reports failure rather than claiming a worker stopped. */
+  async stopLive(): Promise<void> {
+    const generation = ++this.generation;
+    if (this.relayRunning && !this.relayRunning()) {
+      this.stopped = true;
+      this.eventsHalted = true;
+      this.stateValue = stoppedObserverState();
+      return;
+    }
+    if (!this.request) throw new Error('observer-control-unavailable');
+    const result = await this.send('stop-observer') as ObserverCommandResult | undefined;
+    if (generation !== this.generation) throw new Error('observer-control-superseded');
+    if (result?.completed !== true) throw new Error('observer-stop-not-completed');
+    this.stopped = true;
+    this.eventsHalted = true;
+    this.stateValue = result.observer !== undefined ? result.observer : stoppedObserverState();
+  }
+
+  state(): unknown { return this.stateValue; }
+  onFailure(listener: (reason: string) => void): () => void { this.failures.add(listener); return () => this.failures.delete(listener); }
+  forceStop(): void { this.stopped = true; this.eventsHalted = true; this.stateValue = stoppedObserverState(); }
+
   handle(message: unknown): void {
-    const value = message as { type?: string; event?: string; payload?: unknown; reason?: string } | undefined;
-    if (!value || value.type !== 'event') return;
+    const value = message as {
+      type?: string;
+      process?: string;
+      event?: string;
+      sessionEpoch?: string;
+      payload?: unknown;
+      reason?: string;
+    } | undefined;
+    if (!value) return;
+    if (value.type === 'hello' && value.process === 'relay' && typeof value.sessionEpoch === 'string') {
+      if (this.epoch !== undefined && this.epoch !== value.sessionEpoch) {
+        // A new relay generation cannot inherit the old worker's state. A restart re-arms the
+        // worker from the relay config, so forwarding resumes for the new generation.
+        this.epoch = value.sessionEpoch;
+        this.generation += 1;
+        this.eventsHalted = false;
+        if (!this.stopped) this.stateValue = AWAITING_RELAY_STATE;
+      } else if (this.epoch === undefined) {
+        this.epoch = value.sessionEpoch;
+      }
+      return;
+    }
+    if (value.type !== 'event') return;
+    // Events are forwarded for the live relay generation (named by a hello) until an explicit
+    // stop halts them. Boot-enabled observation never calls startLive, so this must not depend
+    // on it. Events from an older relay generation are still dropped by the epoch check below.
+    if (this.eventsHalted || this.epoch === undefined) return;
+    if (typeof value.sessionEpoch === 'string' && value.sessionEpoch !== this.epoch) return;
     if (value.event === 'observer') {
       try { this.onEvent(value.payload); } catch { /* isolated */ }
       return;
@@ -36,11 +131,6 @@ class RelayObserverMonitor implements ObserverMonitor {
     if (value.event === 'diagnostic') {
       const payload = value.payload as { kind?: string; reason?: string } | undefined;
       if (payload?.kind === 'observer-failure') {
-        // Never leave a stale 'running' report after a worker failure: admission arming reads
-        // this state, and a later relay-state heartbeat may not arrive before the operator arm.
-        const current = this.stateValue && typeof this.stateValue === 'object'
-          ? this.stateValue as Record<string, unknown> : {};
-        this.stateValue = { ...current, running: false, availability: 'unknown', lastFailure: payload.reason ?? 'observer-worker-failure' };
         for (const listener of this.failures) { try { listener(payload.reason ?? 'observer-worker-failure'); } catch { /* isolated */ } }
       }
       return;
@@ -49,6 +139,21 @@ class RelayObserverMonitor implements ObserverMonitor {
       const payload = value.payload as { observer?: unknown } | undefined;
       if (payload?.observer !== undefined) this.stateValue = payload.observer;
     }
+  }
+
+  private async send(command: ObserverCommand): Promise<unknown> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try { return await this.request!(command, {}); }
+      catch (error) {
+        lastError = error;
+        // The supervisor may still be promoting its just-spawned child; retry briefly.
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes('supervisor-not-running:starting')) break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 }
 
@@ -85,19 +190,22 @@ export type ServiceIpc = {
 export type BridgeServiceEntryHandle = {
   readonly sessionEpoch: string;
   readonly service: BridgeService;
-  stop(reason?: string): Promise<BridgeShutdownResult>;
+  stop(reason?: string): Promise<{ stopped: boolean; forced: boolean; error?: string }>;
 };
 
 export type ServiceCommandReply =
   | { kind: 'reply'; ok: boolean; result?: unknown; error?: { code: string; message: string } }
   | { kind: 'shutdown' }
   | { kind: 'start-observer' }
-  | { kind: 'stop-observer' };
+  | { kind: 'stop-observer' }
+  | { kind: 'observe' }
+  | { kind: 'arm' };
 
 /**
  * Real capability report for the configured service. Target/network come from the relay
  * configuration actually handed to this child; profile is reported only when the caller
- * supplied it (`unspecified` otherwise, never a guessed profile).
+ * supplied it (`unspecified` otherwise, never a guessed profile). A hardcoded
+ * `client-offline`/`disabled` reply would misreport an explicitly upstream-gated service.
  */
 export function describeBridgeServiceCapabilities(config: BridgeServiceEntryConfig, observerState: unknown) {
   const relay = config.relay;
@@ -147,10 +255,10 @@ export function serviceCommandReply(
       }
       return { kind: 'stop-observer' };
     case 'arm': {
-      const armed = context.service.armControl('operator-ipc-arm');
-      const refusal = context.service.armRefusalReason;
+      const decision = context.service.armControl('operator-ipc-arm');
+      const refusal = decision.reasons.length > 0 ? decision.reasons.join(',') : undefined;
       const status = context.service.status();
-      return armed
+      return decision.allowed
         ? { kind: 'reply', ok: true, result: { armed: true, controlRevoked: status.controlRevoked, status } }
         : {
           kind: 'reply', ok: false,
@@ -182,15 +290,23 @@ export async function runBridgeServiceEntry(
     try { process.stderr.write(`${JSON.stringify(redact({ level, event, ...(fields ?? {}) }))}\n`); } catch { /* best effort */ }
   });
   let stopped = false;
-  let stopPromise: Promise<BridgeShutdownResult> | undefined;
+  let stopPromise: Promise<{ stopped: boolean; forced: boolean; error?: string }> | undefined;
   let service!: BridgeService;
   const observerEnabled = config.observer?.enabled !== false;
-  const observer = observerEnabled ? new RelayObserverMonitor(event => service?.publishObserver(event)) : undefined;
   const relay = new ProcessSupervisor({
     spawn: () => spawnRelayProcess({ ...config.relay, observer: config.relay.observer ?? { enabled: observerEnabled } }),
     maxRestarts: 0,
     ipcTimeoutMs: config.helloTimeoutMs ?? 5_000,
   });
+  // The monitor drives the worker through the same supervised child, so a start/stop ack
+  // reflects the relay's real worker state rather than a local flag.
+  const observer = observerEnabled
+    ? new RelayObserverMonitor(
+        event => service?.publishObserver(event),
+        (command, payload) => relay.request(command, payload),
+        () => relay.state === 'running',
+      )
+    : undefined;
   if (observer) relay.onMessage(message => observer.handle(message));
   service = new BridgeService({
     relay,
@@ -212,16 +328,20 @@ export async function runBridgeServiceEntry(
     service.emit({ type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch, ok, ...(result === undefined ? {} : { result }), ...(error === undefined ? {} : { error }) }, true);
   };
 
-  const stop = (reason = 'shutdown'): Promise<BridgeShutdownResult> => {
+  const stop = async (reason = 'shutdown'): Promise<{ stopped: boolean; forced: boolean; error?: string }> => {
     if (stopPromise) return stopPromise;
     // Stop accepting commands while shutdown is in flight; the shutdown reply itself is sent
     // only after the service reports its real stop outcome.
     stopped = true;
     stopPromise = (async () => {
-      const result = await service.stop(reason);
+      await service.stop(reason);
       service.flush();
       try { ipc.off?.('message', onMessage); ipc.off?.('disconnect', onDisconnect); } catch { /* best effort */ }
-      return result;
+      // The service never reports a clean stop it did not achieve: any per-child failure or
+      // forced escalation is surfaced as `stopped:false` with the exact reason.
+      const shutdown = service.status().shutdown;
+      const error = shutdown.errors.at(-1);
+      return { stopped: !shutdown.forced && error === undefined, forced: shutdown.forced, ...(error === undefined ? {} : { error }) };
     })();
     return stopPromise;
   };
@@ -233,6 +353,10 @@ export async function runBridgeServiceEntry(
     if (!parsed.success) return;
     const request = parsed.data;
     const reply = serviceCommandReply(request, { sessionEpoch, service, ...(observer === undefined ? {} : { observer }), config });
+    if (reply.kind === 'reply') {
+      respond(request, reply.ok, reply.result, reply.error);
+      return;
+    }
     if (reply.kind === 'shutdown') {
       // Acknowledge only after the service has actually attempted to stop every child. A
       // per-child failure or a forced escalation is reported as `stopped:false`, never as a
@@ -252,20 +376,19 @@ export async function runBridgeServiceEntry(
     if (reply.kind === 'start-observer') {
       // Forward recovery to the owning relay child. A local no-op success would leave a
       // globally parked/overflowed observer unrecoverable while reporting success.
-      void relay.request('start-observer').then(
-        result => { observer?.applyResult(result); respond(request, true, result); },
+      void observer!.startLive().then(
+        () => respond(request, true, { accepted: true, completed: true, observer: observer!.state() }),
         error => respond(request, false, undefined, { code: 'observer-recovery-failed', message: errorText(error) }),
       );
       return;
     }
     if (reply.kind === 'stop-observer') {
-      void relay.request('stop-observer').then(
-        result => { observer?.applyResult(result); respond(request, true, result); },
+      void observer!.stopLive().then(
+        () => respond(request, true, { accepted: true, completed: true, observer: observer!.state() }),
         error => respond(request, false, undefined, { code: 'observer-stop-failed', message: errorText(error) }),
       );
       return;
     }
-    respond(request, reply.ok, reply.result, reply.error);
   };
 
   const onDisconnect = () => { void stop('parent-disconnect').then(result => process.exit(result.stopped ? 0 : 1)); };
@@ -283,16 +406,17 @@ export async function runBridgeServiceEntry(
     // reporting an optimistic result. Then release the relay child and exit non-zero.
     await stop('start-failed').catch(() => undefined);
     process.exitCode = 1;
-    throw error;
   }
   // Advertise the session only after the service actually reached running/degraded.
   // Advertise only capabilities this entry implements. `observe` is not a service command
   // (the observer is passive and `observe` is rejected as unsupported), and `observer` is only
   // advertised when an observer monitor is actually configured.
-  ipc.send({
-    type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch, bootEpoch,
-    capabilities: ['control', 'relay', ...(observer === undefined ? [] : ['observer'])],
-  });
+  if (process.exitCode !== 1) {
+    ipc.send({
+      type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch, bootEpoch,
+      capabilities: ['control', 'relay', ...(observer === undefined ? [] : ['observer'])],
+    });
+  }
 
   return { sessionEpoch, service, stop };
 }

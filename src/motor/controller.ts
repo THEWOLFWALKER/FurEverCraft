@@ -1,12 +1,12 @@
 import type { Clock } from '../contracts/index.js';
-import type { BodyAdapter, WorldObservation } from './contracts.js';
-import { isReal3DObservation } from './contracts.js';
-import { ActionPlanner, LANDING_TOLERANCE, type ActionPlannerOptions } from './action-graph.js';
+import type { BodyAdapter, ObserveOptions, SupportState, WorldObservation } from './contracts.js';
+import { isReal3DObservation, observationSupport } from './contracts.js';
+import { ActionPlanner, type ActionPlannerOptions } from './action-graph.js';
 import { Motor3D } from './primitives.js';
 import { ProgressController } from './progress.js';
 import {
-  edgeProgress, horizontalDistance, observationUsable, poseBlock, preconditionKeys, stepDirection, stepLanded,
-  stepTarget, worldFromObservation, yawDelta, type TemporaryFailure,
+  DEFAULT_ARRIVAL_TOLERANCE, edgeProgress, horizontalDistance, observationUsable, poseBlock, preconditionKeys, stepDirection, stepLanded,
+  stepTarget, targetCenter, withinArrivalTolerance, worldFromObservation, yawDelta, type TemporaryFailure,
 } from './route.js';
 import type { ActionCapability, BlockPos, MotorAsyncDeps, NavRoute, Pose3D, RouteStep } from './types.js';
 
@@ -19,6 +19,12 @@ export type ControlBudget = {
   stallTicks: number;
   observationMaxAgeMs: number;
   yawToleranceDegrees: number;
+  /** Bound for one observation; an unsettled observe is abandoned after this. */
+  observeTimeoutMs: number;
+  /** Bound for the terminal stop submission on the release path. */
+  stopTimeoutMs: number;
+  /** Bound for owner release; a hung release is reported, never awaited forever. */
+  releaseTimeoutMs: number;
 };
 export const DEFAULT_CONTROL_BUDGET: ControlBudget = {
   maxTicks: 400,
@@ -28,6 +34,9 @@ export const DEFAULT_CONTROL_BUDGET: ControlBudget = {
   stallTicks: 8,
   observationMaxAgeMs: 500,
   yawToleranceDegrees: 8,
+  observeTimeoutMs: 250,
+  stopTimeoutMs: 250,
+  releaseTimeoutMs: 250,
 };
 
 export type NavigationStatus = 'confirmed' | 'partial' | 'failed' | 'canceled';
@@ -102,6 +111,9 @@ export class MotionController {
   private running = false;
   private inputIssued = false;
   private releaseFailed = false;
+  /** Aborted by pause/stop/watch/target change so a stuck observe exits promptly. */
+  private runController?: AbortController;
+  private externalAbort?: { signal: AbortSignal; listener: () => void };
   private readonly budget: ControlBudget;
   private readonly progress: ProgressController;
 
@@ -130,6 +142,11 @@ export class MotionController {
   abort(reason: string, revokeLease = true): void {
     const fresh = this.abortReason === undefined;
     if (fresh) this.abortReason = reason;
+    // Signal any in-flight observation immediately. The guarded observe races
+    // this controller, so a never-settling adapter cannot pin the control loop.
+    if (!this.runController?.signal.aborted) {
+      try { this.runController?.abort(reason); } catch { /* abort is best effort */ }
+    }
     if (fresh && revokeLease) {
       try { this.options.onLeaseRevoke?.(reason); } catch { /* lease revocation is best effort at the hook boundary */ }
       this.releasePromise ??= this.releaseInput();
@@ -151,11 +168,21 @@ export class MotionController {
     this.inputIssued = false;
     this.releaseFailed = false;
     this.running = true;
+    // One controller per run: pause/stop/watch and the caller signal share it.
+    const runController = new AbortController();
+    this.runController = runController;
+    if (request.signal) {
+      const listener = () => this.abort('canceled');
+      if (request.signal.aborted) listener();
+      else request.signal.addEventListener('abort', listener, { once: true });
+      this.externalAbort = { signal: request.signal, listener };
+    }
     let ticks = 0;
+    const tick = () => ++ticks;
     let replans = 0;
     let pose: Pose3D | undefined;
     const target = request.target;
-    const tolerance = request.tolerance ?? LANDING_TOLERANCE;
+    const tolerance = request.tolerance ?? DEFAULT_ARRIVAL_TOLERANCE;
 
     const finish = async (status: NavigationStatus, outcome: NavigationOutcome, reason?: string, reasonCode?: string): Promise<NavigationResult> => {
       await this.stopAndRelease();
@@ -193,15 +220,30 @@ export class MotionController {
           return await finish('failed', 'failed', 'control-budget-exhausted', 'control-budget-exhausted');
         }
 
-        const observed = await this.body.observe();
+        const read = await this.readObservation(request);
+        if (!('observation' in read)) {
+          const stop = stopReason();
+          if (stop) { this.abort(stop); return await this.finishStop(finish, stop); }
+          if (read.kind === 'timeout' || read.kind === 'aborted') {
+            // An observation we could not obtain is partial/control-budget, never confirmed.
+            return await finish('partial', 'partial', read.reason, 'control-budget');
+          }
+          this.abort(read.reason);
+          return await finish('failed', 'failed', read.reason, read.reason);
+        }
+        const observed = read.observation;
         pose = observed.pose;
         this.lastObservedPose = observed.pose;
         const issue = this.observationIssue(observed);
         if (issue) { this.abort(issue); return await finish('failed', 'failed', issue, issue); }
 
-        if (this.reached(observed.pose, target, tolerance, observed.supported)) return await finish('confirmed', 'confirmed');
+        const support = observationSupport(observed);
+        // Unknown support cannot confirm arrival and is not evidence of being
+        // airborne: stop here and ask for a usable observation instead.
+        if (support === 'unknown') return await finish('partial', 'partial', 'support-unknown', 'needs-observation');
+        if (this.reached(observed.pose, target, tolerance, support)) return await finish('confirmed', 'confirmed');
 
-        if (!observed.supported) {
+        if (support === 'unsupported') {
           // Airborne/unsupported start is not a stable planning anchor. Wait for
           // bounded evidence instead of declaring a route from an invented pose.
           const decision = this.progress.record({ kind: 'observation_no_update', failureSignature: 'unstable-start', hasNewEvidence: false, ownerToken: request.ownerToken });
@@ -212,20 +254,37 @@ export class MotionController {
 
         const world = worldFromObservation(observed);
         const planner = new ActionPlanner(world, this.plannerOptions());
-        const planned = planner.planRoute(poseBlock(observed.pose), target);
+        // Async planning yields a real macrotask every expansion slice; the
+        // signal/deadline let pause and the wall-clock budget interrupt it.
+        const planned = await planner.planRouteAsync(poseBlock(observed.pose), target, {
+          signal: runController.signal,
+          deadline: startedAt + this.budget.maxWallClockMs,
+          now: () => this.clock.now(),
+        });
         this.currentRoute = this.annotate(planned, observed.revision);
         this.options.onProgress?.('plan', 0, this.currentRoute.steps.length, this.currentRoute.status);
+        if (planned.status === 'CANCELED') {
+          const stop = stopReason();
+          if (stop) { this.abort(stop); return await this.finishStop(finish, stop); }
+          this.abort('canceled');
+          return await this.finishStop(finish, 'canceled');
+        }
         if (planned.status !== 'COMPLETE') {
-          const status: NavigationStatus = planned.status === 'NEEDS_OBSERVATION' ? 'partial' : 'failed';
-          const outcome: NavigationOutcome = planned.status === 'NEEDS_OBSERVATION' ? 'partial' : 'failed';
+          const partial = planned.status === 'NEEDS_OBSERVATION' || planned.status === 'BUDGET_EXHAUSTED' || planned.status === 'PARTIAL';
+          const status: NavigationStatus = partial ? 'partial' : 'failed';
+          const outcome: NavigationOutcome = partial ? 'partial' : 'failed';
           // Unreachable/unsupported is declared, not executed. Held input is still released.
           return await finish(status, outcome, planned.reason ?? planned.status.toLowerCase(), `plan:${planned.status}`);
         }
         if (planned.steps.length === 0) {
-          // The body is already in the target block but the corner distance exceeds
-          // the landing tolerance. There is no finer edge to execute; walking out
-          // and back would be worse than accepting the observed target block.
-          return await finish('confirmed', 'confirmed');
+          // A zero-step route is a same-block planning anchor, not proof of
+          // arrival. Re-check the observed pose against the continuous target
+          // tolerance and close the remaining gap with bounded local control.
+          const settled = await this.settleAtTarget(target, tolerance, request, tick, stopReason, budgetExhausted, observed);
+          pose = settled.pose ?? pose;
+          if (settled.outcome === 'confirmed') return await finish('confirmed', 'confirmed');
+          if (settled.outcome === 'canceled') { this.abort(settled.reason ?? 'canceled'); return await this.finishStop(finish, settled.reason ?? 'canceled'); }
+          return await finish('partial', 'partial', settled.reason ?? 'arrival-tolerance-not-met', 'arrival-tolerance-not-met');
         }
         const validated = planner.validateRoute(this.currentRoute, world, { start: poseBlock(observed.pose) });
         if (!validated.ok) {
@@ -242,10 +301,20 @@ export class MotionController {
           if (stop) { this.abort(stop); return await this.finishStop(finish, stop); }
           const step = this.currentRoute.steps[stepIndex]!;
           // Preconditions are re-evaluated against the freshest observation, not the plan snapshot.
-          const before = await this.body.observe();
+          const beforeRead = await this.readObservation(request);
+          if (!('observation' in beforeRead)) {
+            const stop = stopReason();
+            if (stop) { this.abort(stop); return await this.finishStop(finish, stop); }
+            if (beforeRead.kind === 'timeout' || beforeRead.kind === 'aborted') return await finish('partial', 'partial', beforeRead.reason, 'control-budget');
+            this.abort(beforeRead.reason); return await finish('failed', 'failed', beforeRead.reason, beforeRead.reason);
+          }
+          const before = beforeRead.observation;
           pose = before.pose;
           const beforeIssue = this.observationIssue(before);
           if (beforeIssue) { this.abort(beforeIssue); return await finish('failed', 'failed', beforeIssue, beforeIssue); }
+          const beforeSupport = observationSupport(before);
+          if (beforeSupport === 'unknown') return await finish('partial', 'partial', 'support-unknown', 'needs-observation');
+          if (beforeSupport !== 'supported') return await finish('failed', 'failed', 'support-lost', 'support-lost');
           const freshWorld = worldFromObservation(before);
           const freshPlanner = new ActionPlanner(freshWorld, this.plannerOptions());
           const stepRoute: NavRoute = { ...this.currentRoute, steps: [step] };
@@ -264,6 +333,13 @@ export class MotionController {
             if (executed.reason) this.abort(executed.reason);
             return await this.finishStop(finish, executed.reason ?? 'canceled');
           }
+          if (executed.outcome === 'unknown') {
+            const stop = stopReason();
+            if (stop) { this.abort(stop); return await this.finishStop(finish, stop); }
+            // An unabortable/unavailable observation or unknown support inside a
+            // step is reported as partial and fresh observation, never confirmed.
+            return await finish('partial', 'partial', executed.reason ?? 'observation-unknown', 'control-budget');
+          }
           if (executed.outcome === 'replan') {
             this.noteStepFailure(step, executed.reason ?? 'stalled');
             if (replans >= this.budget.maxReplans) return await finish('failed', 'failed', executed.reason ?? 'replan-budget-exhausted', 'replan-budget-exhausted');
@@ -280,16 +356,28 @@ export class MotionController {
         }
         if (replanNeeded) continue;
 
-        // A route is only successful when the body is observed on the target, not
-        // because the planned step list was exhausted.
-        const finalObserved = await this.body.observe();
+        // A route is only successful when the body is observed within the
+        // continuous target tolerance, not because the planned step list ended.
+        const finalRead = await this.readObservation(request);
+        if (!('observation' in finalRead)) {
+          const stop = stopReason();
+          if (stop) { this.abort(stop); return await this.finishStop(finish, stop); }
+          if (finalRead.kind === 'timeout' || finalRead.kind === 'aborted') return await finish('partial', 'partial', finalRead.reason, 'control-budget');
+          this.abort(finalRead.reason); return await finish('failed', 'failed', finalRead.reason, finalRead.reason);
+        }
+        const finalObserved = finalRead.observation;
         pose = finalObserved.pose;
         const finalIssue = this.observationIssue(finalObserved);
         if (finalIssue) { this.abort(finalIssue); return await finish('failed', 'failed', finalIssue, finalIssue); }
-        if (this.reached(finalObserved.pose, target, tolerance, finalObserved.supported)) return await finish('confirmed', 'confirmed');
-        this.progress.noteFailure('route-end', 'target-not-reached');
-        if (replans >= this.budget.maxReplans) return await finish('failed', 'failed', 'target-not-reached', 'target-not-reached');
-        replans += 1;
+        if (observationSupport(finalObserved) === 'unknown') return await finish('partial', 'partial', 'support-unknown', 'needs-observation');
+        const settledResult = await this.settleAtTarget(target, tolerance, request, tick, stopReason, budgetExhausted, finalObserved);
+        pose = settledResult.pose ?? pose;
+        if (settledResult.outcome === 'confirmed') return await finish('confirmed', 'confirmed');
+        if (settledResult.outcome === 'canceled') { this.abort(settledResult.reason ?? 'canceled'); return await this.finishStop(finish, settledResult.reason ?? 'canceled'); }
+        // Local short-range control was insufficient or preconditions were not
+        // provable. Report partial honestly; the same block is not arrival proof.
+        this.progress.noteFailure('route-end', settledResult.reason ?? 'arrival-tolerance-not-met');
+        return await finish('partial', 'partial', settledResult.reason ?? 'arrival-tolerance-not-met', 'arrival-tolerance-not-met');
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -297,6 +385,11 @@ export class MotionController {
       return await finish('failed', 'failed', reason, 'control-error');
     } finally {
       this.running = false;
+      if (this.externalAbort) {
+        this.externalAbort.signal.removeEventListener('abort', this.externalAbort.listener);
+        this.externalAbort = undefined;
+      }
+      this.runController = undefined;
     }
   }
 
@@ -319,12 +412,17 @@ export class MotionController {
     tick: () => number,
     stopReason: () => string | undefined,
     budgetExhausted: () => boolean,
-  ): Promise<{ outcome: 'confirmed' | 'failed' | 'canceled' | 'replan'; pose?: Pose3D; reason?: string }> {
-    const motor = this.options.motor?.({ context: this.body.context, clock: this.clock, body: this.body, leaseId: request.leaseId, ownerToken: request.ownerToken })
-      ?? new Motor3D({ context: this.body.context, clock: this.clock, body: this.body, leaseId: request.leaseId, ownerToken: request.ownerToken });
+  ): Promise<{ outcome: 'confirmed' | 'failed' | 'canceled' | 'replan' | 'unknown'; pose?: Pose3D; reason?: string }> {
+    const motor = this.motorFor(request);
     const direction = stepDirection(step);
     const targetPose = stepTarget(step);
-    let observation = await this.body.observe();
+    const initialRead = await this.readObservation(request);
+    if (!('observation' in initialRead)) {
+      const stop = stopReason();
+      if (stop) return { outcome: 'canceled', reason: stop };
+      return { outcome: this.readFailureOutcome(initialRead), reason: initialRead.reason };
+    }
+    let observation = initialRead.observation;
     let pose = observation.pose;
 
     try {
@@ -341,7 +439,13 @@ export class MotionController {
             if (stop) return { outcome: 'canceled', pose, reason: stop };
             if (budgetExhausted()) return { outcome: 'failed', pose, reason: 'control-budget-exhausted' };
             await this.advanceBody(); tick();
-            observation = await this.body.observe(); pose = observation.pose;
+            const read = await this.readObservation(request);
+            if (!('observation' in read)) {
+              const stopped = stopReason();
+              if (stopped) return { outcome: 'canceled', pose, reason: stopped };
+              return { outcome: this.readFailureOutcome(read), pose, reason: read.reason };
+            }
+            observation = read.observation; pose = observation.pose;
             const yawIssue = this.observationIssue(observation);
             if (yawIssue) return { outcome: 'canceled', pose, reason: yawIssue };
           }
@@ -363,17 +467,32 @@ export class MotionController {
         if (stop) return { outcome: 'canceled', pose, reason: stop };
         if (budgetExhausted()) return { outcome: 'failed', pose, reason: 'control-budget-exhausted' };
         await this.advanceBody(); tick();
-        observation = await this.body.observe(); pose = observation.pose;
+        const read = await this.readObservation(request);
+        if (!('observation' in read)) {
+          const stopped = stopReason();
+          if (stopped) return { outcome: 'canceled', pose, reason: stopped };
+          return { outcome: this.readFailureOutcome(read), pose, reason: read.reason };
+        }
+        observation = read.observation; pose = observation.pose;
         const issue = this.observationIssue(observation);
         if (issue) return { outcome: 'canceled', pose, reason: issue };
 
         if (stepLanded(step, pose)) {
           // Stop input and verify a stable, supported landing before claiming the edge.
-          await motor.stop();
-          const settled = await this.body.observe(); pose = settled.pose;
+          await this.boundedStop(motor);
+          const settledRead = await this.readObservation(request);
+          if (!('observation' in settledRead)) {
+            const stopped = stopReason();
+            if (stopped) return { outcome: 'canceled', pose, reason: stopped };
+            return { outcome: this.readFailureOutcome(settledRead), pose, reason: settledRead.reason };
+          }
+          const settled = settledRead.observation; pose = settled.pose;
           const settledIssue = this.observationIssue(settled);
           if (settledIssue) return { outcome: 'canceled', pose, reason: settledIssue };
-          if (!settled.supported) return { outcome: 'replan', pose, reason: 'landing-unsupported' };
+          const settledSupport = observationSupport(settled);
+          // Unknown is not airborne, but it also cannot prove a landing.
+          if (settledSupport === 'unknown') return { outcome: 'unknown', pose, reason: 'landing-support-unknown' };
+          if (settledSupport === 'unsupported') return { outcome: 'replan', pose, reason: 'landing-unsupported' };
           if (!stepLanded(step, settled.pose)) return { outcome: 'replan', pose, reason: 'landing-deviation' };
           return { outcome: 'confirmed', pose };
         }
@@ -397,7 +516,171 @@ export class MotionController {
       return { outcome: 'replan', pose, reason: 'no-progress' };
     } finally {
       // The owner releases held input on every exit; a new owner is never touched.
-      await motor.release();
+      // Release is bounded: a hung release cannot keep the control loop alive.
+      const outcome = await this.withWallTimeout(motor.release(), this.budget.releaseTimeoutMs);
+      if (outcome.timedOut || outcome.error) this.releaseFailed = true;
+    }
+  }
+
+  private motorFor(request: RunRequest): Pick<Motor3D, 'orientTo' | 'walk' | 'jumpShort' | 'stop' | 'release'> {
+    return this.options.motor?.({ context: this.body.context, clock: this.clock, body: this.body, leaseId: request.leaseId, ownerToken: request.ownerToken })
+      ?? new Motor3D({ context: this.body.context, clock: this.clock, body: this.body, leaseId: request.leaseId, ownerToken: request.ownerToken });
+  }
+
+  /**
+   * Guarded observation (FEC-31). Every observe is bounded by the clock budget
+   * and raced against a per-run AbortController, so pause/stop/external cancel
+   * exit even when the adapter never settles. The per-call signal is also
+   * handed to the adapter so cooperative implementations can abort their work.
+   */
+  private async readObservation(request: RunRequest): Promise<
+    | { observation: WorldObservation }
+    | { kind: 'timeout' | 'aborted' | 'error'; reason: string }
+  > {
+    void request;
+    const runSignal = this.runController?.signal;
+    if (runSignal?.aborted) return { kind: 'aborted', reason: 'observation-aborted' };
+    const callController = new AbortController();
+    const onRunAbort = () => callController.abort();
+    if (runSignal) {
+      if (runSignal.aborted) callController.abort();
+      else runSignal.addEventListener('abort', onRunAbort, { once: true });
+    }
+    const startedAt = this.clock.now();
+    const deadline = startedAt + this.budget.observeTimeoutMs;
+    let timerId: string | undefined;
+    const options: ObserveOptions = { signal: callController.signal, deadline };
+    const timeout = new Promise<'timeout'>(resolve => {
+      timerId = this.clock.schedule(deadline, () => resolve('timeout'));
+    });
+    let onAbortResolve: (() => void) | undefined;
+    const aborted = new Promise<'aborted'>(resolve => {
+      onAbortResolve = () => resolve('aborted');
+      if (callController.signal.aborted) onAbortResolve();
+      else callController.signal.addEventListener('abort', onAbortResolve, { once: true });
+    });
+    const observed = Promise.resolve()
+      .then(() => this.body.observe(options))
+      .then(
+        observation => ({ kind: 'observation' as const, observation }),
+        error => ({ kind: 'error' as const, error }),
+      );
+    try {
+      const result = await Promise.race([observed, timeout, aborted]);
+      if (result === 'timeout' || result === 'aborted') {
+        // Best effort cancellation of the underlying adapter task; the caller is
+        // already free, and the next observation will not queue behind this one.
+        callController.abort();
+        return { kind: result, reason: result === 'timeout' ? 'observation-timeout' : 'observation-aborted' };
+      }
+      if (result.kind === 'error') {
+        const message = result.error instanceof Error ? result.error.message : String(result.error);
+        return { kind: 'error', reason: `observation-failed:${message}` };
+      }
+      return { observation: result.observation };
+    } finally {
+      if (timerId !== undefined) this.clock.cancel(timerId);
+      runSignal?.removeEventListener('abort', onRunAbort);
+      if (onAbortResolve) callController.signal.removeEventListener('abort', onAbortResolve);
+    }
+  }
+
+  private readFailureOutcome(read: { kind: 'timeout' | 'aborted' | 'error' }): 'unknown' | 'canceled' | 'failed' {
+    if (read.kind === 'timeout' || read.kind === 'aborted') return 'unknown';
+    return 'failed';
+  }
+
+  private async boundedStop(motor: Pick<Motor3D, 'stop'>): Promise<void> {
+    const outcome = await this.withWallTimeout(motor.stop(), this.budget.stopTimeoutMs);
+    if (outcome.timedOut || outcome.error) this.releaseFailed = true;
+  }
+
+  /** Wall-clock bound for terminal stop/release calls (no fresh observation needed). */
+  private withWallTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<{ timedOut: boolean; value?: T; error?: unknown }> {
+    return new Promise(resolve => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ timedOut: true });
+      }, Math.max(1, timeoutMs));
+      operation.then(
+        value => { if (settled) return; settled = true; clearTimeout(timer); resolve({ timedOut: false, value }); },
+        error => { if (settled) return; settled = true; clearTimeout(timer); resolve({ timedOut: false, error }); },
+      );
+    });
+  }
+
+  /**
+   * Close the remaining distance inside the target block (FEC-32). A discrete
+   * block match is only a planning anchor; final arrival requires the observed
+   * pose within `tolerance` (default 0.25) of the block centre. Cardinal walks
+   * can leave a perpendicular offset, which is corrected with bounded
+   * short-range input while staying inside the target block. If the body cannot
+   * walk, lacks support evidence, or cannot make progress, the result is
+   * partial - never confirmed.
+   */
+  private async settleAtTarget(
+    target: BlockPos,
+    tolerance: number,
+    request: RunRequest,
+    tick: () => number,
+    stopReason: () => string | undefined,
+    budgetExhausted: () => boolean,
+    initial: WorldObservation,
+  ): Promise<{ outcome: 'confirmed' | 'canceled' | 'partial'; pose?: Pose3D; reason?: string }> {
+    let observation = initial;
+    let pose = observation.pose;
+    let support = observationSupport(observation);
+    if (support === 'unknown') return { outcome: 'partial', pose, reason: 'support-unknown' };
+    if (support === 'unsupported') return { outcome: 'partial', pose, reason: 'support-unsupported' };
+    if (!this.body.capabilities.threeDimensional || !this.body.capabilities.walk) return { outcome: 'partial', pose, reason: 'arrival-tolerance-not-met' };
+    if (withinArrivalTolerance(pose, target, tolerance)) return { outcome: 'confirmed', pose };
+
+    const motor = this.motorFor(request);
+    let issued = false;
+    let lastSign: { x: number; z: number } | undefined;
+    try {
+      for (let index = 0; index < this.budget.maxTicksPerStep; index++) {
+        const stop = stopReason();
+        if (stop) return { outcome: 'canceled', pose, reason: stop };
+        if (budgetExhausted()) return { outcome: 'partial', pose, reason: 'control-budget-exhausted' };
+        const block = poseBlock(pose);
+        // Short-range correction never leaves the target block. If the pose is
+        // outside it, this is not a same-cell arrival at all.
+        if (block.x !== target.x || block.y !== target.y || block.z !== target.z) return { outcome: 'partial', pose, reason: 'arrival-tolerance-not-met' };
+        const center = targetCenter(target);
+        const direction = { x: center.x - pose.x, y: 0, z: center.z - pose.z };
+        if (withinArrivalTolerance(pose, target, tolerance)) return { outcome: 'confirmed', pose };
+        const sign = { x: Math.sign(direction.x), z: Math.sign(direction.z) };
+        // Held input keeps applying until replaced or released. Re-submitting
+        // every tick would continuously reset a latent plan and (with injected
+        // latency) never let it take effect, so only re-issue when the needed
+        // direction actually changes (for example after crossing the centre).
+        if (!issued || !lastSign || sign.x !== lastSign.x || sign.z !== lastSign.z) {
+          const submission = await motor.walk(target, direction, observation);
+          if (submission.status !== 'accepted') return { outcome: 'partial', pose, reason: submission.reason ?? 'arrival-input-rejected' };
+          this.inputIssued = true;
+          issued = true;
+          lastSign = sign;
+        }
+        await this.advanceBody(); tick();
+        const read = await this.readObservation(request);
+        if (!('observation' in read)) {
+          const stopped = stopReason();
+          if (stopped) return { outcome: 'canceled', pose, reason: stopped };
+          return { outcome: 'partial', pose, reason: read.reason };
+        }
+        observation = read.observation; pose = observation.pose;
+        const issue = this.observationIssue(observation);
+        if (issue) return { outcome: 'partial', pose, reason: issue };
+        support = observationSupport(observation);
+        if (support === 'unknown') return { outcome: 'partial', pose, reason: 'support-unknown' };
+        if (support === 'unsupported') return { outcome: 'partial', pose, reason: 'support-unsupported' };
+      }
+      return { outcome: 'partial', pose, reason: 'arrival-tolerance-not-met' };
+    } finally {
+      if (issued) await this.boundedStop(motor);
     }
   }
 
@@ -425,15 +708,17 @@ export class MotionController {
     await new Promise<void>(resolve => { this.clock.schedule(this.clock.now() + 20, resolve); });
   }
 
-  private reached(pose: Pose3D, target: BlockPos, tolerance: number, supported: boolean): boolean {
-    void tolerance;
+  /**
+   * Final arrival requires supported evidence AND the continuous pose to be
+   * within tolerance of the block centre. Being in the same discrete block is
+   * not sufficient (FEC-32); `settleAtTarget` performs the bounded local
+   * correction before this check is used to confirm.
+   */
+  private reached(pose: Pose3D, target: BlockPos, tolerance: number, support: SupportState): boolean {
+    if (support !== 'supported') return false;
     const block = poseBlock(pose);
-    // The destination is a block. Being inside it with the expected vertical
-    // level is the landing contract; a perpendicular offset inside the same
-    // block is not a failure for cardinal-only movement.
-    return supported
-      && block.x === target.x && block.y === target.y && block.z === target.z
-      && Math.abs(pose.y - target.y) <= 0.2;
+    if (block.x !== target.x || block.y !== target.y || block.z !== target.z) return false;
+    return withinArrivalTolerance(pose, target, tolerance);
   }
 
   private annotate(route: NavRoute, observationRevision: string): NavRoute {
@@ -456,24 +741,28 @@ export class MotionController {
 
   private async releaseInput(): Promise<void> {
     if (!this.currentOwnerToken) return;
+    let outcome: { timedOut: boolean; error?: unknown };
     try {
-      await this.body.release(this.currentOwnerToken);
-    } catch {
-      // A rejecting sink may still hold input. Report that honestly instead of
-      // claiming release succeeded. Never touches a different owner.
-      this.releaseFailed = true;
+      outcome = await this.withWallTimeout(this.body.release(this.currentOwnerToken), this.budget.releaseTimeoutMs);
+    } catch (error) {
+      outcome = { timedOut: false, error };
     }
+    // A rejecting or unsettled sink may still hold input. Report that honestly
+    // instead of claiming release succeeded. Never touches a different owner.
+    if (outcome.timedOut || outcome.error) this.releaseFailed = true;
   }
 
   private async stopAndRelease(): Promise<void> {
     // `run` owns the token for this invocation; stop() zeroes held motion, then release is authoritative.
     if (this.inputIssued && this.currentOwnerToken) {
       try {
-        await this.body.submit({
+        await this.withWallTimeout(this.body.submit({
           commandId: `stop-${this.currentOwnerToken}`, ownerToken: this.currentOwnerToken, leaseId: this.currentLeaseId ?? 'lease',
           issuedAt: this.clock.now(), deadline: this.clock.now() + 250, maxAge: 250, context: this.body.context,
           observationRef: 'stop', intent: { kind: 'stop' },
-        });
+        }), this.budget.stopTimeoutMs);
+        // A timed-out stop still falls through to release: the owner token is
+        // the authoritative held-input boundary and release must be attempted.
       } catch { /* fall through to release */ }
     }
     await this.releaseInput();

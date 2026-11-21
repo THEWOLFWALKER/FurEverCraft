@@ -54,9 +54,15 @@
   "artifacts": [
     {
       "role": "native",
+      "path": "native/windows/FurEverCraft.Helper.Core.cs",
+      "sha256": "e6a1de11caaa191722981f0772d6eede8412a70f4a782f590c89db3432eb8c5d",
+      "bytes": 63124
+    },
+    {
+      "role": "native",
       "path": "native/windows/FurEverCraft.Helper.ps1",
-      "sha256": "a54fbaacab60f7b24da2975977357cb6bff6604d1776d4e327c9ccf6806cc458",
-      "bytes": 10765
+      "sha256": "b876e42f094c5b6ae7020b1c4d395c58ef9d882b88e5f3efa96e1c1e9a321f03",
+      "bytes": 1038
     },
     {
       "role": "fixture",

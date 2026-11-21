@@ -89,7 +89,7 @@ describe('P17 shared bounded request runtime', () => {
     expect(JSON.stringify(sent)).not.toContain('providerSource');
   });
 
-  it('never executes a write tool twice when the model retries it with a different id', async () => {
+  it('executes identical text/arguments again in a new decision instead of fingerprint suppression', async () => {
     const transport = new RecordingTransport((_body, index) => index === 0
       ? completion(null as unknown as string, [{ id: 'write-a', name: 'place_one', arguments: '{"x":1,"y":2}' }])
       : index === 1
@@ -103,10 +103,12 @@ describe('P17 shared bounded request runtime', () => {
       execute: async () => { executions++; return { accepted: true }; },
     });
     const result = await session.run('place it');
-    expect(executions).toBe(1);
+    // A different tool_call id in a NEW response is a new logical action; it must not be
+    // suppressed just because the arguments look the same (FEC-39).
+    expect(executions).toBe(2);
     expect(result.turns[0]!.executed).toEqual(['write-a']);
-    expect(result.turns[1]!.replayed).toEqual(['write-b']);
-    expect(result.turns[1]!.executed).toEqual([]);
+    expect(result.turns[1]!.executed).toEqual(['write-b']);
+    expect(result.turns[1]!.replayed).toEqual([]);
   });
 
   it('shares the retry budget between OpenAI and Anthropic and honors Retry-After', async () => {
@@ -183,17 +185,17 @@ describe('P17 shared bounded request runtime', () => {
     expect(injected.requests).toHaveLength(0);
   });
 
-  it('deduplicates write fingerprints only for writes, and reset clears one run', () => {
-    const ledger = new ToolExecutionLedger(new Set(['place_one']));
-    ledger.record({ id: 'a', name: 'place_one', arguments: '{"x":1}' }, { ok: true });
-    expect(ledger.reuse({ id: 'b', name: 'place_one', arguments: '{ "x" : 1 }' })).toEqual({ replayed: true, result: { ok: true } });
-    const readLedger = new ToolExecutionLedger();
-    readLedger.record({ id: 'r', name: 'get_state', arguments: '{}' }, { ok: true });
-    expect(readLedger.reuse({ id: 'other', name: 'get_state', arguments: '{}' }).replayed).toBe(false);
-    // ProviderSession resets this at the start of each top-level run: the next user turn can
-    // legitimately repeat the write; durable execution records cover restarts, not this ledger.
-    ledger.reset();
-    expect(ledger.size).toBe(0);
-    expect(ledger.reuse({ id: 'c', name: 'place_one', arguments: '{"x":1}' }).replayed).toBe(false);
+  it('replays only the same logical call identity, and reports changed name/arguments as conflict', () => {
+    const ledger = new ToolExecutionLedger();
+    const parts = { sessionId: 's', decisionId: 'd1', responseAttemptId: 'a1', toolCallId: 'call-a' };
+    const id = ToolExecutionLedger.logicalId(parts);
+    ledger.record(id, { id: 'call-a', name: 'place_one', arguments: '{"x":1}' }, { ok: true });
+    // Same logical id + canonically equal arguments replays the recorded result.
+    expect(ledger.check(id, { id: 'call-a', name: 'place_one', arguments: '{ "x" : 1 }' })).toEqual({ status: 'replay', result: { ok: true } });
+    // Same logical id with changed name or arguments is a conflict, never a silent replay.
+    expect(ledger.check(id, { id: 'call-a', name: 'place_one', arguments: '{"x":2}' }).status).toBe('conflict');
+    expect(ledger.check(id, { id: 'call-a', name: 'send_chat', arguments: '{"x":1}' }).status).toBe('conflict');
+    // A new decision with the same raw id/arguments is a new logical action.
+    expect(ledger.check(ToolExecutionLedger.logicalId({ ...parts, decisionId: 'd2' }), { id: 'call-a', name: 'place_one', arguments: '{"x":1}' })).toEqual({ status: 'new' });
   });
 });

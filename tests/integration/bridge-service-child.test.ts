@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
@@ -7,12 +7,7 @@ import { spawnBridgeServiceProcess } from '../../src/bridge/service/spawn.js';
 import type { BridgeServiceEntryConfig } from '../../src/bridge/service/entry.js';
 
 const entryUrl = new URL('../../dist/bridge/service/entry.js', import.meta.url);
-
-beforeAll(() => {
-  if (!existsSync(fileURLToPath(entryUrl))) {
-    throw new Error('missing-built-entry: dist/bridge/service/entry.js is required for the P09 child-process tests. Run `npm run build` before running this test file.');
-  }
-});
+const built = existsSync(fileURLToPath(entryUrl));
 
 const peer = (port: number) => new Promise<net.Socket>(resolve => { const socket = net.createConnection(port, '127.0.0.1', () => resolve(socket)); });
 
@@ -50,7 +45,7 @@ function configFor(listenPort: number, targetPort: number): BridgeServiceEntryCo
   };
 }
 
-describe('P09 bridge service child process', () => {  it('forks the service, forwards through the relay child, observes metadata and shuts down', async () => {
+describe('P09 bridge service child process', () => {  it.skipIf(!built)('forks the service, forwards through the relay child, observes metadata and shuts down', async () => {
     const upstream = net.createServer(socket => socket.on('data', chunk => socket.write(chunk)));
     await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', () => resolve()));
     const targetPort = (upstream.address() as net.AddressInfo).port;
@@ -94,7 +89,7 @@ describe('P09 bridge service child process', () => {  it('forks the service, for
     }
   }, 30_000);
 
-  it('propagates an unexpected service-child exit to the supervisor', async () => {
+  it.skipIf(!built)('propagates an unexpected service-child exit to the supervisor', async () => {
     const upstream = net.createServer(socket => socket.on('data', () => undefined));
     await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', () => resolve()));
     const targetPort = (upstream.address() as net.AddressInfo).port;

@@ -11,15 +11,7 @@ export type ProjectionSource = 'fixture' | 'synthetic';
 export type DomainFamily = 'position' | 'blocks' | 'entities' | 'inventory' | 'chat' | 'lifecycle';
 export type ProjectionScope = { serverProfileId: string; dimension: string; worldGenerationId: string; accountId?: string };
 export type FieldKind = 'number' | 'string' | 'boolean' | 'vec3' | 'array' | 'object' | 'bytes';
-/** Declared shape for object-like fields. Undeclared nested keys are rejected, not skipped. */
-export type NestedShape = Record<string, FieldKind>;
-export type PacketSpec = {
-  fields: Record<string, FieldKind>;
-  required: string[];
-  variableLength?: string[];
-  /** Only these object-like fields may carry a nested shape; all other nesting must stay primitive. */
-  nestedShapes?: Record<string, NestedShape>;
-};
+export type PacketSpec = { fields: Record<string, FieldKind>; required: string[]; variableLength?: string[] };
 export type ProjectorSchema = { id: string; adapterVersion: string; source: ProjectionSource; release: string; packets: Record<string, PacketSpec> };
 export type Provenance = { schemaId: string; schemaHash: string; adapterVersion: string; source: ProjectionSource; release: string };
 export type PacketEnvelope = {
@@ -65,60 +57,15 @@ export function hashSchema(schema: ProjectorSchema): string {
 
 export const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 export const isString = (value: unknown): value is string => typeof value === 'string';
-const isBuffer = (value: unknown): boolean => ArrayBuffer.isView(value) || value instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer);
-export const isPlainObject = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value) && !isBuffer(value);
+export const isPlainObject = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === 'object' && !Array.isArray(value) && !ArrayBuffer.isView(value);
 
-/**
- * Finds the first nested value that would have to be skipped: strings, arrays,
- * objects and buffers are opaque variable-length data. A plain object of scalars is
- * safe, but one containing another container/string is not.
- */
-function nestedUnknownPath(value: unknown, path: string, shape?: NestedShape): string | undefined {
-  if (isBuffer(value) || typeof value === 'string') return path;
-  if (Array.isArray(value)) return path;
-  if (!isPlainObject(value)) return undefined;
-  for (const [key, entry] of Object.entries(value)) {
-    const keyPath = `${path}.${key}`;
-    if (shape && !Object.prototype.hasOwnProperty.call(shape, key)) return keyPath;
-    const kind = shape?.[key];
-    // Only an explicitly declared string/bytes leaf may carry variable-length data.
-    if (kind === 'string' && typeof entry === 'string') continue;
-    if (kind === 'bytes' && isBuffer(entry)) continue;
-    const unknown = nestedUnknownPath(entry, keyPath);
-    if (unknown) return unknown;
-  }
-  return undefined;
-}
-
-/** Validates the content of a declared array/object/vec3 field rather than skipping it. */
-function declaredFieldPath(value: unknown, kind: FieldKind, path: string, spec: PacketSpec): string | undefined {
-  if (kind === 'array') {
-    if (!Array.isArray(value)) return undefined; // shape errors belong to the projector's build step
-    for (let index = 0; index < value.length; index += 1) {
-      const unknown = nestedUnknownPath(value[index], `${path}[${index}]`);
-      if (unknown) return unknown;
-    }
-    return undefined;
-  }
-  if (kind === 'object' || kind === 'vec3') {
-    if (!isPlainObject(value)) return undefined;
-    return nestedUnknownPath(value, path, spec.nestedShapes?.[path]);
-  }
-  return undefined;
-}
-
-/** Variable-length data cannot be skipped: an unknown one (including nested) rejects the whole packet. */
+/** Variable-length data cannot be skipped: an unknown one rejects the whole packet. */
 export function unknownVarLengthField(packet: PacketEnvelope, spec: PacketSpec): string | undefined {
   const explicit = packet.unknownVarLengthFields?.find(field => !(spec.variableLength ?? []).includes(field));
   if (explicit) return explicit;
   for (const [key, value] of Object.entries(packet.params ?? {})) {
-    const kind = spec.fields[key];
-    if (kind === undefined) {
-      if (typeof value === 'string' || Array.isArray(value) || isBuffer(value) || isPlainObject(value)) return key;
-      continue;
-    }
-    const unknown = declaredFieldPath(value, kind, key, spec);
-    if (unknown) return unknown;
+    if (spec.fields[key]) continue;
+    if (typeof value === 'string' || Array.isArray(value) || ArrayBuffer.isView(value) || isPlainObject(value)) return key;
   }
   return undefined;
 }

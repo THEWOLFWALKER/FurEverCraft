@@ -3,20 +3,18 @@ import { nextId, type BodyContext } from '../contracts/index.js';
 import type { ModelMessage, ModelProvider, ToolCall } from '../providers/scripted/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
-import { sameStableScope } from '../persistence/store.js';
 import { Executor, type InputArbiter, type Progress } from '../execution/runtime.js';
 import { skillRequiresInput, type AdmissionDecision, type ExecutionAdmission } from '../execution/admission.js';
+import { ActionGateway, type ManagedEffect } from '../execution/action-gateway.js';
+import type { EffectOutcome } from '../execution/effect-coordinator.js';
+import { evaluatePreconditions } from '../skills/preconditions.js';
 import { skillImplementations } from '../skills/skills.js';
-import { findSkills, skillManifests } from '../skills/registry.js';
+import { findSkill, findSkills, skillManifests } from '../skills/registry.js';
 import type { EventHub } from '../diagnostics/events.js';
 import { redactError } from '../diagnostics/redaction.js';
-import { MemoryService, createPlaceResolver, type MemoryScope } from '../autonomous/memory.js';
+import { MemoryService, createPlaceResolver, type MemoryScope, type PlaceObservation } from '../autonomous/memory.js';
 import { KnowledgeService, knowledgeToolDefinitions } from '../autonomous/knowledge.js';
-import { ProviderSession } from '../providers/session.js';
-import { assertModelResponse } from '../providers/canonical.js';
-import { ProviderError } from '../providers/shared.js';
-import type { ProviderMetadata } from '../control/dto.js';
-import { getAttachedBodyAdapter, bodyStateFromObservation, isReal3DObservation } from '../motor/contracts.js';
+import { getAttachedBodyAdapter, bodyStateFromObservation, type BodySource } from '../motor/contracts.js';
 import type { MotorFactory } from '../motor/controller.js';
 import type { SkillLifecycle } from '../skills/lifecycle.js';
 import { syntheticCapture } from '../autonomous/bounds.js';
@@ -32,6 +30,19 @@ export function memoryScopeOf(context: BodyContext): MemoryScope {
     ...(context.worldGenerationId ? { worldGenerationId: context.worldGenerationId } : {}),
     dimensionId: context.dimension,
   };
+}
+
+/**
+ * Body adapters label their observation source with `BodySource`
+ * (`simulated` | `observed-server` | `legacy-simulated`), while memory records a
+ * `PlaceObservation` source (`server-observed` | `simulated` | ...). Map the body value onto the
+ * memory vocabulary instead of widening the memory type: a server-witnessed body observation is
+ * `server-observed` (a trusted source), and both simulated variants are `simulated`. The original
+ * body source is preserved in the evidence reference, so the truthful distinction is not lost.
+ */
+function placeObservationSource(source: BodySource): PlaceObservation['source'] {
+  if (source === 'observed-server') return 'server-observed';
+  return 'simulated';
 }
 
 export const ToolCallResultSchema = z.object({ callId: z.string(), name: z.string(), ok: z.boolean(), result: z.unknown().optional(), error: z.string().optional() });
@@ -98,134 +109,47 @@ export class ToolRouter {
   private readonly memoryScope: MemoryScope;
   private readonly nav?: ToolRouterExtras['nav'];
   private readonly motor?: MotorFactory;
+  /** The single write entry point every skill registers effects through (S04). */
+  private readonly gateway?: ActionGateway;
   constructor(private readonly bridge: ClientBridgeCapabilities, private readonly store?: SQLiteStore, private readonly events?: EventHub, executor?: Executor, memory?: MemoryService, private readonly clockNow: () => number = () => Date.now(), private readonly admission?: ExecutionAdmission, extras: ToolRouterExtras = {}) {
-    if (store) { this.executor = executor ?? new Executor(bridge, store); this.memory = memory ?? new MemoryService(store); }
+    if (store) {
+      this.executor = executor ?? new Executor(bridge, store);
+      this.memory = memory ?? new MemoryService(store);
+      // One gateway per router: no skill (including chat/UI control) writes effects any other way.
+      this.gateway = new ActionGateway(store, () => this.bridge.context, { ...(events ? { events } : {}) });
+    }
     this.knowledge = extras.knowledge;
     this.lifecycle = extras.lifecycle;
     this.nav = extras.nav;
     this.motor = extras.motor;
     this.memoryScope = extras.memoryScope ?? memoryScopeOf(bridge.context);
   }
-  /** True when a stored goal belongs to the currently attached stable body scope. */
-  goalScopeMatches(goalContext: unknown): boolean { return sameStableScope(goalContext, this.currentContext()); }
-  /** Skills the current body can actually run, derived from manifest metadata and body capability rather than a hard-coded list. */
-  availableSkills(): string[] {
-    const body = getAttachedBodyAdapter(this.bridge);
-    const movement3d = Boolean(body && body.capabilities.threeDimensional && body.capabilities.walk);
-    // Advertising a skill the input gate would immediately reject is misleading. A router
-    // embedded without an executor has no gate to consult; runtime routers always do.
-    const inputOpen = !this.executor || this.executor.inputGateOpen();
-    return skillManifests.filter(manifest => {
-      const id = manifest.id;
-      if (skillRequiresInput(id) && !inputOpen) return false;
-      // Honor the coordinate contract: a world-3d movement skill is not executable by the
-      // planar bridge. gather_blocks/return_to_place retain explicit legacy implementations,
-      // so they are checked against their legacy capabilities below instead.
-      if (manifest.coordinateSpace === 'world-3d' && !movement3d && id !== 'gather_blocks' && id !== 'return_to_place') return false;
-      switch (id) {
-        // A 3D adapter is the body for movement/exploration/gather skills. Only the
-        // methods and capabilities it actually declares make a skill available.
-        case 'navigate_to':
-        case 'explore_area':
-          return movement3d;
-        case 'gather_blocks':
-          if (body) return movement3d && Boolean(body.findBlock && body.digBlock);
-          return Boolean(this.bridge.digBlock && this.bridge.adjacentBlock);
-        case 'return_to_place':
-          if (body) return movement3d;
-          return Boolean(this.memory || this.bridge.findPlace);
-        case 'look_at': return Boolean(this.bridge.lookAt);
-        case 'dig_one': return Boolean(this.bridge.dig);
-        case 'collect_nearby': return Boolean(this.bridge.collectNearby);
-        case 'send_chat': return Boolean(this.bridge.dispatchChat);
-        case 'place_one': return typeof this.bridge.place === 'function';
-        case 'observe_ui': return typeof this.bridge.snapshot === 'function';
-        case 'wait_for_condition': return true;
-        // An unmapped manifest cannot be proven executable; never advertise it.
-        default: return false;
-      }
-    }).map(manifest => manifest.id as string);
+  /** One shared classifier: read | write | control-write, including dynamic start_skill. */
+  classifyTool(call: ToolCall): ToolClass {
+    return classifyToolCall(call);
   }
-  /**
-   * Observe truthful evidence for the manifest prerequisites of one skill. Only positively
-   * observed entries are returned; an absent entry stays unmet and fails the lifecycle gate
-   * closed. This replaces the former fabricated `{ name: true }` map for every declaration.
-   */
-  private async observedPreconditions(skill: string, args: Record<string, unknown>): Promise<Record<string, boolean>> {
-    const evidence: Record<string, boolean> = {};
+  /** Skills the current body can actually run, derived from capability presence rather than a hard-coded list. */
+  availableSkills(): string[] {
+    const all = skillManifests.map(manifest => manifest.id as string);
     const body = getAttachedBodyAdapter(this.bridge);
-    const readSnapshot = () => { try { return this.bridge.snapshot(); } catch { return undefined; } };
-    const set = (name: string, value: boolean) => { if (value) evidence[name] = true; };
-    const coordinate = (name: string): number | undefined => {
-      const value = Number(args[name]);
-      return Number.isInteger(value) ? value : undefined;
-    };
-    switch (skill) {
-      case 'navigate_to': {
-        if (body) {
-          try {
-            const observation = await body.observe();
-            set('current-position', isReal3DObservation(observation)
-              && [observation.pose.x, observation.pose.y, observation.pose.z].every(Number.isFinite));
-          } catch { /* unknown position */ }
-        } else {
-          const observed = readSnapshot();
-          set('current-position', Boolean(observed && observed.freshness === 'current' && observed.gap !== true
-            && Number.isFinite(observed.position.x) && Number.isFinite(observed.position.y)));
-        }
-        break;
+    return all.filter(id => {
+      // A 3D adapter is the body for movement/exploration/gather skills. Only the
+      // methods and capabilities it actually declares make a skill available.
+      if (body) {
+        const movement = body.capabilities.threeDimensional && body.capabilities.walk;
+        if (id === 'navigate_to' || id === 'explore_area' || id === 'return_to_place') return movement;
+        if (id === 'gather_blocks') return movement && Boolean(body.findBlock && body.digBlock);
       }
-      case 'observe_ui': {
-        const observed = readSnapshot();
-        const ui = observed?.fields?.ui;
-        set('ui-observation', Boolean(observed && (!ui || (ui.available !== false && ui.freshness !== 'unknown'))));
-        break;
-      }
-      case 'send_chat':
-        set('chat-ui', typeof this.bridge.dispatchChat === 'function');
-        break;
-      case 'place_one': {
-        const x = coordinate('x'), y = coordinate('y');
-        if (x !== undefined && y !== undefined) {
-          try { set('free-target', this.bridge.cell(x, y) === 'free'); } catch { /* unknown target */ }
-        }
-        set('inventory', Number.isInteger(this.bridge.inventory) && this.bridge.inventory > 0);
-        break;
-      }
-      case 'wait_for_condition':
-        // The router supplies a real clock to every skill program it starts.
-        set('clock', true);
-        break;
-      case 'look_at':
-        set('orientation', typeof this.bridge.lookAt === 'function');
-        break;
-      case 'explore_area': {
-        if (body) {
-          try { set('local-observation', isReal3DObservation(await body.observe())); } catch { /* unknown observation */ }
-        }
-        break;
-      }
-      case 'dig_one': {
-        const x = coordinate('x'), y = coordinate('y');
-        if (x !== undefined && y !== undefined) {
-          try { set('reachable-target', this.bridge.cell(x, y) === 'blocked'); } catch { /* unknown target */ }
-        }
-        set('tool', typeof this.bridge.dig === 'function');
-        break;
-      }
-      case 'collect_nearby':
-        set('entity-observation', Boolean(body?.collectNearby ?? this.bridge.collectNearby));
-        break;
-      case 'gather_blocks':
-        // A 3D body's own find/dig contract is the evidence; the legacy pair is used only
-        // when no adapter is attached.
-        set('known-target', body ? Boolean(body.findBlock && body.digBlock) : Boolean(this.bridge.digBlock && this.bridge.adjacentBlock));
-        break;
-      case 'return_to_place':
-        set('remembered-place', Boolean(this.memory || body?.findPlace || typeof this.bridge.findPlace === 'function'));
-        break;
-    }
-    return evidence;
+      if (id === 'look_at') return Boolean(this.bridge.lookAt);
+      if (id === 'dig_one') return Boolean(this.bridge.dig);
+      if (id === 'gather_blocks') return Boolean(this.bridge.digBlock && this.bridge.adjacentBlock);
+      if (id === 'collect_nearby') return Boolean(this.bridge.collectNearby);
+      if (id === 'return_to_place') return Boolean(this.memory || this.bridge.findPlace);
+      // navigate_to requires x/y/z and is served only by the 3D adapter path.
+      if (id === 'navigate_to') return false;
+      if (id === 'send_chat') return Boolean(this.bridge.dispatchChat);
+      return true;
+    });
   }
   async invoke(call: ToolCall, admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal } = {}): Promise<z.infer<typeof ToolCallResultSchema>> {
     let raw: unknown;
@@ -305,37 +229,47 @@ export class ToolRouter {
           break;
         }
         // A missing backing service must report failure, not a successful undefined.
-        // Execution ids are only addressable inside the attached stable body scope. A row from
-        // another world/account is reported as not found rather than exposed or mutated.
-        case 'get_execution': {
-          if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' };
-          const found = this.store.getExecution(String(args.executionId));
-          if (!found || !sameStableScope(found.context, this.currentContext())) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' };
-          result = found; break;
-        }
+        case 'get_execution': if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' }; result = this.store.getExecution(String(args.executionId)); if (!result) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' }; break;
         case 'read_events': if (!this.events) return { callId: call.id, name: call.name, ok: false, error: 'events-unavailable' }; result = this.events.read(String(args.cursor ?? '0'), Number(args.limit ?? 100), args.filter as string | undefined); break;
-        case 'revise_goal': {
-          if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' };
-          const goal = this.store.getGoal(String(args.goalId));
-          if (!goal) return { callId: call.id, name: call.name, ok: false, error: 'goal-not-found' };
-          // Reject a foreign-scope goal instead of revising another body's goal row.
-          if (!sameStableScope(goal.context, this.currentContext())) return { callId: call.id, name: call.name, ok: false, error: `goal-scope-mismatch:${String(args.goalId)}` };
-          result = this.store.reviseGoal(String(args.goalId), Number(args.expectedRevision), String(args.change)); break;
-        }
+        case 'revise_goal': if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' }; result = this.store.reviseGoal(String(args.goalId), Number(args.expectedRevision), String(args.change)); break;
         case 'query_memory': if (!this.memory) return { callId: call.id, name: call.name, ok: false, error: 'memory-unavailable' }; result = { scope: { ...this.memoryScope }, spatial: this.memory.querySpatial({ ...(args as { limit?: number; cursor?: string }), scope: this.memoryScope }), episodic: this.memory.queryEpisodic({ ...(args as { limit?: number; cursor?: string }), scope: this.memoryScope }) }; break;
         case 'query_knowledge_facts':
         case 'query_knowledge_sources':
         case 'query_knowledge_coverage': {
           if (!this.knowledge) return { callId: call.id, name: call.name, ok: false, error: 'knowledge-unavailable' };
           // The legacy query_knowledge path is retired: all knowledge reads use one release-backed service.
-          // Facts are always scoped to the attached body's runtime scope here; the model cannot
-          // request another world/account by supplying its own `scope` (the tool schema rejects it).
-          const knowledge = this.knowledge.invoke(call.name, args, { scope: this.memoryScope });
+          const knowledge = this.knowledge.invoke(call.name, args);
           if (!knowledge.ok) return { callId: call.id, name: call.name, ok: false, error: knowledge.error };
           result = knowledge.result;
           break;
         }
-        case 'remember_place': if (!this.memory) return { callId: call.id, name: call.name, ok: false, error: 'memory-unavailable' }; result = this.memory.rememberPlace({ placeId: String(args.placeId), context: this.memoryScope, payload: args.payload }); break;
+        case 'remember_place': {
+          if (!this.memory) return { callId: call.id, name: call.name, ok: false, error: 'memory-unavailable' };
+          const placeId = String(args.placeId);
+          const body = getAttachedBodyAdapter(this.bridge);
+          if (body) {
+            // An attached 3D body is a trusted observation source: the remembered place is bound
+            // to a witnessed pose (including z), not to model-supplied coordinates. The witness is
+            // the observation's own revision/pose (a real identifier), never the model's claim.
+            // A body that cannot observe fails closed instead of downgrading the place to unverified.
+            let observation;
+            try { observation = await body.observe(); }
+            catch (error) { return { callId: call.id, name: call.name, ok: false, error: redactError(error) }; }
+            result = this.memory.rememberPlaceFromObservation({
+              placeId, context: this.memoryScope,
+              observation: {
+                source: placeObservationSource(observation.source), pose: { ...observation.pose },
+                evidenceRef: `${observation.source}:${observation.revision}`, fieldRevision: observation.revision, scope: this.memoryScope,
+              },
+              payload: args.payload, provenance: { source: 'body-observation' },
+            });
+            break;
+          }
+          // Without a body the place is model-authored and stays explicitly unverified (FEC-51);
+          // it is recorded but never becomes a return target until observation binds it.
+          result = this.memory.rememberPlace({ placeId, context: this.memoryScope, payload: args.payload });
+          break;
+        }
         case 'start_skill': {
           const skill = String(args.skill);
           const implementation = skillImplementations[skill as keyof typeof skillImplementations];
@@ -351,7 +285,7 @@ export class ToolRouter {
           // execution exists. Prepared intent is persisted before dispatch; only a confirmed outcome settles it.
           // collect_nearby mutates inventory and therefore needs the same durable barrier as dig/chat/place.
           const sideEffect = skill === 'place_one' || skill === 'send_chat' || skill === 'dig_one' || skill === 'gather_blocks' || skill === 'collect_nearby';
-          const run = await this.runWriteSkill(call, skill, args, executeArgs, sideEffect, admissionContext, true);
+          const run = await this.runWriteSkill(call, skill, args, executeArgs, sideEffect, admissionContext);
           if (!run.ok) {
             this.events?.publish(`tool.${call.name}`, { callId: call.id, result: run.result }, false);
             return { callId: call.id, name: call.name, ok: false, result: run.result, error: run.error };
@@ -372,7 +306,7 @@ export class ToolRouter {
         case 'cancel_execution': {
           if (!this.store) return { callId: call.id, name: call.name, ok: false, error: 'store-unavailable' };
           const target = this.store.getExecution(String(args.executionId));
-          if (!target || !sameStableScope(target.context, this.currentContext())) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' };
+          if (!target) return { callId: call.id, name: call.name, ok: false, error: 'execution-not-found' };
           this.executor?.cancel(String(args.executionId));
           result = { canceled: args.executionId, status: this.store.getExecution(String(args.executionId))?.status };
           break;
@@ -400,10 +334,78 @@ export class ToolRouter {
   private currentContext() { return this.bridge.context; }
 
   /**
+   * Build the non-blocking precondition facts for a skill from already-available state
+   * (FEC-36). Unknown prerequisites stay unknown and are never coerced to satisfied; nothing
+   * here observes the world synchronously beyond a body `peek()` (which never blocks or
+   * guesses). A 3D body is preferred over the legacy bridge so a 3D attach drives the 3D rules.
+   */
+  private preconditionFacts(args: Record<string, unknown>) {
+    const body = getAttachedBodyAdapter(this.bridge) as unknown as import('../motor/contracts.js').BodyPort | undefined;
+    const bridge = this.bridge as unknown as Partial<ClientBridgeCapabilities>;
+    // Explicit, non-blocking observations the router can establish synchronously. These take
+    // precedence over the module's capability-only defaults and are the *only* way a
+    // prerequisite becomes positively satisfied without a fresh observation.
+    const observations: Record<string, boolean | undefined> = {};
+    if (body) {
+      const peeked = body.peek?.();
+      if (peeked && !peeked.gap && peeked.freshness === 'current') {
+        // known-target: a current local observation that actually contains the requested block
+        // is positive evidence the target exists. Its absence is NOT proof of absence (the
+        // block may be outside the observed radius), so absence stays unknown, never false.
+        const block = typeof args.block === 'string' ? args.block : undefined;
+        if (block) {
+          const present = [...peeked.cells.values()].some(cell => cell.block === block);
+          if (present) observations['known-target'] = true;
+        }
+      }
+    }
+    return {
+      ...(body ? { body } : {}),
+      bridge,
+      args,
+      clockAvailable: true,
+      ...(Object.keys(observations).length ? { observations } : {}),
+      // The scoped resolver is authoritative for `remembered-place`: a positively resolved,
+      // fresh in-scope place is satisfied; anything it cannot confirm stays `unknown` (never a
+      // hard `false`) so the skill's own resolver reports the precise reason (place-stale /
+      // place-unresolved / foreign) and still fails closed.
+      ...(this.memory ? { hasPlace: (placeId: string) => { const target = createPlaceResolver(this.memory!, this.memoryScope, { now: this.clockNow() })(placeId); return target ? true : undefined; } } : {}),
+    };
+  }
+
+  /**
+   * Evaluate a skill's manifest prerequisites for real. A prerequisite that is demonstrably
+   * unmet (`unsatisfied`) fails closed with an explicit code instead of being blanket-marked
+   * true. A prerequisite that cannot be decided without a fresh observation stays `unknown`
+   * (it is never coerced to satisfied); the skill itself re-verifies it through its own
+   * evidence checks, so an unknown fact is not treated as a satisfied one. The returned
+   * `observed` map is lifecycle-compatible: satisfied=true, unsatisfied=false, unknown omitted
+   * (so the lifecycle also refuses to treat it as satisfied).
+   */
+  private evaluateSkillPreconditions(skill: string, args: Record<string, unknown>):
+    { observed: Record<string, boolean | undefined>; unmet: string[]; unknown: string[] } {
+    const manifest = findSkill(skill);
+    if (!manifest) return { observed: {}, unmet: [], unknown: [] };
+    const result = evaluatePreconditions(manifest, this.preconditionFacts(args));
+    // Only a positively unsatisfied prerequisite is a hard, fail-closed rejection at the router.
+    // `unknown` is preserved (and reported) but does not masquerade as satisfied. A genuinely
+    // unknown fact is passed through to the lifecycle as "not blocked here" because the skill
+    // itself re-verifies it with real evidence (e.g. `remembered-place` is re-resolved with
+    // scope + freshness, `known-target` with a fresh block search) and fails closed on its own.
+    const observed: Record<string, boolean | undefined> = { ...result.observed };
+    for (const name of result.unknown) observed[name] = true;
+    return { observed, unmet: result.unsatisfied, unknown: result.unknown };
+  }
+
+  /**
    * Run a body-input skill through the executor with per-write admission and a durable
-   * prepared -> may-have-dispatched barrier. The skill function is not invoked until the
-   * prepared effect is persisted; the barrier is persisted before any dispatch report is
-   * forwarded to the body. A failed barrier write aborts before the skill can act.
+   * prepared -> may-have-dispatched barrier, registering every effect through the
+   * ActionGateway (S04). The skill function is not invoked until the prepared effect is
+   * persisted; the barrier is persisted before any dispatch report is forwarded to the body.
+   * A failed barrier write aborts before the skill can act.
+   *
+   * `gather_blocks(count>1)` registers one effect per dig (FEC-35) keyed on the logical action
+   * id and ordinal, instead of a single aggregated effect that loses per-dig attribution.
    */
   private async runWriteSkill(
     call: ToolCall,
@@ -412,61 +414,66 @@ export class ToolRouter {
     executeArgs: unknown,
     sideEffect: boolean,
     admissionContext: { goalId?: string; goalRevision?: number; owner?: string; signal?: AbortSignal },
-    requireAdvertised = false,
   ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
     const implementation = skillImplementations[skill as keyof typeof skillImplementations];
-    if (!implementation || !this.executor || !this.store) return { ok: false, error: 'unsupported-skill' };
+    if (!implementation || !this.executor || !this.store || !this.gateway) return { ok: false, error: 'unsupported-skill' };
     // Capture the context once and re-check it at each dispatch boundary: a connection/body
     // epoch change between admission and the write must reject the stale plan. Copy the object
     // because a bridge may mutate its context in place instead of replacing it.
     const admittedContext = { ...this.currentContext() };
-    // A goal id from another stable scope is not a valid admission target even if its revision
-    // matches; this closes the store-global goal read before any effect or lease exists.
-    if (admissionContext.goalId !== undefined) {
-      const goal = this.store.getGoal(admissionContext.goalId);
-      if (!goal || !sameStableScope(goal.context, this.currentContext())) {
-        return { ok: false, error: 'goal-revision-conflict', result: { code: 'goal-revision-conflict', message: goal ? `goal-scope-mismatch:${admissionContext.goalId}` : `goal-not-found:${admissionContext.goalId}` } };
-      }
-    }
     const rejected = this.checkAdmission(skill, admissionContext, admittedContext);
     if (rejected && !rejected.ok) return { ok: false, error: rejected.code, result: { code: rejected.code, message: rejected.message } };
-    // Registration is not availability: once precise admission gates (owner, control, input,
-    // capability) have had their say, refuse a skill the current body does not advertise. A
-    // world-3d skill must never be dispatched into the legacy planar path just because an
-    // implementation exists in the registry.
-    if (requireAdvertised && !this.availableSkills().includes(skill)) {
-      return { ok: false, error: 'skill-unavailable', result: { code: 'skill-unavailable', skill } };
-    }
-    const effectId = sideEffect ? nextId('effect') : undefined;
-    let effectPrepared = false;
+    const gateway = this.gateway;
+    // One logical action per skill call groups its per-dig effects; the ordinal distinguishes
+    // them for the unique (execution_id, logical_action_id, action_ordinal) index.
+    const logicalActionId = nextId('action');
+    const perDig = skill === 'gather_blocks';
+    const effects: ManagedEffect[] = [];
+    const intentFor = (ordinal: number) => ({
+      kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : skill === 'collect_nearby' ? 'collect' : 'dig',
+      x: typeof executeArgs === 'object' && executeArgs !== null ? (executeArgs as { x?: number }).x : undefined,
+      y: typeof executeArgs === 'object' && executeArgs !== null ? (executeArgs as { y?: number }).y : undefined,
+      text: skill === 'send_chat' ? String(executeArgs) : undefined,
+      block: skill === 'gather_blocks' ? String(args.block) : undefined,
+      ...(perDig ? { ordinal } : {}),
+    });
+    // A single bound effect id is reused for non-gather writes; gather mints one per dig.
+    let singleEffectId: string | undefined;
+    let singlePrepared = false;
+
+    const prepareEffectOnce = (executionId: string, ordinal: number): ManagedEffect | undefined => {
+      const effectId = perDig ? nextId('effect') : (singleEffectId ??= nextId('effect'));
+      const prepared = gateway.prepareEffect({ effectId, executionId, intent: intentFor(ordinal), logicalActionId, actionOrdinal: perDig ? ordinal : 0 });
+      if ('effectId' in prepared) { effects.push(prepared); if (!perDig) singlePrepared = true; return prepared; }
+      if (prepared.status === 'invalid') throw new Error(prepared.reason);
+      throw new Error(`effect-prepare-${prepared.status}`);
+    };
     const execution = await this.executor.start(admissionContext.goalId ?? 'agent', skill, args, async (lease, report, signal) => {
       const early = this.checkAdmission(skill, admissionContext, admittedContext);
       if (early && !early.ok) return { ok: false, outcome: 'failed', reason: early.code };
-      if (effectId && !effectPrepared) {
-        // Durable prepare must succeed before the skill can reach a dispatch report.
-        this.store!.addEffect({
-          effectId,
-          executionId: lease.owner,
-          context: this.bridge.context,
-          status: 'prepared',
-          intent: {
-            kind: skill === 'place_one' ? 'place' : skill === 'send_chat' ? 'chat' : skill === 'collect_nearby' ? 'collect' : 'dig',
-            x: typeof executeArgs === 'object' && executeArgs !== null ? (executeArgs as { x?: number }).x : undefined,
-            y: typeof executeArgs === 'object' && executeArgs !== null ? (executeArgs as { y?: number }).y : undefined,
-            text: skill === 'send_chat' ? String(executeArgs) : undefined,
-            block: skill === 'gather_blocks' ? String(args.block) : undefined,
-          },
-        });
-        effectPrepared = true;
-      }
+      if (!perDig && !singlePrepared) prepareEffectOnce(lease.owner, 0);
+      // Real, non-blocking prerequisite evaluation (FEC-36). A demonstrably unmet prerequisite
+      // fails closed here, before any dispatch report (and therefore before any body input) is
+      // produced. The effect was already prepared above, so a rejection still leaves the truthful
+      // "prepared but never dispatched" durable row instead of a phantom confirmed one.
+      const preconditions = this.evaluateSkillPreconditions(skill, args);
+      if (preconditions.unmet.length > 0) return { ok: false, outcome: 'failed', reason: `precondition:${preconditions.unmet.join(',')}` };
+      let digOrdinal = 0;
       const guardedReport = (progress: Omit<Progress, 'at'>) => {
-        if (effectId && progress.stage === 'dispatch') {
-          if (!effectPrepared) throw new Error('effect-not-prepared');
+        if (sideEffect && progress.stage === 'dispatch') {
           // Every dispatch report is the last synchronous boundary before the skill body
           // performs input. Admission is re-evaluated, then the durable barrier is written.
           const barrier = this.checkAdmission(skill, { ...admissionContext, signal }, admittedContext);
           if (barrier && !barrier.ok) throw new Error(barrier.code);
-          this.store!.updateEffect(effectId, 'may-have-dispatched', { barrier: 'pre-dispatch', goalId: admissionContext.goalId, goalRevision: admissionContext.goalRevision });
+          // gather registers one effect per dig, so the barrier is written per dig rather than
+          // one aggregated effect (FEC-35). Every other write crosses one barrier.
+          const target = perDig ? prepareEffectOnce(lease.owner, digOrdinal++) : effects[0]!;
+          if (!target) throw new Error('effect-not-prepared');
+          const written = gateway.markDispatched(target.effectId, { barrier: 'pre-dispatch', goalId: admissionContext.goalId, goalRevision: admissionContext.goalRevision });
+          // A conflict (a recovery rewrote this barrier) or invalid transition aborts before the
+          // skill can perform input. The exhaustive union is handled, never swallowed (FEC-24).
+          if (written.status !== 'applied') throw new Error(written.reason);
+
         }
         report(progress);
       };
@@ -491,10 +498,11 @@ export class ToolRouter {
         return result instanceof Promise ? await result : result;
       };
       if (this.lifecycle) {
-        // The lifecycle owns pause/cancel/human-control fencing for the run. Preconditions are
-        // passed as observed evidence, not assumed true; an unobserved prerequisite fails closed.
-        const preconditions = await this.observedPreconditions(skill, args);
-        const snapshot = await this.lifecycle.run(skill, lifeSignal => invokeSkill(lifeSignal), { generation: this.lifecycle.generationValue, preconditions });
+        // The lifecycle owns pause/cancel/human-control fencing for the run. The skill still
+        // performs its own evidence checks; the prerequisites are the REAL evaluations from
+        // `evaluatePreconditions` (FEC-36), not a blanket `true` map. An unmet prerequisite is
+        // already rejected above, so every entry here is satisfied or explicitly false/unknown.
+        const snapshot = await this.lifecycle.run(skill, lifeSignal => invokeSkill(lifeSignal), { generation: this.lifecycle.generationValue, preconditions: preconditions.observed });
         if (snapshot.state === 'suspended' && snapshot.outcome === 'paused') return { ok: false, outcome: 'canceled', reason: 'paused' };
         if (snapshot.state === 'canceled') return { ok: false, outcome: 'canceled', reason: snapshot.reason };
         if (snapshot.state === 'failed') return { ok: false, outcome: 'failed', reason: snapshot.reason };
@@ -502,106 +510,83 @@ export class ToolRouter {
       }
       return invokeSkill();
     });
-    if (sideEffect && effectId && effectPrepared) {
-      const effect = this.store.getEffect(effectId);
-      const current = effect?.status;
-      // Keep the pre-dispatch barrier evidence: settlement must not erase the audit trail that
-      // proves the durable barrier was crossed before any world action.
-      const evidence = { ...(effect?.evidence as Record<string, unknown> | undefined), executionId: execution.executionId, outcome: execution.outcome, ...(execution.reason ? { reason: execution.reason } : {}) };
-      // Only an explicitly confirmed skill settles the effect. A prepared-but-never-dispatched
-      // effect stays distinguishable from one that may have reached the body.
-      if (execution.outcome === 'confirmed') this.store.updateEffect(effectId, 'confirmed', evidence);
-      else if (execution.outcome === 'partial') this.store.updateEffect(effectId, 'partial', evidence);
-      else if (current === 'prepared') this.store.updateEffect(effectId, 'prepared', { ...evidence, dispatched: false });
-      else this.store.updateEffect(effectId, 'ambiguous', evidence);
+    // Settlement goes through the gateway and coordinator only; an unknown/ambiguous effect is
+    // never reported as success and a prepared-but-never-dispatched effect stays distinguishable.
+    if (sideEffect && effects.length > 0) {
+      const outcome: EffectOutcome = execution.outcome === 'confirmed' ? 'confirmed' : execution.outcome === 'partial' ? 'partial' : 'ambiguous';
+      for (const managed of effects) {
+        const effect = this.store.getEffect(managed.effectId);
+        if (!effect) continue;
+        // Keep the pre-dispatch barrier evidence on the settled row so the audit trail that the
+        // barrier was crossed before any world action survives settlement.
+        const evidence = { ...(effect.evidence as Record<string, unknown> | undefined), executionId: execution.executionId, outcome: execution.outcome, ...(execution.reason ? { reason: execution.reason } : {}) };
+        // A prepared effect that never crossed the barrier is recorded as not dispatched; the
+        // coordinator maps it to `prepared` (or `ambiguous`) and never to confirmed (FEC-25).
+        const settled = gateway.settleEffect(managed.effectId, outcome, effect.status === 'prepared' ? { ...evidence, dispatched: false } : evidence);
+        // A CAS conflict (for example a recovery rewrote the barrier) is reported, not swallowed.
+        if (settled.status === 'conflict') this.events?.publish('effect.settle-conflict', { effectId: managed.effectId, reason: settled.reason }, false);
+      }
     }
-    // Only an explicitly confirmed execution is a successful tool call. Partial,
-    // ambiguous, failed and canceled outcomes are reported as failures; a partial
-    // effect may still have changed the world and must not look complete.
+    // Only an explicitly confirmed execution is a successful tool call, and every registered
+    // effect must itself be confirmed. Partial, ambiguous, failed and canceled outcomes are
+    // reported as failures; a partial effect may still have changed the world and must not look
+    // complete.
     if (execution.status !== 'succeeded' || execution.outcome !== 'confirmed') {
       return { ok: false, result: execution, error: execution.reason ?? execution.outcome ?? execution.status };
+    }
+    if (sideEffect && effects.some(effect => this.store!.getEffect(effect.effectId)?.status !== 'confirmed')) {
+      return { ok: false, result: execution, error: 'effect-not-confirmed' };
     }
     return { ok: true, result: execution };
   }
 }
 
-export type AgentLoopOptions = {
-  canonical?: boolean;
-  providerName?: string;
-  writeTools?: Iterable<string>;
-  /** Every provider the assembly can switch between. Defaults to the single resolved provider. */
-  providers?: Record<string, ModelProvider>;
-  /** Mutable public metadata object, updated on a successful provider switch. */
-  providerMetadata?: ProviderMetadata;
-  /** Immutable metadata snapshots keyed by registry name. */
-  providerMetadataByName?: Record<string, ProviderMetadata>;
-};
+import { ProviderSession } from '../providers/session.js';
+import { classifyToolCall, defaultWriteTools as sharedDefaultWriteTools, type ToolClass } from '../providers/tools.js';
+
+/** Write + control-write defaults. Control writes are serialized just like body writes. */
+export const defaultWriteTools: readonly string[] = sharedDefaultWriteTools;
 
 export class AgentLoop {
   private readonly session?: ProviderSession;
-  private readonly providerMetadata?: ProviderMetadata;
-  private readonly providerMetadataByName?: Record<string, ProviderMetadata>;
   private canonicalQueue: Promise<void> = Promise.resolve();
   private runContext: { goalId?: string; goalRevision?: number; owner?: string } = {};
   constructor(
     private readonly provider: ModelProvider,
     private readonly router: ToolRouter,
     private readonly maxTurns = 8,
-    options: AgentLoopOptions = {},
+    options: { canonical?: boolean; providerName?: string; writeTools?: Iterable<string>; sessionId?: string } = {},
   ) {
-    this.providerMetadata = options.providerMetadata;
-    this.providerMetadataByName = options.providerMetadataByName;
     // The canonical provider session is the production path when a real configured provider is
     // used. Scripted/fixture/injected providers keep the legacy loop, which is also the offline
     // test/fixture path. Both drive the same ToolRouter and tool definitions.
     if (options.canonical) {
-      const providerName = options.providerName ?? Object.keys(options.providers ?? {})[0] ?? 'provider';
-      // Register every configured/injected provider, not only the initially resolved one, so a
-      // later switch is a metadata/history operation rather than an unknown-provider error.
-      const providers = options.providers ?? { [providerName]: provider };
-      if (!providers[providerName]) throw new ProviderError(`provider-unknown:${providerName}`);
       this.session = new ProviderSession({
-        providers,
-        initialProvider: providerName,
+        providers: { [options.providerName ?? 'provider']: provider },
+        initialProvider: options.providerName ?? 'provider',
         tools: defaultTools,
         execute: (call, signal) => this.router.invoke(call, { ...this.runContext, ...(signal ? { signal } : {}) }),
-        writeTools: options.writeTools ?? ['start_skill', 'send_chat', 'remember_place'],
+        // defaultWriteTools includes control-write tools (revise_goal/cancel_execution); the
+        // session classifier additionally resolves start_skill through the skill registry.
+        writeTools: options.writeTools ?? defaultWriteTools,
+        ...(options.sessionId ? { sessionId: options.sessionId } : {}),
         maxTurns,
       });
     }
   }
   get canonicalPath(): boolean { return Boolean(this.session); }
   get providerSession(): ProviderSession | undefined { return this.session; }
-  /**
-   * A goal is admissible only when it exists, its revision matches and it belongs to this
-   * runtime's current stable body scope.
-   */
-  private goalMatches(store: SQLiteStore, goalId: string, expectedRevision?: number): boolean {
-    const goal = store.getGoal(goalId);
-    if (!goal) return false;
-    if (expectedRevision !== undefined && goal.revision !== expectedRevision) return false;
-    return this.router.goalScopeMatches(goal.context);
-  }
   /** Provider switching is only available on the canonical path and only between a completed turn. */
   switchProvider(name: string): void {
     if (!this.session) throw new Error('provider-session-unavailable');
     this.session.switchProvider(name);
-    // Canonical history and the write ledger stay untouched; only provenance metadata changes.
-    const next = this.providerMetadataByName?.[name];
-    if (next && this.providerMetadata) {
-      this.providerMetadata.provider = next.provider;
-      this.providerMetadata.configured = next.configured;
-      this.providerMetadata.networkEnabled = next.networkEnabled;
-      this.providerMetadata.transport = next.transport;
-      if (next.model === undefined) delete this.providerMetadata.model;
-      else this.providerMetadata.model = next.model;
-    }
   }
 
   async run(messages: ModelMessage[], tools: ToolDefinition[] = defaultTools, signal?: AbortSignal, options: { goalId?: string; goalRevision?: number; owner?: string; store?: SQLiteStore } = {}) {
     // Goal-revision fencing happens before the provider is called on both paths.
     if (options.goalId && options.store) {
-      if (!this.goalMatches(options.store, options.goalId, options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace: [] as unknown[] };
+      const goal = options.store.getGoal(options.goalId);
+      if (!goal || (options.goalRevision !== undefined && goal.revision !== options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace: [] as unknown[] };
     }
     if (this.session) return this.runCanonical(messages, signal, options);
     const history = messages.map(message => structuredClone(message));
@@ -609,11 +594,10 @@ export class AgentLoop {
     for (let turn = 0; turn < this.maxTurns; turn++) {
       if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
       if (options.goalId && options.store) {
-        if (!this.goalMatches(options.store, options.goalId, options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace };
+        const goal = options.store.getGoal(options.goalId);
+        if (!goal || (options.goalRevision !== undefined && goal.revision !== options.goalRevision)) return { response: { stopReason: 'goal-revision-conflict', text: '' }, trace };
       }
       const response = await this.provider.complete(history, tools, signal); trace.push(response);
-      // The legacy injected/fixture path applies the same non-terminal contract.
-      assertModelResponse(response);
       if (!response.toolCalls?.length) return { response, trace };
       if (signal?.aborted) { this.provider.cancel(); throw new DOMException('The operation was aborted', 'AbortError'); }
       const byId = new Map<string, Awaited<ReturnType<ToolRouter['invoke']>>>();
@@ -625,9 +609,7 @@ export class AgentLoop {
       history.push({ role: 'assistant', content: response.text ?? '', toolCalls: response.toolCalls });
       for (const call of response.toolCalls) { const result = byId.get(call.id); if (result) history.push({ role: 'tool', toolCallId: result.callId, content: JSON.stringify(result) }); }
     }
-    // Exhausting the turn budget is not a successful terminal answer. Surface it as an error
-    // so the command layer does not record a fabricated empty success.
-    throw new ProviderError('provider-max-turns');
+    return { response: { stopReason: 'max-turns', text: '' }, trace };
   }
 
   /**
@@ -655,7 +637,7 @@ export class AgentLoop {
         ...(signal ? { signal } : {}),
         ...(options.goalId ? { goalId: options.goalId } : {}),
         ...(options.goalRevision !== undefined ? { expectedRevision: options.goalRevision } : {}),
-        ...(options.store ? { getGoalRevision: (goalId: string) => this.goalMatches(options.store!, goalId) ? options.store!.getGoal(goalId)?.revision : undefined } : {}),
+        ...(options.store ? { getGoalRevision: (goalId: string) => options.store!.getGoal(goalId)?.revision } : {}),
       });
       // `turns` is the session-wide log; the trace is only this run's responses plus the final one.
       const trace = [...result.turns.slice(turnsBefore).map(turn => turn.response), result.response];

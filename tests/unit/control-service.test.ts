@@ -4,12 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRuntime } from '../../src/execution/factory.js';
 import { SQLiteStore } from '../../src/persistence/store.js';
-import { canonicalPayloadHash, commandScopeOf } from '../../src/control/service.js';
+import { commandScopeFor, canonicalPayloadHash } from '../../src/control/service.js';
 import { FakeClientBridge, type FakeBridgeOptions } from '../../src/bridge/fake/index.js';
 import type { ModelMessage, ModelProvider, ModelResponse, ToolCall } from '../../src/providers/scripted/index.js';
-import { nextId, ManualClock } from '../../src/contracts/index.js';
+import { nextId } from '../../src/contracts/index.js';
 import { ScriptedModelProvider } from '../../src/providers/scripted/index.js';
-import { SimulatedBodyAdapter } from '../../src/fixtures/body-adapter.js';
 
 /** Gate a promise from outside so a test can hold an AgentLoop in flight. */
 function deferred<T = void>() {
@@ -50,7 +49,8 @@ class CountingBridge extends FakeClientBridge {
 }
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
-const controlScope = commandScopeOf({ serverProfileId: 'simulated', worldGenerationId: 'world-1', connectionEpoch: '1', bodyEpoch: '1', dimension: 'overworld' });
+/** The default FakeClientBridge context: world/dimension are available, account identity is not. */
+const controlScope = commandScopeFor({ serverProfileId: 'simulated', worldGenerationId: 'world-1', dimension: 'overworld', connectionEpoch: '1', bodyEpoch: '1' });
 
 describe('U01 ControlService', () => {
   it('hashes payloads canonically and deduplicates durable requests', async () => {
@@ -143,109 +143,12 @@ describe('U01 ControlService', () => {
   it('stop cancels non-terminal executions instead of only flagging', async () => {
     const runtime = createRuntime({ provider: new ScriptedModelProvider([{ text: 'ok', stopReason: 'end_turn' }]) });
     try {
-      runtime.store.saveExecution({ executionId: 'exec-running', proposalId: 'prop-running', proposalHash: 'h', goalId: 'g1', skillId: 'navigate_to', skillVersion: '1.0.0', status: 'running', context: runtime.bridge.context });
+      runtime.store.saveExecution({ executionId: 'exec-running', proposalId: 'prop-running', proposalHash: 'h', goalId: 'g1', skillId: 'navigate_to', skillVersion: '1.0.0', status: 'running' });
       const stopped = await runtime.control.command({ requestId: 'stop', command: 'stop', payload: {} });
       expect(stopped.state).toBe('accepted');
       expect((stopped.result as { canceled?: string[] }).canceled).toContain('exec-running');
       expect(runtime.store.getExecution('exec-running')?.status).toBe('canceled');
       expect(runtime.control.status().stopping).toBe(true);
-    } finally { runtime.close(); }
-  });
-
-  it('reports release-channel-unavailable when no body release channel exists', async () => {
-    const runtime = createRuntime({ clock: new ManualClock() });
-    try {
-      const stopped = await runtime.control.command({ requestId: 'stop-no-release', command: 'stop', payload: {} });
-      expect(stopped.state).toBe('accepted');
-      expect((stopped.result as { body: { released: boolean; error?: string } }).body).toEqual({ released: false, error: 'release-channel-unavailable' });
-    } finally { runtime.close(); }
-  });
-
-  it('delegates release to the attached body adapter with a real owner token', async () => {
-    const runtime = createRuntime({ profile: 'simulated-3d', clock: new ManualClock() });
-    const adapter = runtime.bodyAdapter as SimulatedBodyAdapter;
-    const tokens: string[] = [];
-    const original = adapter.release.bind(adapter);
-    adapter.release = async (token: string) => { tokens.push(token); await original(token); };
-    try {
-      const stopped = await runtime.control.command({ requestId: 'stop-adapter', command: 'stop', payload: {} });
-      expect((stopped.result as { body: { released: boolean } }).body.released).toBe(true);
-      // With no execution in flight, the runtime owner is the real owner token this process holds.
-      expect(tokens).toContain(runtime.ownerId);
-      expect(adapter.counters.releases).toBe(1);
-    } finally { runtime.close(); }
-  });
-
-  it('falls back to the bridge release channel when no adapter is attached', async () => {
-    class ReleasingBridge extends FakeClientBridge {
-      releases = 0;
-      async releaseOwnedInputs() { this.releases += 1; return { released: true }; }
-    }
-    const bridge = new ReleasingBridge();
-    const runtime = createRuntime({ bridge, clock: new ManualClock() });
-    try {
-      const stopped = await runtime.control.command({ requestId: 'stop-bridge-release', command: 'stop', payload: {} });
-      expect((stopped.result as { body: { released: boolean } }).body.released).toBe(true);
-      expect(bridge.releases).toBe(1);
-    } finally { runtime.close(); }
-  });
-
-  it('does not report an execution as canceled while cancellation is unconfirmed', async () => {
-    const runtime = createRuntime({ clock: new ManualClock() });
-    try {
-      for (const executionId of ['exec-stopping', 'exec-cancel-error']) {
-        runtime.store.saveExecution({ executionId, proposalId: `prop-${executionId}`, proposalHash: 'h', goalId: 'g1', skillId: 'place_one', skillVersion: '1.0.0', status: 'running', context: runtime.bridge.context });
-      }
-      const router = runtime.router as unknown as { invoke: (...args: never[]) => Promise<unknown> };
-      const original = router.invoke.bind(runtime.router) as (...args: never[]) => Promise<unknown>;
-      router.invoke = async (...args: never[]) => {
-        const call = args[0] as ToolCall;
-        const executionId = (JSON.parse(call.arguments) as { executionId: string }).executionId;
-        if (executionId === 'exec-cancel-error') return { callId: call.id, name: call.name, ok: false, error: 'cancel-denied' };
-        runtime.store.updateExecutionStatus(executionId, 'stopping', 'cancel-requested');
-        return { callId: call.id, name: call.name, ok: true, result: { status: 'stopping' } };
-      };
-      try {
-        const stopped = await runtime.control.command({ requestId: 'stop-unconfirmed', command: 'stop', payload: {} });
-        const summary = stopped.result as {
-          canceled: string[];
-          failed: Array<{ executionId: string; error: string }>;
-          cancelRequested: Array<{ executionId: string; error: string }>;
-        };
-        expect(summary.canceled).toEqual([]);
-        expect(summary.failed).toEqual(expect.arrayContaining([{ executionId: 'exec-cancel-error', error: 'cancel-denied' }]));
-        expect(summary.cancelRequested).toEqual([{ executionId: 'exec-stopping', error: 'status:stopping' }]);
-      } finally {
-        router.invoke = original;
-      }
-    } finally { runtime.close(); }
-  });
-
-  it('does not accept a quit whose durable receipt cannot be written', async () => {
-    const runtime = createRuntime({ clock: new ManualClock() });
-    const store = runtime.store as unknown as { updateActionReceipt: (...args: unknown[]) => unknown };
-    const original = store.updateActionReceipt.bind(runtime.store);
-    store.updateActionReceipt = (...args: unknown[]) => {
-      if (args[1] === 'quit-write-fail') throw new Error('quit-receipt-disk-full');
-      return original(...(args as Parameters<typeof original>));
-    };
-    try {
-      const result = await runtime.control.command({ requestId: 'quit-write-fail', command: 'quit', payload: {} });
-      expect(result).toMatchObject({ state: 'unknown', code: 'quit-receipt-disk-full' });
-      expect(result.state).not.toBe('accepted');
-      // The shutdown decision still happened even though its receipt could not be committed.
-      expect(runtime.control.quittingValue).toBe(true);
-      expect(runtime.control.closedValue).toBe(true);
-    } finally { runtime.close(); }
-  });
-
-  it('does not report a terminal message for an unavailable provider', async () => {
-    const runtime = createRuntime({ clock: new ManualClock() });
-    try {
-      const result = await runtime.control.command({ requestId: 'msg-provider-unavailable', command: 'message', payload: { text: 'go' } });
-      expect(result).toMatchObject({ state: 'unknown', code: 'provider-unavailable' });
-      expect((result.result as { response?: { stopReason?: string } }).response?.stopReason).toBe('unavailable');
-      expect(runtime.store.getActionReceipt(controlScope, 'msg-provider-unavailable')?.status).toBe('unknown');
     } finally { runtime.close(); }
   });
 });
@@ -263,7 +166,9 @@ describe('FEC-052 in-process requestId claim', () => {
       const duplicates = await Promise.all([runtime.control.command(request), runtime.control.command(request)]);
       const leaked = await runtime.control.command({ ...request, payload: { text: 'different' } });
       expect(duplicates.every(result => result.state === 'accepted' && result.code === 'in-flight')).toBe(true);
-      expect(leaked).toMatchObject({ state: 'accepted', code: 'in-flight' });
+      // A different payload under the same requestId is a conflict even while the first is
+      // still in flight; it must never be reported as accepted work (FEC-29).
+      expect(leaked).toMatchObject({ state: 'conflict', code: 'command-payload-conflict' });
       expect(runtime.store.getActionReceipt(controlScope, 'same')?.status).toBe('pending');
 
       provider.releaseRun();

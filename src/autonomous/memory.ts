@@ -1,10 +1,18 @@
 import { readFileSync } from 'node:fs';
 import type { SQLiteStore } from '../persistence/store.js';
+import {
+  canonicalScopeKey, resolveStableScope,
+  type StableScope,
+} from '../contracts/context.js';
 
 export type MemoryScope = { serverProfileId: string; accountId?: string; worldGenerationId?: string; dimensionId?: string };
 export type KnowledgeRule = { id: string; version: number; scope: MemoryScope; predicate: string; conclusion: unknown; provenance: string; observed: boolean; validFrom: string; revalidateAfter?: string };
 export type MemoryPage<T> = { items: T[]; nextCursor?: string; truncated: boolean };
 export type PlaceFreshness = 'current' | 'stale' | 'unknown' | 'invalid';
+/** A model-authored place is `unverified`; only observation evidence may promote it. */
+export type PlaceVerificationStatus = 'unverified' | 'verified' | 'legacy-unreviewed';
+/** Persisted freshness may only use UTC. Legacy rows have no trustworthy clock domain. */
+export type PlaceTimeBasis = 'utc' | 'unknown';
 export type PlaceView = {
   placeId: string;
   scope: MemoryScope;
@@ -12,6 +20,8 @@ export type PlaceView = {
   status: string;
   revision: number;
   lastVerifiedAt?: string;
+  verificationStatus: PlaceVerificationStatus;
+  timeBasis: PlaceTimeBasis;
   invalidatedReason?: string;
   provenance?: unknown;
   payload: unknown;
@@ -48,6 +58,25 @@ export type ExecutionExperienceView = {
   authorizesWorldRule: false;
 };
 
+/** Sources that are observations, not model proposals or predictions. */
+const TRUSTED_OBSERVATION_SOURCES = new Set(['client-reported', 'server-observed', 'simulated']);
+export type PlaceObservation = {
+  /** Stable scope captured with the observation. When present it must equal the requested scope. */
+  scope?: unknown;
+  source: 'client-reported' | 'server-observed' | 'predicted' | 'historical' | 'model' | 'synthetic' | 'simulated';
+  pose?: unknown;
+  position?: unknown;
+  x?: number;
+  y?: number;
+  z?: number;
+  evidenceRef?: string | { id?: string };
+  evidence?: string | { id?: string };
+  fieldRevision?: string;
+  /** Optional observation time. A trustworthy UTC timestamp is required when supplied. */
+  observedAtUtc?: string;
+  receivedUtc?: string;
+};
+
 /** Load versioned knowledge rules from a JSON file. Missing or malformed files fail closed. */
 export function loadKnowledgeRules(path: string): KnowledgeRule[] {
   if (!path) return [];
@@ -66,9 +95,37 @@ export function normalizeMemoryScope(value: unknown): MemoryScope {
   if (typeof candidate.serverProfileId !== 'string' || !candidate.serverProfileId) throw new Error('invalid-memory-scope:serverProfileId');
   const scope: MemoryScope = { serverProfileId: candidate.serverProfileId };
   for (const key of ['accountId', 'worldGenerationId', 'dimensionId'] as const) if (typeof candidate[key] === 'string' && candidate[key]) scope[key] = candidate[key] as string;
+  // `dimension` is the bridge's wire name; MemoryScope stores the domain name in `dimensionId`.
+  if (!scope.dimensionId && typeof candidate.dimension === 'string' && candidate.dimension) scope.dimensionId = candidate.dimension;
   return scope;
 }
+
+/** Full stable identity for a memory scope, or undefined when any field is missing. */
+export function memoryScopeToStableScope(value: unknown): StableScope | undefined {
+  try {
+    const scope = normalizeMemoryScope(value);
+    const resolved = resolveStableScope({
+      serverProfileId: scope.serverProfileId,
+      ...(scope.accountId ? { accountId: scope.accountId } : {}),
+      ...(scope.worldGenerationId ? { worldGenerationId: scope.worldGenerationId } : {}),
+      ...(scope.dimensionId ? { dimension: scope.dimensionId } : {}),
+    } as Record<string, unknown>);
+    return resolved.status === 'resolved' ? resolved.scope : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Canonical key for a *resolved* scope; unresolved input has no key. */
+export function memoryScopeKey(value: unknown): string | undefined {
+  const stable = memoryScopeToStableScope(value);
+  return stable ? canonicalScopeKey(stable) : undefined;
+}
+
+/** Sorted-JSON compatibility key used by legacy partial scopes. */
 export function scopeKey(scope: MemoryScope): string {
+  const stable = memoryScopeToStableScope(scope);
+  if (stable) return canonicalScopeKey(stable);
   return JSON.stringify(Object.fromEntries(Object.entries(scope).sort(([a], [b]) => a.localeCompare(b))));
 }
 const sameScope = (left: MemoryScope, right: MemoryScope) => scopeKey(left) === scopeKey(right);
@@ -79,26 +136,96 @@ const cursorOf = (value: string | undefined) => {
   if (cursor > 10_000) throw new Error('memory-cursor-limit');
   return cursor;
 };
-const pageLimit = (value: number | undefined) => {
-  if (value === undefined) return 20;
-  if (!Number.isFinite(value)) throw new Error('invalid-memory-limit');
-  return Math.min(Math.max(Math.trunc(value), 1), 20);
+const pageLimit = (value: number | undefined) => Math.min(Math.max(Math.trunc(value ?? 20), 1), 20);
+
+/**
+ * Scope resolution computed from a live callback. Never cache the returned value across calls:
+ * a world/account/dimension change must invalidate the previous resolution (FEC-49).
+ */
+export type MemoryScopeResolution =
+  | { status: 'resolved'; scope: MemoryScope; scopeKey: string }
+  | { status: 'unresolved'; missing: string[] };
+
+export function resolveMemoryScope(value: unknown): MemoryScopeResolution {
+  let candidate = value;
+  // Accept a ContextProvider-shaped record or a `{ context }` envelope without trusting it.
+  if (candidate && typeof candidate === 'object') {
+    const record = candidate as Record<string, unknown>;
+    if (record.status === 'resolved' && record.scope && typeof record.scope === 'object') candidate = record.scope;
+    else if (record.status === 'unresolved') return { status: 'unresolved', missing: Array.isArray(record.missing) ? record.missing.map(String) : ['context'] };
+    else if (record.context && typeof record.context === 'object') candidate = record.context;
+  }
+  const stable = memoryScopeToStableScope(candidate);
+  if (!stable) {
+    let partial: MemoryScope | undefined;
+    try { partial = normalizeMemoryScope(candidate); } catch { /* unresolved below */ }
+    const missing: string[] = [];
+    if (!partial) missing.push('serverProfileId');
+    else {
+      if (!partial.accountId) missing.push('accountId');
+      if (!partial.worldGenerationId) missing.push('worldGenerationId');
+      if (!partial.dimensionId) missing.push('dimensionId');
+    }
+    return { status: 'unresolved', missing: missing.length ? missing : ['context'] };
+  }
+  return {
+    status: 'resolved',
+    scope: {
+      serverProfileId: stable.serverProfileId,
+      accountId: stable.accountId,
+      worldGenerationId: stable.worldGenerationId,
+      dimensionId: stable.dimensionId,
+    },
+    scopeKey: canonicalScopeKey(stable),
+  };
+}
+
+export function createScopeResolver(source: () => unknown): () => MemoryScopeResolution {
+  return () => resolveMemoryScope(source());
+}
+
+export type MemoryServiceOptions = {
+  /** Monotonic process time. Never persisted and never used as UTC freshness. */
+  nowMono?: () => number;
+  /** TimeServices-like convenience: `clock.now()` is monotonic. */
+  clock?: { now(): number };
+  /** Legacy option name: treated as *monotonic*, never as Unix milliseconds. */
+  now?: () => number;
+  /** Wall-clock ISO source used for every persisted timestamp and freshness comparison. */
+  utcNow?: () => string;
+  clockDomainId?: string;
+  freshnessMaxAgeMs?: number;
+  /** A UTC timestamp slightly ahead of local wall clock is unknown, not fresh. */
+  futureToleranceMs?: number;
 };
 
 export class MemoryService {
-  /** Monotonic runtime timing only. Never persisted and never compared with stored ISO times. */
-  private readonly now: () => number;
-  /** Wall-clock time used for persisted ISO timestamps and freshness comparisons. */
-  private readonly wallNow: () => number;
+  private readonly nowMono: () => number;
+  private readonly utcNow: () => string;
+  private readonly clockDomainId: string;
   private readonly freshnessMaxAgeMs: number;
-  constructor(private readonly store: SQLiteStore, private readonly rules: KnowledgeRule[] = [], options: { now?: () => number; wallNow?: () => number; freshnessMaxAgeMs?: number } = {}) {
-    // `now` may be a monotonic runtime clock (performance.now()/ManualClock). Persisted
-    // timestamps and age checks must use the wall clock, otherwise a fresh process with a
-    // low monotonic value reads yesterday's place as "current". Callers that need a
-    // deterministic wall clock inject `wallNow`; the runtime clock never leaks into storage.
-    this.now = options.now ?? (() => Date.now());
-    this.wallNow = options.wallNow ?? (() => Date.now());
+  private readonly futureToleranceMs: number;
+  constructor(private readonly store: SQLiteStore, private readonly rules: KnowledgeRule[] = [], options: MemoryServiceOptions = {}) {
+    // A legacy caller may still pass `now`, but it is monotonic. It is deliberately not used
+    // for persisted timestamps or freshness; only utcNow may answer "is this UTC fresh?".
+    this.nowMono = options.nowMono ?? options.clock?.now ?? options.now ?? (() => performance.now());
+    this.utcNow = options.utcNow ?? (() => new Date().toISOString());
+    this.clockDomainId = options.clockDomainId ?? 'default-utc';
     this.freshnessMaxAgeMs = Math.max(0, options.freshnessMaxAgeMs ?? 5 * 60_000);
+    this.futureToleranceMs = Math.max(0, options.futureToleranceMs ?? 60_000);
+  }
+
+  /** Monotonic time is exposed only for in-process diagnostics, never for persisted freshness. */
+  monotonicNow(): number { return this.nowMono(); }
+  clockDomain(): string { return this.clockDomainId; }
+
+  private utcNowIso(): string {
+    const value = this.utcNow();
+    if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw new Error('memory-invalid-utc');
+    return value;
+  }
+  private safeUtcNow(): string | undefined {
+    try { return this.utcNowIso(); } catch { return undefined; }
   }
 
   /** Legacy, explicitly scoped rule query. New knowledge uses KnowledgeService releases. */
@@ -110,26 +237,137 @@ export class MemoryService {
     return { items: page, truncated: start + limit < items.length, ...(start + limit < items.length ? { nextCursor: String(start + limit) } : {}) };
   }
 
+  /**
+   * Persist a model-authored place. It is explicitly *unverified*: no freshness timestamp is
+   * written and it can never be a return target until `verifyPlaceFromObservation` binds a fresh
+   * observed pose (FEC-51).
+   */
   rememberPlace(place: { placeId: string; context: unknown; status?: string; payload: unknown; lastVerifiedAt?: string; provenance?: unknown; expectedRevision?: number }): PlaceView {
-    normalizeMemoryScope(place.context);
-    const lastVerifiedAt = place.lastVerifiedAt ?? new Date(this.wallNow()).toISOString();
-    this.store.savePlace({ placeId: place.placeId, context: place.context, status: place.status ?? 'known', lastVerifiedAt, payload: place.payload, provenance: place.provenance, expectedRevision: place.expectedRevision });
-    const stored = this.store.findPlaceByScope(place.placeId, place.context);
+    const scope = normalizeMemoryScope(place.context);
+    const recordedAt = this.utcNowIso();
+    const provenance = { ...(asRecord(place.provenance) ?? {}), recordedAt, source: asRecord(place.provenance)?.source ?? 'model' };
+    this.store.savePlace({
+      placeId: place.placeId, context: scope, status: place.status ?? 'known', payload: place.payload,
+      provenance, expectedRevision: place.expectedRevision,
+      // A caller-supplied lastVerifiedAt is not evidence. It is intentionally not persisted.
+      timeBasis: 'unknown', verificationStatus: 'unverified',
+    });
+    const stored = this.store.findPlaceByScope(place.placeId, scope);
+    if (!stored) throw new Error('place-not-found');
+    return this.placeView(stored);
+  }
+
+  /**
+   * Create (or re-bind) a place from a body observation the runtime actually witnessed. Unlike
+   * `rememberPlace`, the coordinates come from a trusted observation, so the place is born
+   * `verified` with a UTC freshness basis (FEC-51). A non-trusted source or a stale/unknown
+   * observation fails closed; the model payload is never allowed to override the witnessed pose.
+   */
+  rememberPlaceFromObservation(place: {
+    placeId: string;
+    context: unknown;
+    observation: PlaceObservation;
+    /** Model-supplied payload retained for provenance only; a conflicting pose is rejected. */
+    payload?: unknown;
+    provenance?: unknown;
+    expectedRevision?: number;
+    observedAtUtc?: string;
+  }): PlaceView {
+    const scope = normalizeMemoryScope(place.context);
+    if (!place.observation || typeof place.observation !== 'object') throw new Error('observation-required');
+    if (!TRUSTED_OBSERVATION_SOURCES.has(place.observation.source)) throw new Error('observation-not-trusted');
+    const evidenceRef = observationEvidenceRef(place.observation);
+    if (!evidenceRef) throw new Error('observation-evidence-required');
+    if (place.observation.scope !== undefined && !sameScope(normalizeMemoryScope(place.observation.scope), scope)) throw new Error('observation-scope-mismatch');
+    const pose = observationPose(place.observation);
+    this.assertObservationFresh(place.observation.observedAtUtc ?? place.observation.receivedUtc ?? place.observedAtUtc);
+    // A place is a navigation *target*: the block the body occupies. The witnessed pose may be
+    // fractional, so it is floored to its block cell exactly as `poseBlock` does elsewhere. The
+    // model payload must agree with that cell; it never overrides the witnessed position.
+    // A planar (2D) observation carries no z; it is floored on the z=0 layer, matching the
+    // rest of the codebase's treatment of legacy/2D bodies.
+    const cell = { x: Math.floor(pose.x), y: Math.floor(pose.y), z: Math.floor(pose.z ?? 0) };
+    const payload = posePayload(place.payload, cell);
+    const existing = this.store.findPlaceByScope(place.placeId, scope);
+    const recordedAt = this.utcNowIso();
+    const provenance = {
+      ...(asRecord(existing?.provenance) ?? {}), ...(asRecord(place.provenance) ?? {}),
+      recordedAt, source: place.observation.source, evidenceRef,
+      ...(place.observation.fieldRevision ? { fieldRevision: place.observation.fieldRevision } : {}),
+    };
+    this.store.savePlace({
+      placeId: place.placeId, context: scope, status: 'known', payload, lastVerifiedAt: recordedAt,
+      timeBasis: 'utc', verificationStatus: 'verified', provenance, expectedRevision: place.expectedRevision,
+    });
+    const stored = this.store.findPlaceByScope(place.placeId, scope);
     if (!stored) throw new Error('place-not-found');
     return this.placeView(stored);
   }
 
   updatePlace(placeId: string, scopeValue: unknown, change: { status?: string; payload?: unknown; lastVerifiedAt?: string; provenance?: unknown; expectedRevision?: number }): PlaceView {
-    normalizeMemoryScope(scopeValue);
-    this.store.updatePlace({ placeId, context: scopeValue, status: change.status, payload: change.payload, lastVerifiedAt: change.lastVerifiedAt, provenance: change.provenance, expectedRevision: change.expectedRevision });
-    const stored = this.store.findPlaceByScope(placeId, scopeValue);
+    const scope = normalizeMemoryScope(scopeValue);
+    const existing = this.store.findPlaceByScope(placeId, scope);
+    if (!existing) throw new Error('place-not-found');
+    const existingVerified = (existing as { verificationStatus?: string }).verificationStatus === 'verified'
+      && (existing as { timeBasis?: string }).timeBasis === 'utc';
+    const provenance = change.provenance === undefined ? undefined : { ...(asRecord(change.provenance) ?? {}), recordedAt: this.utcNowIso() };
+    this.store.updatePlace({
+      placeId, context: scope, status: change.status, payload: change.payload,
+      ...(existingVerified && change.lastVerifiedAt !== undefined ? { lastVerifiedAt: change.lastVerifiedAt } : {}),
+      provenance, expectedRevision: change.expectedRevision,
+    });
+    const stored = this.store.findPlaceByScope(placeId, scope);
     if (!stored) throw new Error('place-not-found');
     return this.placeView(stored);
   }
 
   invalidatePlace(placeId: string, scopeValue: unknown, reason: string, expectedRevision?: number): PlaceView {
-    normalizeMemoryScope(scopeValue);
-    return this.placeView(this.store.invalidatePlace(placeId, scopeValue, reason || 'invalidated', expectedRevision));
+    const scope = normalizeMemoryScope(scopeValue);
+    return this.placeView(this.store.invalidatePlace(placeId, scope, reason || 'invalidated', expectedRevision));
+  }
+
+  /**
+   * Bind a fresh observation to an existing place. Only observation evidence can make a place
+   * verified; model/predicted/historical coordinates stay unverified.
+   */
+  verifyPlaceFromObservation(placeId: string, scopeValue: unknown, observation: PlaceObservation, options: { expectedRevision?: number } = {}): PlaceView {
+    const scope = normalizeMemoryScope(scopeValue);
+    if (!observation || typeof observation !== 'object') throw new Error('observation-required');
+    if (!TRUSTED_OBSERVATION_SOURCES.has(observation.source)) throw new Error('observation-not-trusted');
+    const evidenceRef = observationEvidenceRef(observation);
+    if (!evidenceRef) throw new Error('observation-evidence-required');
+    if (observation.scope !== undefined && !sameScope(normalizeMemoryScope(observation.scope), scope)) throw new Error('observation-scope-mismatch');
+    const existing = this.store.findPlaceByScope(placeId, scope);
+    if (!existing) throw new Error('place-not-found');
+    const pose = observationPose(observation);
+    const now = this.utcNowIso();
+    this.assertObservationFresh(observation.observedAtUtc ?? observation.receivedUtc, now);
+    const provenance = {
+      ...(asRecord((existing as { provenance?: unknown }).provenance) ?? {}),
+      recordedAt: now, source: observation.source, evidenceRef,
+      ...(observation.fieldRevision ? { fieldRevision: observation.fieldRevision } : {}),
+    };
+    this.store.savePlace({
+      placeId, context: scope, status: 'known', payload: pose, lastVerifiedAt: now,
+      timeBasis: 'utc', verificationStatus: 'verified', provenance, expectedRevision: options.expectedRevision,
+    });
+    const stored = this.store.findPlaceByScope(placeId, scope);
+    if (!stored) throw new Error('place-not-found');
+    return this.placeView(stored);
+  }
+
+  /**
+   * A supplied observation timestamp must be a trustworthy UTC value: not in the future beyond the
+   * skew tolerance, and not older than the freshness window. Absent timestamps are allowed (the
+   * caller's `utcNow` becomes the basis); a supplied but unparsable one fails closed.
+   */
+  private assertObservationFresh(observedAt: string | undefined, now: string = this.utcNowIso()): void {
+    if (observedAt === undefined) return;
+    const observed = Date.parse(observedAt);
+    const current = Date.parse(now);
+    if (!Number.isFinite(observed)) throw new Error('observation-time-invalid');
+    if (observed - current > this.futureToleranceMs) throw new Error('observation-clock-skew');
+    if (current - observed > this.freshnessMaxAgeMs) throw new Error('observation-stale');
   }
 
   /** Exact-scope resolution; a place in another world/dimension/account is never returned. */
@@ -150,13 +388,14 @@ export class MemoryService {
   querySpatial(options: { scope?: unknown; status?: string; limit?: number; cursor?: string } = {}): MemoryPage<PlaceView> { return this.queryPlaces(options); }
 
   /**
-   * The only place-derived value return_to_place may use. A stale, invalid or cross-scope place
-   * yields no target; execution history is never consulted as a substitute.
+   * The only place-derived value return_to_place may use. A stale, invalid, unverified or
+   * cross-scope place yields no target; execution history is never consulted as a substitute.
    */
-  returnToPlaceTarget(placeId: string, scopeValue: unknown, options: { now?: number } = {}): { x: number; y: number; z?: number; placeId: string; revision: number; freshness: 'current'; scope: MemoryScope } | undefined {
+  returnToPlaceTarget(placeId: string, scopeValue: unknown, options: { utcNow?: string; now?: number } = {}): { x: number; y: number; z?: number; placeId: string; revision: number; freshness: 'current'; scope: MemoryScope } | undefined {
     const view = this.resolvePlace(placeId, scopeValue);
     if (!view) return undefined;
-    const freshness = this.freshnessOf(view, options.now);
+    if (view.verificationStatus !== 'verified') return undefined;
+    const freshness = this.freshnessOf(view, options.utcNow);
     if (freshness !== 'current') return undefined;
     const payload = view.payload as { x?: unknown; y?: unknown; z?: unknown } | undefined;
     if (!payload || typeof payload.x !== 'number' || typeof payload.y !== 'number' || !Number.isFinite(payload.x) || !Number.isFinite(payload.y)) return undefined;
@@ -166,11 +405,14 @@ export class MemoryService {
     return { x: payload.x, y: payload.y, ...(z === undefined ? {} : { z }), placeId, revision: view.revision, freshness: 'current', scope: view.scope };
   }
 
-  resolveReturnToPlace(placeId: string, scopeValue: unknown, options: { now?: number } = {}): { ok: true; target: NonNullable<ReturnType<MemoryService['returnToPlaceTarget']>> } | { ok: false; reason: string } {
+  resolveReturnToPlace(placeId: string, scopeValue: unknown, options: { utcNow?: string; now?: number } = {}): { ok: true; target: NonNullable<ReturnType<MemoryService['returnToPlaceTarget']>> } | { ok: false; reason: string } {
     const view = this.resolvePlace(placeId, scopeValue);
     if (!view) return { ok: false, reason: 'unknown-place' };
-    const freshness = this.freshnessOf(view, options.now);
-    if (freshness === 'invalid' || view.status === 'invalid') return { ok: false, reason: 'place-invalid' };
+    if (view.status === 'invalid') return { ok: false, reason: 'place-invalid' };
+    if (view.verificationStatus !== 'verified') return { ok: false, reason: 'place-unverified' };
+    const freshness = this.freshnessOf(view, options.utcNow);
+    if (freshness === 'invalid') return { ok: false, reason: 'place-invalid' };
+    if (view.timeBasis !== 'utc') return { ok: false, reason: 'place-time-unknown' };
     if (freshness === 'stale' || freshness === 'unknown') return { ok: false, reason: `place-${freshness}` };
     const target = this.returnToPlaceTarget(placeId, scopeValue, options);
     return target ? { ok: true, target } : { ok: false, reason: 'place-position-missing' };
@@ -195,7 +437,7 @@ export class MemoryService {
     };
     const row = this.store.saveEpisode({
       episodeId: input.episodeId, context: scope, eventRefs: input.evidence.map(item => item.ref).filter(Boolean),
-      summary, provenance: input.provenance ?? { source: 'execution', recordedAt: new Date(this.wallNow()).toISOString() },
+      summary, provenance: input.provenance ?? { source: 'execution', recordedAt: this.utcNowIso() },
     });
     void row;
     const stored = this.store.getEpisode(input.episodeId, scope);
@@ -222,10 +464,13 @@ export class MemoryService {
 
   private placeView(row: NonNullable<ReturnType<SQLiteStore['getPlace']>>): PlaceView {
     const scope = safeScope(row.context);
-    const freshness = this.freshnessOf({ status: row.status, lastVerifiedAt: row.lastVerifiedAt }, undefined);
+    const verificationStatus = normalizeVerificationStatus((row as { verificationStatus?: string }).verificationStatus);
+    const timeBasis = normalizeTimeBasis((row as { timeBasis?: string }).timeBasis);
+    const freshness = this.freshnessOf({ status: row.status, lastVerifiedAt: row.lastVerifiedAt ?? undefined, verificationStatus, timeBasis }, undefined);
     return {
       placeId: row.place_id, scope, context: scope, status: row.status, revision: Number((row as { revision?: number }).revision ?? 0),
       lastVerifiedAt: row.lastVerifiedAt ?? undefined,
+      verificationStatus, timeBasis,
       invalidatedReason: (row as { invalidatedReason?: string }).invalidatedReason,
       provenance: (row as { provenance?: unknown }).provenance,
       payload: row.payload, freshness, fresh: freshness === 'current',
@@ -245,42 +490,89 @@ export class MemoryService {
     };
   }
 
-  private freshnessOf(view: { status: string; lastVerifiedAt?: string }, nowOverride: number | undefined): PlaceFreshness {
+  private freshnessOf(view: { status: string; lastVerifiedAt?: string; verificationStatus?: PlaceVerificationStatus; timeBasis?: PlaceTimeBasis }, utcNowOverride: string | undefined): PlaceFreshness {
     if (view.status === 'invalid') return 'invalid';
     if (view.status === 'stale') return 'stale';
+    // Legacy rows without a recorded clock domain are unknown. They are never guessed
+    // as current (or stale) from the local wall clock.
+    if (view.verificationStatus !== 'verified') return 'unknown';
+    if (view.timeBasis !== 'utc') return 'unknown';
     if (!view.lastVerifiedAt) return 'unknown';
     const verified = Date.parse(view.lastVerifiedAt);
     if (!Number.isFinite(verified)) return 'unknown';
-    return (this.wallTime(nowOverride)) - verified > this.freshnessMaxAgeMs ? 'stale' : 'current';
-  }
-
-  /**
-   * Treat a supplied `now` as an override only when it is in the wall-clock domain. Callers such
-   * as the runtime's place resolver historically passed `clock.now()`, which is monotonic
-   * (performance.now()/ManualClock). Comparing that with a stored ISO time makes every place look
-   * current, so a low value falls back to the actual wall clock; an injected test wall time is
-   * still honoured.
-   */
-  private wallTime(override: number | undefined): number {
-    const WALL_CLOCK_FLOOR_MS = Date.parse('2001-01-01T00:00:00.000Z');
-    return typeof override === 'number' && Number.isFinite(override) && override >= WALL_CLOCK_FLOOR_MS
-      ? override
-      : this.wallNow();
+    const nowText = utcNowOverride ?? this.safeUtcNow();
+    if (!nowText) return 'unknown';
+    const now = Date.parse(nowText);
+    if (!Number.isFinite(now)) return 'unknown';
+    if (verified - now > this.futureToleranceMs) return 'unknown';
+    return now - verified > this.freshnessMaxAgeMs ? 'stale' : 'current';
   }
 }
 function scopeMatches(value: MemoryScope, wanted?: MemoryScope) { return !wanted || Object.entries(wanted).every(([key, item]) => item === undefined || value[key as keyof MemoryScope] === item); }
 /**
  * Adapter for navigation's return_to_place. The navigation stream should call this instead of
- * bridge.findPlace, so stale/invalid/cross-scope places never become navigation targets.
+ * bridge.findPlace, so stale/invalid/unverified/cross-scope places never become navigation targets.
  */
-export function createPlaceResolver(memory: MemoryService, scope: unknown, options: { now?: number } = {}) {
+export function createPlaceResolver(memory: MemoryService, scope: unknown, options: { utcNow?: string; now?: number } = {}) {
   return (placeId: string): { x: number; y: number; z?: number } | undefined => {
     const target = memory.returnToPlaceTarget(placeId, scope, options);
     return target ? { x: target.x, y: target.y, ...(target.z === undefined ? {} : { z: target.z }) } : undefined;
   };
 }
+/**
+ * Scope is resolved on every call from `scopeSource` (FEC-49). A callback returning an
+ * unresolved scope never produces a target and never falls back to a frozen scope.
+ */
+export function createDynamicPlaceResolver(memory: MemoryService, scopeSource: () => unknown, options: { utcNow?: string | (() => string); now?: number } = {}) {
+  return (placeId: string): { x: number; y: number; z?: number } | undefined => {
+    const resolution = resolveMemoryScope(scopeSource());
+    if (resolution.status !== 'resolved') return undefined;
+    const utcNow = typeof options.utcNow === 'function' ? options.utcNow() : options.utcNow;
+    const target = memory.returnToPlaceTarget(placeId, resolution.scope, { ...(utcNow ? { utcNow } : {}), ...(options.now !== undefined ? { now: options.now } : {}) });
+    return target ? { x: target.x, y: target.y, ...(target.z === undefined ? {} : { z: target.z }) } : undefined;
+  };
+}
+/** Alias used by callers that describe the resolver by its scope source. */
+export const createScopedPlaceResolver = createDynamicPlaceResolver;
 /** Legacy fixtures stored a plain string context; read them without weakening new write validation. */
 function safeScope(value: unknown): MemoryScope {
   if (value && typeof value === 'object') return normalizeMemoryScope(value);
   return { serverProfileId: String(value ?? 'unknown') };
+}
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+/**
+ * Reconcile a model-supplied place payload with the witnessed pose. The observed pose is
+ * authoritative: when the caller also supplied coordinates they must agree, otherwise the model
+ * would be silently overriding what the body actually saw (rejected as `place-payload-mismatch`).
+ */
+function posePayload(payload: unknown, pose: { x: number; y: number; z?: number }): { x: number; y: number; z?: number } {
+  const record = asRecord(payload);
+  if (!record) return pose;
+  const x = record.x, y = record.y, z = record.z;
+  if (x !== undefined && (typeof x !== 'number' || x !== pose.x)) throw new Error('place-payload-mismatch');
+  if (y !== undefined && (typeof y !== 'number' || y !== pose.y)) throw new Error('place-payload-mismatch');
+  if (z !== undefined && (typeof z !== 'number' || z !== pose.z)) throw new Error('place-payload-mismatch');
+  return pose;
+}
+function normalizeVerificationStatus(value: string | undefined): PlaceVerificationStatus {
+  return value === 'verified' || value === 'unverified' || value === 'legacy-unreviewed' ? value : 'legacy-unreviewed';
+}
+function normalizeTimeBasis(value: string | undefined): PlaceTimeBasis {
+  return value === 'utc' ? 'utc' : 'unknown';
+}
+function observationEvidenceRef(observation: PlaceObservation): string | undefined {
+  const candidate = observation.evidenceRef ?? observation.evidence;
+  if (typeof candidate === 'string' && candidate) return candidate;
+  if (candidate && typeof candidate === 'object' && typeof candidate.id === 'string' && candidate.id) return candidate.id;
+  return undefined;
+}
+function observationPose(observation: PlaceObservation): { x: number; y: number; z?: number } {
+  const source = observation.pose ?? observation.position ?? observation;
+  if (!source || typeof source !== 'object') throw new Error('observation-pose-required');
+  const record = source as Record<string, unknown>;
+  if (typeof record.x !== 'number' || typeof record.y !== 'number' || !Number.isFinite(record.x) || !Number.isFinite(record.y)) throw new Error('observation-pose-required');
+  const z = typeof record.z === 'number' && Number.isFinite(record.z) ? record.z : undefined;
+  return { x: record.x, y: record.y, ...(z === undefined ? {} : { z }) };
 }

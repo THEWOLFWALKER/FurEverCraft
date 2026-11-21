@@ -34,6 +34,19 @@ const acceptedReceipt = (receipt: unknown): boolean => {
   const value = receipt as { accepted?: unknown; ambiguous?: unknown; commandId?: unknown };
   return value.accepted === true && value.ambiguous !== true && typeof value.commandId === 'string' && value.commandId.length > 0;
 };
+/**
+ * An indeterminate receipt: the body may or may not have performed the dig. Either the
+ * receipt explicitly flags ambiguity, or it is an accepted receipt that carries no usable
+ * command id. `undefined`/`null`/non-object receipts are indeterminate too (nothing proves
+ * the dig did not happen). This is the signal that legacy gather must halt on (FEC-34).
+ */
+const indeterminateReceipt = (receipt: unknown): boolean => {
+  if (!receipt || typeof receipt !== 'object') return true;
+  const value = receipt as { accepted?: unknown; ambiguous?: unknown; commandId?: unknown };
+  if (value.ambiguous === true) return true;
+  if (value.accepted === true && !(typeof value.commandId === 'string' && value.commandId.length > 0)) return true;
+  return false;
+};
 
 export function navigateTo(ctx: SkillContext, target: { x: number; y: number; z?: number }, budget = 3): SkillResult | Promise<SkillResult> {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
@@ -157,9 +170,9 @@ export function exploreArea(ctx: SkillContext, radius: number): SkillResult | Pr
   if (getAttachedBodyAdapter(ctx.bridge)) {
     return exploreAreaSkill({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, radius);
   }
-  // Reading a planar snapshot is observation, not movement. Reporting confirmed here
-  // would claim that a world-3d skill explored an area when no body input was issued.
-  return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
+  const snapshot = ctx.bridge.snapshot();
+  ctx.report({ stage: 'dispatch', completed: 1, total: 1, message: 'observed-local-area' });
+  return { ok: true, outcome: 'confirmed', value: { radius, position: snapshot.position, observed: Object.keys(snapshot.cells).length, source: snapshot.source, legacy2d: true } };
 }
 export function digOne(ctx: SkillContext, target: { x: number; y: number }): SkillResult {
   if (canceled(ctx)) return { ok: false, outcome: 'canceled' };
@@ -252,6 +265,13 @@ function gatherBlocksLegacy(ctx: SkillContext, block: string, count: number): Sk
     try {
       const result = ctx.bridge.digBlock(target.x, target.y, block);
       const cleared = ctx.bridge.cell(target.x, target.y) === 'free';
+      // An indeterminate receipt may mean the dig already reached the world. Continuing to mine
+      // would pile up unaccounted physical actions, so the gather halts immediately with an
+      // ambiguous result instead of retrying (FEC-34). The pre-state must also have been
+      // observed blocked for the dig to be valid at all.
+      if (indeterminateReceipt(result)) {
+        return { ok: false, outcome: 'ambiguous', reason: 'dig-receipt-indeterminate', value: { gathered, requested: count, target: { ...target } } };
+      }
       // A free cell alone is not causal evidence. The receipt must identify an accepted command;
       // the pre-state must have been observed blocked; the post-state must be observed free.
       if (!acceptedReceipt(result) || !cleared) {
@@ -305,9 +325,6 @@ function finishReturn(
 ): SkillResult | Promise<SkillResult> {
   if (!resolved.ok) return { ok: false, outcome: 'failed', reason: resolved.reason };
   if (body) return navigateToSkill({ ...ctx, isPaused: ctx.isPaused ?? ctx.isCanceled }, resolved.target, budget);
-  // A remembered world-3d place can carry a real z. The planar bridge cannot execute it,
-  // and dropping z would silently navigate to a different (flattened) location.
-  if (resolved.target.z !== undefined) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   return navigateTo(ctx, { x: resolved.target.x, y: resolved.target.y }, budget);
 }
 

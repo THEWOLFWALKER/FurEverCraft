@@ -22,12 +22,6 @@ export type ObserverCompressionState = 'disabled' | 'enabled' | 'unknown';
 export type ControlEvent =
   | { type: 'compression'; enabled: true; threshold: number }
   | { type: 'compression'; enabled: false }
-  /**
-   * Explicitly declares that compression changed but the new state could not be
-   * recognised. Interpretation stops before the next frame instead of assuming a
-   * framing mode; this is how the `compression-unknown` branch is reached.
-   */
-  | { type: 'compression'; enabled: 'unknown'; reason?: string }
   | { type: 'phase'; phase: ObserverPhase }
   | { type: 'control-unknown'; reason?: string };
 
@@ -41,7 +35,9 @@ export type ControlEventRecognizer = (input: {
 
 export type FrameBudget = {
   maxVarIntBytes: number;
+  /** Maximum outer Packet Length, including the Data Length VarInt when enabled. */
   maxFrameBytes: number;
+  /** Maximum decoded packet body size (packet ID plus fields). */
   maxDecompressedBytes: number;
   maxCompressionRatio: number;
   compressionRatioFloorBytes: number;
@@ -56,9 +52,11 @@ export type FrameFailureCode =
   | 'decompressed-too-large'
   | 'compression-unknown'
   | 'compression-control-invalid'
+  | 'compressed-below-threshold'
   | 'control-unknown'
   | 'length-mismatch'
   | 'invalid-zlib'
+  | 'zlib-trailing-bytes'
   | 'ratio-exceeded'
   | 'decompress-timeout';
 
@@ -70,8 +68,6 @@ export type DecodedFrame = {
   frameBytes: number;
   payloadBytes: number;
   compressed: boolean;
-  /** Present while compression is unknown and framing is parsed under this explicit assumption. */
-  compressionAssumed?: 'uncompressed';
   body: Buffer;
   phase: ObserverPhase;
   compression: ObserverCompressionState;
@@ -117,13 +113,7 @@ export class DirectionalFrameDecoder {
   private byteOffsetValue = 0n;
   private frameSequenceValue = 0n;
   private phaseValue: ObserverPhase | 'unknown' = 'unknown';
-  /**
-   * Production observer has no 26.3 control-packet recogniser, so compression must start
-   * unknown. Frames are still parsed under an explicit, reported "assumed uncompressed"
-   * assumption until a recognised control event establishes the real state.
-   */
-  private compressionValue: ObserverCompressionState = 'unknown';
-  private compressionAssumedValue = true;
+  private compressionValue: ObserverCompressionState = 'disabled';
   private thresholdValue: number | null = null;
   private stoppedReason?: string;
   private readonly budget: FrameBudget;
@@ -144,8 +134,6 @@ export class DirectionalFrameDecoder {
 
   get phase(): ObserverPhase { return phaseState(this.phaseValue); }
   get compression(): ObserverCompressionState { return this.compressionValue; }
-  /** Non-undefined only while compression is unknown and uncompressed framing is assumed. */
-  get compressionAssumed(): 'uncompressed' | undefined { return this.compressionAssumedValue ? 'uncompressed' : undefined; }
   get compressionThreshold(): number | null { return this.thresholdValue; }
   get byteOffset(): string { return this.byteOffsetValue.toString(); }
   get frameSequence(): string { return this.frameSequenceValue.toString(); }
@@ -162,25 +150,15 @@ export class DirectionalFrameDecoder {
     if (this.stopped) return;
     if (event.type === 'control-unknown') { this.markUnknown(event.reason ?? 'control-unknown'); return; }
     if (event.type === 'phase') { this.phaseValue = event.phase; return; }
-    if (event.enabled === 'unknown') {
-      // A transition happened but its direction is unrecognised: stop guessing rather
-      // than continuing to parse compressed bytes as if they were uncompressed.
-      this.compressionValue = 'unknown';
-      this.compressionAssumedValue = false;
-      this.thresholdValue = null;
-      return;
-    }
     if (event.enabled) {
       if (!Number.isInteger(event.threshold) || event.threshold < 0 || event.threshold > this.budget.maxDecompressedBytes) {
         this.markUnknown('compression-control-invalid');
         return;
       }
       this.compressionValue = 'enabled';
-      this.compressionAssumedValue = false;
       this.thresholdValue = event.threshold;
     } else {
       this.compressionValue = 'disabled';
-      this.compressionAssumedValue = false;
       this.thresholdValue = null;
     }
   }
@@ -203,8 +181,7 @@ export class DirectionalFrameDecoder {
     this.consumedOffset = 0n;
     this.frameSequenceValue = 0n;
     this.phaseValue = 'unknown';
-    this.compressionValue = 'unknown';
-    this.compressionAssumedValue = true;
+    this.compressionValue = 'disabled';
     this.thresholdValue = null;
     this.stoppedReason = undefined;
   }
@@ -228,88 +205,101 @@ export class DirectionalFrameDecoder {
         return this.failure(outer.code === 'too-long' ? 'varint-too-long' : 'varint-overflow', frames);
       }
       const packetLength = outer.value;
-      if (packetLength > this.budget.maxDecompressedBytes) {
-        this.markUnknown('decompressed-too-large');
-        return this.failure('decompressed-too-large', frames);
-      }
-      if (this.compressionValue === 'unknown') {
-        if (!this.compressionAssumedValue) {
-          this.markUnknown('compression-unknown');
-          return this.failure('compression-unknown', frames);
-        }
-        // Compression is unknown but the caller has not proven a transition: parse under
-        // the explicitly reported assumed-uncompressed framing rather than claiming
-        // `disabled` as a confirmed state.
-      }
-
-      if (this.compressionValue !== 'enabled') {
-        if (packetLength > this.budget.maxFrameBytes) {
-          this.markUnknown('frame-too-large');
-          return this.failure('frame-too-large', frames);
-        }
-        const total = outer.size + packetLength;
-        if (this.buffer.length < total) return { frames, stopped: this.stopped };
-        const body = Buffer.from(this.buffer.subarray(outer.size, total));
-        this.buffer = this.buffer.length === total ? Buffer.alloc(0) : Buffer.from(this.buffer.subarray(total));
-        const frame = this.commit(body, total, packetLength, false, frames);
-        if (!frame) return { frames, failure: { code: 'control-unknown', reason: this.stopReason ?? 'control-unknown' }, stopped: true };
-        continue;
-      }
-
-      const data = readBoundedVarInt(this.buffer, outer.size, this.budget.maxVarIntBytes);
-      if (!data.ok) {
-        if (data.code === 'incomplete') {
-          if (this.buffer.length > outer.size + this.budget.maxVarIntBytes) { this.markUnknown('varint-too-long'); return this.failure('varint-too-long', frames); }
-          return { frames, stopped: this.stopped };
-        }
-        this.markUnknown(data.code === 'too-long' ? 'varint-too-long' : 'varint-overflow');
-        return this.failure(data.code === 'too-long' ? 'varint-too-long' : 'varint-overflow', frames);
-      }
-      const dataLength = data.value;
-      if (dataLength === 0) {
-        if (packetLength > this.budget.maxFrameBytes) {
-          this.markUnknown('frame-too-large');
-          return this.failure('frame-too-large', frames);
-        }
-        const payloadStart = outer.size + data.size;
-        const total = payloadStart + packetLength;
-        if (this.buffer.length < total) return { frames, stopped: this.stopped };
-        const body = Buffer.from(this.buffer.subarray(payloadStart, total));
-        this.buffer = this.buffer.length === total ? Buffer.alloc(0) : Buffer.from(this.buffer.subarray(total));
-        const frame = this.commit(body, total, packetLength, false, frames);
-        if (!frame) return { frames, failure: { code: 'control-unknown', reason: this.stopReason ?? 'control-unknown' }, stopped: true };
-        continue;
-      }
-
-      if (dataLength > this.budget.maxFrameBytes) {
+      // Packet Length always bounds the bytes on the wire after its own VarInt.
+      // In compression mode those bytes include the Data Length VarInt.
+      if (packetLength > this.budget.maxFrameBytes) {
         this.markUnknown('frame-too-large');
         return this.failure('frame-too-large', frames);
       }
-      const payloadStart = outer.size + data.size;
-      const total = payloadStart + dataLength;
-      if (this.buffer.length < total) return { frames, stopped: this.stopped };
-      const compressedBody = Buffer.from(this.buffer.subarray(payloadStart, total));
-      this.buffer = this.buffer.length === total ? Buffer.alloc(0) : Buffer.from(this.buffer.subarray(total));
+      if (packetLength === 0) {
+        this.markUnknown('length-mismatch');
+        return this.failure('length-mismatch', frames);
+      }
+      if (this.compressionValue === 'unknown') {
+        this.markUnknown('compression-unknown');
+        return this.failure('compression-unknown', frames);
+      }
+      const total = outer.size + packetLength;
 
+      if (this.compressionValue === 'disabled') {
+        if (packetLength > this.budget.maxDecompressedBytes) {
+          this.markUnknown('decompressed-too-large');
+          return this.failure('decompressed-too-large', frames);
+        }
+        if (this.buffer.length < total) return { frames, stopped: this.stopped };
+        const body = Buffer.from(this.buffer.subarray(outer.size, total));
+        this.buffer = this.buffer.length === total ? Buffer.alloc(0) : Buffer.from(this.buffer.subarray(total));
+        const frame = this.commit(body, total, body.length, false, frames);
+        if (!frame) return { frames, failure: { code: 'control-unknown', reason: this.stopReason ?? 'control-unknown' }, stopped: true };
+        continue;
+      }
+
+      // Never read an inner VarInt past this frame into the following frame.
+      const packet = this.buffer.subarray(outer.size, total);
+      const data = readBoundedVarInt(packet, 0, this.budget.maxVarIntBytes);
+      if (!data.ok) {
+        if (data.code === 'incomplete' && this.buffer.length < total) return { frames, stopped: this.stopped };
+        const code = data.code === 'incomplete' ? 'length-mismatch'
+          : data.code === 'too-long' ? 'varint-too-long' : 'varint-overflow';
+        this.markUnknown(code);
+        return this.failure(code, frames);
+      }
+      const dataLength = data.value;
+      const payloadBytes = packetLength - data.size;
+      if (payloadBytes <= 0) {
+        this.markUnknown('length-mismatch');
+        return this.failure('length-mismatch', frames);
+      }
+      const decodedLength = dataLength === 0 ? payloadBytes : dataLength;
+      // When compression is enabled with a nonzero threshold, a compressed payload may not
+      // declare a decoded length below that threshold. A zero dataLength is the legal
+      // "stored uncompressed" marker and is not subject to the threshold.
+      if (dataLength !== 0 && this.thresholdValue !== null && this.thresholdValue > 0 && dataLength < this.thresholdValue) {
+        this.markUnknown('compressed-below-threshold');
+        return this.failure('compressed-below-threshold', frames);
+      }
+      if (decodedLength > this.budget.maxDecompressedBytes) {
+        this.markUnknown('decompressed-too-large');
+        return this.failure('decompressed-too-large', frames);
+      }
+      if (this.buffer.length < total) return { frames, stopped: this.stopped };
+      const payloadStart = outer.size + data.size;
+      const payload = Buffer.from(this.buffer.subarray(payloadStart, total));
+      this.buffer = this.buffer.length === total ? Buffer.alloc(0) : Buffer.from(this.buffer.subarray(total));
+      if (dataLength === 0) {
+        const frame = this.commit(payload, total, payload.length, false, frames);
+        if (!frame) return { frames, failure: { code: 'control-unknown', reason: this.stopReason ?? 'control-unknown' }, stopped: true };
+        continue;
+      }
+
+      const compressedBody = payload;
       const started = this.now();
       let body: Buffer;
+      let consumedBytes: number | undefined;
       try {
-        const inflate = this.options.inflate ?? ((value: Buffer, maxOutputLength: number) => inflateSync(value, { maxOutputLength }));
-        // Request at most the declared length. A compressed stream that expands past the
-        // declaration must fail rather than be silently truncated.
-        body = inflate(compressedBody, Math.max(1, packetLength));
-      } catch {
+        const inflated = this.inflateFrame(compressedBody, dataLength);
+        body = inflated.body;
+        consumedBytes = inflated.consumedBytes;
+      } catch (error) {
+        // Output-cap failures are a declared-size violation, not corrupt zlib data.
+        if ((error as { code?: unknown } | undefined)?.code === 'ERR_BUFFER_TOO_LARGE') {
+          this.markUnknown('decompressed-too-large');
+          return this.failure('decompressed-too-large', frames);
+        }
         this.markUnknown('invalid-zlib');
         return this.failure('invalid-zlib', frames);
       }
-      // Detection only: synchronous inflate has already returned by the time this runs, so
-      // it can never preempt a hostile frame. The worker host enforces the real wall-clock
-      // bound by terminating a worker that does not acknowledge the chunk in time.
       if (this.now() - started > this.budget.maxDecompressMs) {
         this.markUnknown('decompress-timeout');
         return this.failure('decompress-timeout', frames);
       }
-      if (body.length !== packetLength) {
+      // The zlib stream must consume exactly the compressed payload. Trailing bytes inside
+      // the frame would otherwise be silently ignored and break frame-boundary continuity.
+      if (consumedBytes !== undefined && consumedBytes !== compressedBody.length) {
+        this.markUnknown('zlib-trailing-bytes');
+        return this.failure('zlib-trailing-bytes', frames);
+      }
+      if (body.length !== dataLength) {
         this.markUnknown('length-mismatch');
         return this.failure('length-mismatch', frames);
       }
@@ -318,10 +308,24 @@ export class DirectionalFrameDecoder {
         this.markUnknown('ratio-exceeded');
         return this.failure('ratio-exceeded', frames);
       }
-      const frame = this.commit(body, total, packetLength, true, frames);
+      const frame = this.commit(body, total, body.length, true, frames);
       if (!frame) return { frames, failure: { code: 'control-unknown', reason: this.stopReason ?? 'control-unknown' }, stopped: true };
     }
     return { frames, stopped: this.stopped };
+  }
+
+  /**
+   * Inflate a compressed payload. The default implementation asks zlib for the consumed
+   * input length as well; injected test inflaters keep returning a plain Buffer and are
+   * treated as consuming the whole payload (same compatibility as before).
+   */
+  private inflateFrame(data: Buffer, maxOutputLength: number): { body: Buffer; consumedBytes?: number } {
+    if (this.options.inflate) return { body: this.options.inflate(data, maxOutputLength) };
+    const result = inflateSync(data, { maxOutputLength, info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+    return { body: result.buffer, consumedBytes: result.engine.bytesWritten };
   }
 
   private commit(body: Buffer, frameBytes: number, payloadBytes: number, compressed: boolean, frames: DecodedFrame[]): DecodedFrame | undefined {
@@ -352,8 +356,7 @@ export class DirectionalFrameDecoder {
     if (this.stopped) return undefined;
     const frame: DecodedFrame = {
       direction: this.direction, frameSequence: sequence, offsetStart, offsetEnd, frameBytes, payloadBytes,
-      compressed, ...(this.compressionAssumed === 'uncompressed' ? { compressionAssumed: 'uncompressed' as const } : {}),
-      body, phase: this.phase, compression: this.compression,
+      compressed, body, phase: this.phase, compression: this.compression,
     };
     frames.push(frame);
     return frame;

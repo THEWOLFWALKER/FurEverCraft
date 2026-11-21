@@ -14,21 +14,25 @@ export type RelayConfig = {
   handshakeTimeoutMs?: number;
   allowedNextStates?: number[];
   budgets?: Partial<RelayBudgets>;
+  /** Global downstream connection quota. Checked before opening an upstream socket. */
+  maxConnections?: number;
+  /** Global upstream connection quota. Checked before network.connect. */
+  maxUpstreamConnections?: number;
   /**
    * Passive observation tap. It receives every source chunk (including bytes the observer
-   * cannot interpret) together with the owning TCP session identity. It is invoked inside
-   * a try/catch so an observer failure can never block or alter forwarding. Observer state
-   * must be scoped by `session.sessionEpoch`: concurrent sessions are independent.
+   * cannot interpret), the relay session epoch, and is invoked inside a try/catch so an
+   * observer failure can never block or alter forwarding.
    */
-  onChunk?: (direction: RelayDirection, chunk: Buffer, session: RelayChunkContext) => void;
+  onChunk?: (direction: RelayDirection, chunk: Buffer, sessionEpoch: string) => void;
+  /** Called once when a relay session is fully closed; observers drop that session's state. */
+  onSessionClose?: (sessionEpoch: string) => void;
   /** Injected network layer for offline lifecycle tests; defaults to node:net. */
   network?: RelayNetwork;
 };
 export type RelayDirection = 'client-to-server'|'server-to-client';
-/** Stable identity of the TCP session a chunk belongs to. */
-export type RelayChunkContext = { readonly sessionEpoch:string };
 export type RelaySessionState = 'connecting'|'handshaking'|'forwarding'|'half-closed'|'closing'|'closed'|'failed';
 export type RelayMetrics = { queuedBytes:Record<RelayDirection,number>; forwardedBytes:Record<RelayDirection,number>; undeliveredBytes:Record<RelayDirection,number>; state:RelaySessionState; closeReason?:string };
+export type RelayQuota = { maxConnections:number; maxUpstreamConnections:number; activeConnections:number; rejectedConnections:number };
 
 /**
  * Structural socket surface used by the relay. Production uses node:net; tests inject a
@@ -85,29 +89,22 @@ function rewriteHandshake(frame:Buffer, host:string, port:number, allowedNextSta
   return Buffer.concat([encodeVarInt(rest.length),rest]);
 }
 
-export interface RelaySession { readonly sessionEpoch:string; readonly client:RelaySocket; readonly server:RelaySocket; readonly state:RelaySessionState; metrics():RelayMetrics; close(reason?:string):Promise<void>; /** Notify when this session is fully closed (observer state must be discarded). */ onClose(listener:()=>void):()=>void; }
-export interface RawTcpRelay { readonly address:AddressInfo; start():Promise<void>; stop():Promise<void>; sessions():readonly RelaySession[]; onSession(listener:(s:RelaySession)=>void):()=>void; }
+export interface RelaySession { readonly sessionEpoch:string; readonly client:RelaySocket; readonly server:RelaySocket; readonly state:RelaySessionState; metrics():RelayMetrics; close(reason?:string):Promise<void>; }
+export interface RawTcpRelay { readonly address:AddressInfo; start():Promise<void>; stop():Promise<void>; sessions():readonly RelaySession[]; quota():RelayQuota; onSession(listener:(s:RelaySession)=>void):()=>void; }
 
 class Session implements RelaySession {
   readonly sessionEpoch=`relay_${randomUUID()}`; state:RelaySessionState='connecting';
   private closed=false; private reason?:string; private finishing?:Promise<void>;
-  private readonly closeListeners=new Set<()=>void>();
-  private readonly chunkContext:RelayChunkContext;
   private handshakeTimer?:ReturnType<typeof setTimeout>;
   private connectTimer?:ReturnType<typeof setTimeout>;
   private halfCloseTimer?:ReturnType<typeof setTimeout>;
   private readonly stats:RelayMetrics={queuedBytes:{'client-to-server':0,'server-to-client':0},forwardedBytes:{'client-to-server':0,'server-to-client':0},undeliveredBytes:{'client-to-server':0,'server-to-client':0},state:'connecting'};
-  constructor(readonly client:RelaySocket, readonly server:RelaySocket, private readonly config:{targetHost:string;targetPort:number;rewriteHandshake:boolean;handshakeLimitBytes:number;handshakeTimeoutMs:number;allowedNextStates:Set<number>;budgets:RelayBudgets;onChunk?:(direction:RelayDirection, chunk:Buffer, session:RelayChunkContext)=>void}, private readonly onClosed:()=>void){ this.chunkContext=Object.freeze({sessionEpoch:this.sessionEpoch}); this.stats.state='handshaking'; this.state='handshaking'; this.install(); }
+  constructor(readonly client:RelaySocket, readonly server:RelaySocket, private readonly config:{targetHost:string;targetPort:number;rewriteHandshake:boolean;handshakeLimitBytes:number;handshakeTimeoutMs:number;allowedNextStates:Set<number>;budgets:RelayBudgets;onChunk?:(direction:RelayDirection, chunk:Buffer, sessionEpoch:string)=>void}, private readonly onClosed:()=>void){ this.stats.state='handshaking'; this.state='handshaking'; this.install(); }
   metrics(){return {...this.stats,queuedBytes:{...this.stats.queuedBytes},forwardedBytes:{...this.stats.forwardedBytes},undeliveredBytes:{...this.stats.undeliveredBytes}};}
   /** Observer failures are isolated from the forwarding path. */
   private notifyObserver(direction:RelayDirection, chunk:Buffer){
     if(!this.config.onChunk)return;
-    try { this.config.onChunk(direction, chunk, this.chunkContext); } catch { /* observation must never block relay forwarding */ }
-  }
-  onClose(listener:()=>void):()=>void {
-    if(this.closed){listener();return()=>undefined;}
-    this.closeListeners.add(listener);
-    return()=>{this.closeListeners.delete(listener);};
+    try { this.config.onChunk(direction, chunk, this.sessionEpoch); } catch { /* observation must never block relay forwarding */ }
   }
   private install(){ let first=Buffer.alloc(0); let handshakeDone=!this.config.rewriteHandshake;
     // Upstream connects asynchronously. Client bytes are buffered only up to the hard
@@ -166,10 +163,12 @@ class Session implements RelaySession {
     const onDrain=(dir:RelayDirection)=>()=>{ this.stats.queuedBytes[dir]=0; clearStall(dir); const source=sources[dir]; if(!this.closed&&source?.isPaused()){ if(source===this.client)resumeClient(); else source.resume(); } };
     const pair:Array<[RelaySocket,RelaySocket,RelayDirection]> = [[this.client,this.server,clientDir],[this.server,this.client,serverDir]];
     for(const [source,dest,dir] of pair){
-      source.on('data',(chunk:Buffer)=>{ if(this.closed)return; this.notifyObserver(dir,chunk); if(source===this.client&&!handshakeDone){ first=Buffer.concat([first,chunk]); const parsed=readVarInt(first); if(!parsed){ if(first.length>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); return; } const frameLength=parsed.size+parsed.value; if(frameLength>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(first.length<frameLength)return; const frame=Buffer.from(first.subarray(0,frameLength)); first=Buffer.from(first.subarray(frameLength)); try { const out=rewriteHandshake(frame,this.config.targetHost,this.config.targetPort,this.config.allowedNextStates); handshakeDone=true; if(this.handshakeTimer){clearTimeout(this.handshakeTimer);this.handshakeTimer=undefined;} this.state='forwarding'; this.stats.state='forwarding'; forward(dest,source,out,dir); if(first.length){ forward(dest,source,first,dir); first=Buffer.alloc(0); } } catch { void this.close('handshake-rewrite-failed'); } return; }
+      source.on('data',(chunk:Buffer)=>{ if(this.closed)return; this.notifyObserver(dir,chunk); if(source===this.client&&!handshakeDone){ first=Buffer.concat([first,chunk]); const parsed=readVarInt(first); if(parsed && parsed.value>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(first.length>this.config.handshakeLimitBytes)return void this.close('handshake-limit'); if(!parsed||first.length<parsed.size+parsed.value)return; const frame=Buffer.from(first.subarray(0,parsed.size+parsed.value)); first=Buffer.from(first.subarray(frame.length)); try { const out=rewriteHandshake(frame,this.config.targetHost,this.config.targetPort,this.config.allowedNextStates); handshakeDone=true; if(this.handshakeTimer){clearTimeout(this.handshakeTimer);this.handshakeTimer=undefined;} this.state='forwarding'; this.stats.state='forwarding'; forward(dest,source,out,dir); if(first.length){ forward(dest,source,first,dir); first=Buffer.alloc(0); } } catch { void this.close('handshake-rewrite-failed'); } return; }
         forward(dest,source,chunk,dir); });
       dest.on('drain',onDrain(dir));
-      source.on('end',()=>{ if(this.closed)return; endedSockets.add(source); if(!settle(source))return; if(source===this.client&&!upstreamConnected){ clientEndedBeforeConnect=true; return; } if(this.state!=='closing'){this.state='half-closed';this.stats.state='half-closed';} if(!dest.writableEnded)dest.end(); if(accounted.size>=2) void this.close('closed'); else if(!this.halfCloseTimer) this.halfCloseTimer=setTimeout(()=>void this.close('half-close-timeout'),this.config.budgets.halfCloseMs); });
+      source.on('end',()=>{ if(this.closed)return; endedSockets.add(source); if(!settle(source))return; if(source===this.client&&!upstreamConnected){ clientEndedBeforeConnect=true; // The upstream may never finish connecting or never end; bound the session even
+        // though the normal half-close path (upstream EOF -> paired close) has not run yet.
+        if(!this.halfCloseTimer) this.halfCloseTimer=setTimeout(()=>void this.close('half-close-timeout'),this.config.budgets.halfCloseMs); return; } if(this.state!=='closing'){this.state='half-closed';this.stats.state='half-closed';} if(!dest.writableEnded)dest.end(); if(accounted.size>=2) void this.close('closed'); else if(!this.halfCloseTimer) this.halfCloseTimer=setTimeout(()=>void this.close('half-close-timeout'),this.config.budgets.halfCloseMs); });
       // An abrupt close (no preceding 'end') must release the session; otherwise the peer
       // socket and its buffered resources would leak on an ungraceful disconnect.
       source.on('close',()=>{ if(this.closed)return; if(!settle(source))return; if(!endedSockets.has(source)){ void this.close(`${dir}-abort`); return; } if(accounted.size>=2) void this.close('closed'); });
@@ -189,8 +188,6 @@ class Session implements RelaySession {
     await this.flush(clients);
     for(const s of clients) s.destroy();
     this.state=reason==='closed'||reason==='relay-stop'||reason==='client-closed'?'closed':'failed'; this.stats.state=this.state; this.stats.closeReason=reason; this.onClosed();
-    const listeners=[...this.closeListeners]; this.closeListeners.clear();
-    for(const listener of listeners){ try{listener();}catch{ /* observer cleanup is isolated */ } }
   }
   private flush(clients:RelaySocket[]):Promise<void>{
     return new Promise<void>(resolve=>{
@@ -213,10 +210,15 @@ export function createRawTcpRelay(config:RelayConfig):RawTcpRelay {
   const sessions=new Set<Session>(); const listeners=new Set<(s:RelaySession)=>void>(); let server:RelayServer|undefined; let stopping=false;
   let address:AddressInfo={address:config.listenHost??'127.0.0.1',family:'IPv4',port:config.listenPort}; const budgets=mergeBudgets(config.budgets);
   const allowedNextStates=new Set(config.allowedNextStates??[...validNextStates]);
-  const api:RawTcpRelay={get address(){return address;},async start(){if(server)return;stopping=false;const created=network.createServer({allowHalfOpen:true},client=>{ if(stopping){client.destroy();return;} const upstream=network.connect({host:config.targetHost,port:config.targetPort,allowHalfOpen:true});const session=new Session(client,upstream,{targetHost:config.targetHost,targetPort:config.targetPort,rewriteHandshake:config.rewriteHandshake??false,handshakeLimitBytes:config.handshakeLimitBytes??8192,handshakeTimeoutMs:config.handshakeTimeoutMs??5000,allowedNextStates,budgets,onChunk:config.onChunk},()=>sessions.delete(session));sessions.add(session);listeners.forEach(l=>l(session));});
+  const maxConnections=Math.max(0,Math.floor(config.maxConnections??128));
+  const maxUpstreamConnections=Math.max(0,Math.floor(config.maxUpstreamConnections??128));
+  let upstreamConnections=0; let rejectedConnections=0;
+  const api:RawTcpRelay={get address(){return address;},async start(){if(server)return;stopping=false;const created=network.createServer({allowHalfOpen:true},client=>{ if(stopping){client.destroy();return;} // Enforce the global quota before allocating an upstream socket: a new downstream must
+      // not consume an FD, buffer, or upstream slot when either budget is exhausted.
+      if(sessions.size>=maxConnections||upstreamConnections>=maxUpstreamConnections){rejectedConnections+=1;try{client.destroy();}catch{/* best effort */}return;}let upstream:RelaySocket;try{upstream=network.connect({host:config.targetHost,port:config.targetPort,allowHalfOpen:true});}catch{rejectedConnections+=1;try{client.destroy();}catch{/* best effort */}return;}upstreamConnections+=1;let session!:Session;session=new Session(client,upstream,{targetHost:config.targetHost,targetPort:config.targetPort,rewriteHandshake:config.rewriteHandshake??false,handshakeLimitBytes:config.handshakeLimitBytes??8192,handshakeTimeoutMs:config.handshakeTimeoutMs??5000,allowedNextStates,budgets,onChunk:config.onChunk},()=>{sessions.delete(session);upstreamConnections=Math.max(0,upstreamConnections-1);try{config.onSessionClose?.(session.sessionEpoch);}catch{/* observation must never block relay teardown */}});sessions.add(session);listeners.forEach(l=>l(session));});
     await new Promise<void>((resolve,reject)=>{ created.once('error',reject); created.listen(config.listenPort,config.listenHost??'127.0.0.1',()=>{address=created.address() as AddressInfo;resolve();}); }).then(()=>{server=created; // Post-bind listener errors must not crash the process; active sessions already surface their own errors.
       created.on('error',()=>undefined);},error=>{created.close();throw error;});},
     async stop(){ stopping=true; const active=[...sessions].map(s=>s.close('relay-stop')); if(server){ const closing=server; server=undefined; await new Promise<void>(resolve=>closing.close(()=>resolve())); } await Promise.all(active); },
-    sessions:()=>[...sessions],onSession(listener){listeners.add(listener);return()=>listeners.delete(listener);}};
+    sessions:()=>[...sessions],quota:()=>({maxConnections,maxUpstreamConnections,activeConnections:sessions.size,rejectedConnections}),onSession(listener){listeners.add(listener);return()=>listeners.delete(listener);}};
   return api;
 }

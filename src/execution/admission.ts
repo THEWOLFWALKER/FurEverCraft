@@ -7,7 +7,8 @@ import { findSkill, skillManifests } from '../skills/registry.js';
 /**
  * Manifest resources that can only be exercised by driving body input. `ui` alone is
  * deliberately excluded: observe_ui reads a snapshot without submitting input. Deriving
- * the set from the registry keeps new input skills covered without a second hand list.
+ * the set from the registry keeps new input skills (for example explore_area) covered
+ * without a second hand list.
  */
 const INPUT_RESOURCES: ReadonlySet<string> = new Set(['movement', 'view', 'hands', 'textEntry']);
 
@@ -53,6 +54,19 @@ export const sameBodyContext = (left: BodyContext, right: BodyContext) =>
   left.bodyEpoch === right.bodyEpoch &&
   left.dimension === right.dimension;
 
+/**
+ * Legacy planar body actions. When a 3D BodyAdapter is attached these cannot be
+ * executed by that body: their implementations read `bridge.cell/place/dig`
+ * and would silently operate a different planar shim. They are rejected with
+ * explicit codes instead of falling through to the legacy bridge path.
+ */
+const LEGACY_PLANAR_SKILL_CODES: Readonly<Record<string, string>> = {
+  place_one: 'legacy-planar-place-unsupported',
+  look_at: 'legacy-planar-orientation-unsupported',
+  dig_one: 'legacy-planar-dig-unsupported',
+  collect_nearby: 'legacy-planar-collect-unsupported',
+};
+
 /** Missing capability of the concrete body for a skill, if any. */
 export function missingSkillCapability(body: ClientBridgeCapabilities, skillId: string): string | undefined {
   // When a 3D adapter is attached it is the body for movement/gather skills. The
@@ -68,6 +82,10 @@ export function missingSkillCapability(body: ClientBridgeCapabilities, skillId: 
       case 'gather_blocks':
         if (movement) return movement;
         return adapter.findBlock && adapter.digBlock ? undefined : 'gather-capability-unavailable';
+      case 'place_one':
+      case 'look_at':
+      case 'dig_one':
+      case 'collect_nearby': return LEGACY_PLANAR_SKILL_CODES[skillId];
       default: break;
     }
   }
@@ -121,10 +139,10 @@ export class ExecutionAdmission {
     if (missing) return { ok: false, code: 'capability-unavailable', message: missing };
     // Control lost (relay/observer/helper failure, IPC control loss) is a hard admission gate.
     // It is re-evaluated immediately before the dispatch barrier, not only at plan time.
-    if (!this.controlOpen()) return { ok: false, code: 'control-revoked', message: 'bridge-control-revoked' };
     if (skillRequiresInput(request.skillId) && !this.inputsEnabled()) {
       return { ok: false, code: 'input-disabled', message: 'input-disabled' };
     }
+    if (!this.controlOpen()) return { ok: false, code: 'control-revoked', message: 'bridge-control-revoked' };
     if (request.signal?.aborted) return { ok: false, code: 'aborted', message: 'execution-aborted' };
     return { ok: true };
   }

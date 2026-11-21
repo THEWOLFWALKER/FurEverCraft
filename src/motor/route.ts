@@ -36,6 +36,29 @@ export function observationUsable(observation: WorldObservation, options: { maxA
 
 export const bodyContextKey = (context: BodyContext) => `${context.serverProfileId}|${context.worldGenerationId ?? ''}|${context.connectionEpoch}|${context.bodyEpoch}|${context.dimension}`;
 
+/**
+ * Final arrival is a continuous Vec3 check around the block centre, not merely
+ * "the same discrete block". 0.25 block is the default engineering tolerance.
+ * The planner's block nodes remain planning anchors only.
+ */
+export const DEFAULT_ARRIVAL_TOLERANCE = 0.25;
+
+export function targetCenter(target: BlockPos): Pose3D {
+  return centerOf(target);
+}
+
+/** True only when the observed pose is within `tolerance` of the target centre. */
+export function withinArrivalTolerance(pose: Pose3D, target: BlockPos, tolerance = DEFAULT_ARRIVAL_TOLERANCE): boolean {
+  const center = centerOf(target);
+  return poseDistance(pose, center) <= tolerance;
+}
+
+/** Horizontal distance from the pose to the target block centre. */
+export function horizontalTargetDistance(pose: Pose3D, target: BlockPos): number {
+  const center = centerOf(target);
+  return horizontalDistance(pose, center);
+}
+
 export function poseBlock(pose: Pose3D): BlockPos {
   return { x: Math.floor(pose.x), y: Math.floor(pose.y + 0.001), z: Math.floor(pose.z) };
 }

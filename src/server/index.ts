@@ -14,6 +14,12 @@ export type ControlServerOptions = {
   pollMs?: number;
   maxSseEvents?: number;
   maxSseBytes?: number;
+  /** Maximum concurrently attached SSE clients (default 8). Exceeding it returns 503 sse-capacity. */
+  maxSseConnections?: number;
+  /** Service-wide bytes queued to SSE sockets but not yet flushed (default 1 MiB). */
+  maxSsePendingBytes?: number;
+  /** A connection that cannot drain within this window gets an explicit gap and is closed. */
+  sseSlowConsumerMs?: number;
   maxBodyBytes?: number;
   allowedOrigin?: string;
   /** Extra Host header names accepted for same-origin checks. Loopback names are always accepted. */
@@ -26,8 +32,6 @@ export type ControlServerOptions = {
   cliBearer?: string;
   /** Pairing code lifetime (default 5 minutes). */
   pairingTtlMs?: number;
-  /** Failed pairing attempts from one local source before lockout (default 5). */
-  pairingMaxAttempts?: number;
   /** Paired browser session lifetime (default 12 hours). */
   sessionTtlMs?: number;
   /** Injectable clock for credential-expiry tests. */
@@ -36,21 +40,10 @@ export type ControlServerOptions = {
   onSseConnection?: (state: 'open' | 'closed') => void;
 };
 
-type PairingState = {
-  codeHash: string;
-  expiresAt: number;
-  used: boolean;
-  sessions: Map<string, { expiresAt: number; csrfHash: string }>;
-  /** Bounded per-source failed attempts; a lockout lasts until the one-time code expires. */
-  attempts: Map<string, { failures: number; lockedUntil?: number }>;
-};
+type PairingState = { codeHash: string; expiresAt: number; used: boolean; sessions: Map<string, { expiresAt: number; csrfHash: string }> };
 
 const SESSION_COOKIE = 'furevercraft_session';
 const LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1', '[::1]'];
-const MAX_PAIRING_SOURCES = 64;
-const DEFAULT_PAIRING_MAX_ATTEMPTS = 5;
-/** One-time local pairing code: 128 bits from the CSPRNG, rendered as 32 hex characters. */
-export function generatePairingCode(): string { return randomBytes(16).toString('hex'); }
 const hash = (value: string) => createHash('sha256').update(value).digest();
 const safeEqual = (a: string, b: string) => { const left = hash(a); const right = hash(b); return timingSafeEqual(left, right); };
 const safeEqualHashes = (left: Buffer, right: string) => timingSafeEqual(left, Buffer.from(right, 'hex'));
@@ -117,16 +110,11 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
   const app = Fastify({ logger: false, bodyLimit: options.maxBodyBytes ?? 1024 * 1024, exposeHeadRoutes: false });
   void app.register(fastifyCookie);
   const now = options.now ?? (() => Date.now());
-  const pairingMaxAttempts = Math.max(1, Math.trunc(options.pairingMaxAttempts ?? DEFAULT_PAIRING_MAX_ATTEMPTS));
-  // An explicitly configured empty/whitespace code would be pair-able with an empty request.
-  // Fail closed before serving rather than accepting an unauthenticated empty secret.
-  if (options.pairing && options.pairingCode !== undefined && !options.pairingCode.trim()) throw new Error('pairing-code-invalid');
   const pairing: PairingState | undefined = options.pairing ? {
-    codeHash: hash(options.pairingCode ?? generatePairingCode()).toString('hex'),
+    codeHash: hash(options.pairingCode ?? randomBytes(4).toString('hex')).toString('hex'),
     expiresAt: now() + (options.pairingTtlMs ?? 5 * 60_000),
     used: false,
     sessions: new Map(),
-    attempts: new Map(),
   } : undefined;
   const sessionTtlMs = options.sessionTtlMs ?? 12 * 3600_000;
   const loopbackHosts = new Set([...LOOPBACK_HOSTS, ...(options.host ?? '127.0.0.1').toLowerCase()]);
@@ -136,8 +124,49 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
   for (const host of options.allowedHosts ?? []) loopbackHosts.add(host.toLowerCase());
 
   // Exposed for tests and diagnostics; no credential material is ever attached.
-  const serverState = { activeSseConnections: 0 };
+  const serverState = { activeSseConnections: 0, pendingSseBytes: 0 };
   Object.defineProperty(app, 'activeSseConnections', { get: () => serverState.activeSseConnections, enumerable: true });
+  Object.defineProperty(app, 'activeSseBytes', { get: () => serverState.pendingSseBytes, enumerable: true });
+
+  const EFFECT_PAGE_DEFAULT = 20;
+  const EFFECT_PAGE_MAX = 100;
+  /**
+   * Effects are read as a bounded SQL page (FEC-56). The production path never materialises the
+   * whole table; a ControlService without an attached store (tests/fixtures) falls back to an
+   * in-memory page with the same shape.
+   */
+  const effectsPage = (query: { executionId?: unknown; limit?: unknown; cursor?: unknown } = {}, defaultLimit = EFFECT_PAGE_DEFAULT) => {
+    const executionId = typeof query.executionId === 'string' && query.executionId ? query.executionId : undefined;
+    const requested = Number(query.limit);
+    const limit = Number.isFinite(requested) && requested >= 1 ? Math.min(Math.trunc(requested), EFFECT_PAGE_MAX) : defaultLimit;
+    const cursor = typeof query.cursor === 'string' && query.cursor ? query.cursor : undefined;
+    if (runtime) {
+      const page = runtime.store.listEffectsPage(executionId, { limit, ...(cursor === undefined ? {} : { cursor }), maxLimit: EFFECT_PAGE_MAX });
+      return {
+        items: page.items,
+        truncated: page.truncated,
+        ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
+        limit,
+        ...(cursor === undefined ? {} : { cursor }),
+        total: runtime.store.countEffects(),
+      };
+    }
+    const all = (control.effects(executionId) as Array<{ effectId?: string; effect_id?: string }>)
+      .slice()
+      .sort((left, right) => String(left.effectId ?? left.effect_id ?? '').localeCompare(String(right.effectId ?? right.effect_id ?? '')));
+    const start = cursor === undefined ? 0 : all.findIndex(item => String(item.effectId ?? item.effect_id ?? '') > cursor);
+    const from = start < 0 ? all.length : start;
+    const items = all.slice(from, from + limit);
+    const truncated = from + items.length < all.length;
+    return {
+      items,
+      truncated,
+      ...(truncated && items.length ? { nextCursor: String(items[items.length - 1]!.effectId ?? items[items.length - 1]!.effect_id ?? '') } : {}),
+      limit,
+      ...(cursor === undefined ? {} : { cursor }),
+      total: all.length,
+    };
+  };
 
   const isLoopback = (request: FastifyRequest) => {
     // Decide from the TCP peer, never from client-settable forwarding headers. request.ip can be
@@ -211,64 +240,28 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     return true;
   };
 
-  // Public bootstrap surface: a browser must be able to learn *how* it is expected to
-  // authenticate before it holds any credential. This exposes only the enforcement mode,
-  // never the bearer, pairing code, session cookie or CSRF token. It still obeys the local
-  // loopback/Host/Origin policy so a non-local caller cannot probe the serving mode.
-  app.get('/api/v1/auth-mode', async (request, reply) => {
-    if (!isLoopback(request)) return reply.code(403).send({ error: { code: 'non-loopback-denied' } });
-    if (!hostOk(request)) return reply.code(403).send({ error: { code: 'host-not-allowed' } });
-    if (!originOk(request, reply)) return reply;
-    void reply.header('cache-control', 'no-store');
-    return {
-      mode: pairing ? 'pairing' : options.cliBearer ? 'bearer-only' : 'loopback-open',
-      pairing: Boolean(pairing),
-      bearerRequired: Boolean(!pairing && options.cliBearer),
-      browserAccess: pairing ? 'pairing' : options.cliBearer ? 'disabled' : 'open',
-    };
-  });
-
-  app.get('/api/v1/status', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.status(); });
+  // Every response below denotes runtime data that may have originated from a model, input intent
+  // or durable history. Redaction happens at this HTTP boundary (FEC-57) without touching ids,
+  // cursors or the pairing/CSRF response.
+  app.get('/api/v1/status', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact(control.status()); });
   app.get('/api/v1/capabilities', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.capabilities(); });
-  app.get('/api/v1/goals', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.goals(); });
-  app.get('/api/v1/tasks', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.goals(); });
-  app.get('/api/v1/executions', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.executions(); });
+  app.get('/api/v1/goals', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact(control.goals()); });
+  app.get('/api/v1/tasks', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact(control.goals()); });
+  app.get('/api/v1/executions', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact(control.executions()); });
   app.get('/api/v1/effects', async (request, reply) => {
     if (!authorizeRequest(request, reply)) return reply;
-    const query = request.query as { executionId?: string; limit?: string; cursor?: string };
-    try { return control.effects(query.executionId, { ...(query.limit === undefined ? {} : { limit: Number(query.limit) }), ...(query.cursor === undefined ? {} : { cursor: query.cursor }) }); }
-    catch { return reply.code(400).send({ error: { code: 'invalid-effect-cursor' } }); }
+    try { return redact(effectsPage(request.query as { executionId?: unknown; limit?: unknown; cursor?: unknown })); }
+    catch { return reply.code(400).send({ error: { code: 'invalid-effects-query' } }); }
   });
-  app.get('/api/v1/places', async (request, reply) => {
-    if (!authorizeRequest(request, reply)) return reply;
-    const query = request.query as { limit?: string; cursor?: string; status?: string };
-    try { return control.placesPage({ ...(query.limit === undefined ? {} : { limit: Number(query.limit) }), ...(query.cursor === undefined ? {} : { cursor: query.cursor }), ...(query.status === undefined ? {} : { status: query.status }) }); }
-    catch { return reply.code(400).send({ error: { code: 'invalid-memory-cursor' } }); }
-  });
-  app.get('/api/v1/memories', async (request, reply) => {
-    if (!authorizeRequest(request, reply)) return reply;
-    const query = request.query as { limit?: string; cursor?: string; status?: string };
-    try { return control.memories({ ...(query.limit === undefined ? {} : { limit: Number(query.limit) }), ...(query.cursor === undefined ? {} : { cursor: query.cursor }), ...(query.status === undefined ? {} : { status: query.status }) }); }
-    catch { return reply.code(400).send({ error: { code: 'invalid-memory-cursor' } }); }
-  });
+  app.get('/api/v1/places', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.places(); });
+  // Both places and episodes are scope-filtered by the attached runtime identity (FEC-46);
+  // the unscoped store.listEpisodes() table dump is gone.
+  app.get('/api/v1/memories', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact(control.memories()); });
   app.get('/api/v1/provider', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return control.provider(); });
   // The P21 doctor report is a read-only view over the same attached Runtime. It goes through
   // the same pairing/bearer/Origin policy as every other read and is redacted before transmission.
   app.get('/api/v1/doctor', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact(control.diagnostics()); });
-  app.get('/api/v1/config', async (request, reply) => {
-    if (!authorizeRequest(request, reply)) return reply;
-    const capabilities = control.capabilities();
-    // Keep the attached body/server id and the assembled runtime profile explicitly separate;
-    // `profile` remains the legacy alias for the body/server id.
-    return redact({
-      provider: control.provider(),
-      profile: capabilities.profile,
-      serverProfileId: capabilities.serverProfileId,
-      runtimeProfile: capabilities.runtimeProfile,
-      pairing: Boolean(pairing),
-      cliAccess: options.cliBearer ? 'configured' : 'not-configured',
-    });
-  });
+  app.get('/api/v1/config', async (request, reply) => { if (!authorizeRequest(request, reply)) return reply; return redact({ provider: control.provider(), profile: control.capabilities().profile, pairing: Boolean(pairing), cliAccess: options.cliBearer ? 'configured' : 'not-configured' }); });
   app.get('/api/v1/events', async (request, reply) => {
     if (!authorizeRequest(request, reply)) return reply;
     const query = request.query as { cursor?: string; limit?: string; filter?: string };
@@ -281,40 +274,10 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     if (!isLoopback(request)) return reply.code(403).send({ error: { code: 'non-loopback-denied' } });
     if (!hostOk(request)) return reply.code(403).send({ error: { code: 'host-not-allowed' } });
     if (!originOk(request, reply)) return reply;
-    const at = now();
-    const source = request.socket.remoteAddress ?? request.ip ?? 'unknown';
-    const attempt = pairing.attempts.get(source);
-    if (attempt?.lockedUntil !== undefined) {
-      if (attempt.lockedUntil > at) return reply.code(429).send({ error: { code: 'pairing-rate-limited', retryAfterMs: Math.max(1, attempt.lockedUntil - at) } });
-      pairing.attempts.delete(source);
-    }
-    if (at > pairing.expiresAt) return reply.code(410).send({ error: { code: 'pairing-expired' } });
+    if (now() > pairing.expiresAt) return reply.code(410).send({ error: { code: 'pairing-expired' } });
     if (pairing.used) return reply.code(409).send({ error: { code: 'pairing-used' } });
     const body = (request.body ?? {}) as { code?: string };
-    const code = typeof body.code === 'string' ? body.code : '';
-    // An empty/whitespace code is never a valid credential, even if a caller configures one.
-    const valid = code.trim().length > 0 && safeEqualHashes(Buffer.from(pairing.codeHash, 'hex'), hash(code).toString('hex'));
-    if (!valid) {
-      const failures = (attempt?.failures ?? 0) + 1;
-      if (pairing.attempts.size >= MAX_PAIRING_SOURCES && !pairing.attempts.has(source)) {
-        // Bounded per-source bookkeeping: prefer dropping an expired entry, then the oldest.
-        for (const [key, value] of pairing.attempts) {
-          if (value.lockedUntil !== undefined && value.lockedUntil <= at) { pairing.attempts.delete(key); break; }
-        }
-        if (pairing.attempts.size >= MAX_PAIRING_SOURCES) {
-          const oldest = pairing.attempts.keys().next().value as string | undefined;
-          if (oldest !== undefined) pairing.attempts.delete(oldest);
-        }
-      }
-      if (failures >= pairingMaxAttempts) {
-        // Lock the source out for the remainder of the one-time code's lifetime.
-        pairing.attempts.set(source, { failures, lockedUntil: pairing.expiresAt });
-        return reply.code(429).send({ error: { code: 'pairing-rate-limited', retryAfterMs: Math.max(1, pairing.expiresAt - at) } });
-      }
-      pairing.attempts.set(source, { failures });
-      return reply.code(401).send({ error: { code: 'pairing-code-invalid' } });
-    }
-    pairing.attempts.delete(source);
+    if (typeof body.code !== 'string' || !safeEqualHashes(Buffer.from(pairing.codeHash, 'hex'), hash(body.code).toString('hex'))) return reply.code(401).send({ error: { code: 'pairing-code-invalid' } });
     pairing.used = true;
     const session = randomBytes(32).toString('hex');
     const csrf = randomBytes(24).toString('hex');
@@ -332,9 +295,9 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     }
     try {
       const result = await control.command(parsed.data);
-      if (result.state === 'conflict') return reply.code(409).send(result);
-      if (result.state === 'rejected') return reply.code(400).send(result);
-      return result;
+      if (result.state === 'conflict') return reply.code(409).send(redact(result));
+      if (result.state === 'rejected') return reply.code(400).send(redact(result));
+      return redact(result);
     } catch (error) {
       // A bad payload must not take down the control plane or leak internals.
       return reply.code(400).send({ requestId: parsed.data.requestId, command: parsed.data.command, state: 'rejected', code: redact(error instanceof Error ? error.message : String(error)) });
@@ -344,6 +307,9 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
   app.get('/api/v1/events/stream', streamHandler);
   app.get('/events', streamHandler);
   const closeSseConnections = new Set<() => void>();
+  const maxSseConnections = Math.max(1, Math.trunc(options.maxSseConnections ?? 8));
+  const maxSsePendingBytes = Math.max(1, Math.trunc(options.maxSsePendingBytes ?? 1024 * 1024));
+  const slowConsumerMs = Math.max(1, Math.trunc(options.sseSlowConsumerMs ?? 5_000));
   function streamHandler(request: FastifyRequest, reply: FastifyReply) {
     if (!authorizeRequest(request, reply)) return reply;
     const header = request.headers['last-event-id'];
@@ -351,12 +317,24 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
     const requestedFrame = Array.isArray(header) ? header[0] : header ?? query.cursor ?? '0';
     const cursorText = String(requestedFrame);
     if (!/^\d+$/.test(cursorText)) return reply.code(400).send({ error: { code: 'invalid-event-cursor' } });
+    if (serverState.activeSseConnections >= maxSseConnections) {
+      // Capacity is checked before hijacking so a refused subscription is a normal HTTP error.
+      return reply.code(503).send({ error: { code: 'sse-capacity' } });
+    }
     reply.hijack();
     const raw = reply.raw;
-    raw.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+    serverState.activeSseConnections += 1;
+    try {
+      raw.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+    } catch {
+      serverState.activeSseConnections = Math.max(0, serverState.activeSseConnections - 1);
+      return reply;
+    }
     let position = cursorText; let closed = false; let sent = 0; let bytes = 0;
     const maxEvents = Math.max(4, options.maxSseEvents ?? 256); const maxBytes = Math.max(4096, options.maxSseBytes ?? 1024 * 1024);
-    serverState.activeSseConnections += 1;
+    let availableFrom = '0';
+    let skippedFrames = 0; let blockedSince: number | undefined;
+    const pendingSettles = new Set<() => void>();
     options.onSseConnection?.('open');
     let poll: ReturnType<typeof setInterval> | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -366,78 +344,157 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
       if (poll) clearInterval(poll);
       if (heartbeat) clearInterval(heartbeat);
       closeSseConnections.delete(finish);
+      // Write callbacks may not fire after a destroyed socket; settle local accounting once.
+      for (const settle of [...pendingSettles]) settle();
+      pendingSettles.clear();
       serverState.activeSseConnections = Math.max(0, serverState.activeSseConnections - 1);
       options.onSseConnection?.('closed');
       try { raw.end(); } catch { /* peer already gone */ }
     };
     closeSseConnections.add(finish);
     const frameOf = (event: string, payload: unknown, id?: string) => `${id === undefined ? '' : `id: ${id}\n`}event: ${event}\ndata: ${JSON.stringify(redact(payload))}\n\n`;
-    const emit = (event: string, payload: unknown, id?: string): boolean => {
+    /**
+     * Track bytes handed to the socket but not yet flushed. Node invokes the write callback
+     * after the chunk is accepted by the kernel, so the total is a real service-wide pending
+     * budget rather than a synthetic frame counter.
+     */
+    const trackWrite = (frame: string): boolean => {
       if (closed) return false;
+      const size = Buffer.byteLength(frame);
+      // Always allow one in-flight frame to make progress; otherwise the service-wide cap wins.
+      if (serverState.pendingSseBytes > 0 && serverState.pendingSseBytes + size > maxSsePendingBytes) return false;
+      serverState.pendingSseBytes += size;
+      let settled = false;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        pendingSettles.delete(settle);
+        serverState.pendingSseBytes = Math.max(0, serverState.pendingSseBytes - size);
+      };
+      pendingSettles.add(settle);
+      try { raw.write(frame, () => settle()); } catch { settle(); return false; }
+      return true;
+    };
+    type EmitResult = 'sent' | 'skipped' | 'budget' | 'closed';
+    const emit = (event: string, payload: unknown, id?: string): EmitResult => {
+      if (closed) return 'closed';
       const frame = frameOf(event, payload, id);
       const size = Buffer.byteLength(frame);
-      if (sent >= maxEvents || bytes + size > maxBytes) return false;
-      raw.write(frame); sent += 1; bytes += size; return true;
+      if (sent >= maxEvents || bytes + size > maxBytes) return 'budget';
+      if (!trackWrite(frame)) {
+        skippedFrames += 1;
+        blockedSince ??= now();
+        return 'skipped';
+      }
+      sent += 1; bytes += size;
+      skippedFrames = 0; blockedSince = undefined;
+      return 'sent';
     };
+    /** Explicit gap/snapshot frames are never silently dropped for budget reasons. */
+    const emitCritical = (event: string, payload: unknown, id?: string): boolean => {
+      if (closed) return false;
+      const frame = frameOf(event, payload, id);
+      if (!trackWrite(frame)) return false;
+      sent += 1; bytes += Buffer.byteLength(frame);
+      return true;
+    };
+    const slowConsumer = () => skippedFrames >= 64 || (blockedSince !== undefined && now() - blockedSince >= slowConsumerMs);
     const head = () => control.eventsHead();
     const snapshot = (cursor: string, gap: boolean, windowed: boolean) => {
       try {
-        const places = control.placesPage();
+        const page = effectsPage({}, EFFECT_PAGE_DEFAULT);
         return {
-          ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(), effects: control.effects(),
-          places: places.items, placesTruncated: places.truncated, ...(places.nextCursor ? { placesNextCursor: places.nextCursor } : {}),
-          provider: control.provider(), cursor, gap, ...(windowed ? { windowed: true } : {}),
+          ...control.status(), capabilities: control.capabilities(), goals: control.goals(), executions: control.executions(),
+          effects: page.items, effectPage: { truncated: page.truncated, limit: page.limit, ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }) },
+          places: control.places(), provider: control.provider(), cursor, gap, ...(windowed ? { windowed: true } : {}),
         };
       } catch (error) {
         // A closed store during shutdown must end as an explicit gap/unknown snapshot, not a
         // half-written SSE session.
-        return { state: 'closed', paused: true, stopping: true, cursor, gap: true, error: redact(error instanceof Error ? error.message : String(error)), goals: [], executions: [], effects: [], places: [] };
+        return { state: 'closed', paused: true, stopping: true, cursor, gap: true, error: redact(error instanceof Error ? error.message : String(error)), goals: [], executions: [], effects: [], effectPage: { truncated: false, limit: EFFECT_PAGE_DEFAULT }, places: [] };
       }
     };
     const overflow = (reason: string) => {
       // Reserve a final frame even when the event budget is exhausted, so a truncation is
-      // explicit instead of looking like a clean end-of-stream. The client reconnects at head.
-      try {
-        raw.write(frameOf('gap', { gap: true, reason, cursor: position, head: head(), availableFrom: availableFrom }, head()));
-      } catch { /* ignore */ }
+      // explicit instead of looking like a clean end-of-stream.
+      try { emitCritical('gap', { gap: true, reason, cursor: position, head: head(), availableFrom }, head()); } catch { /* ignore */ }
       finish();
     };
-    let availableFrom: string;
     try { availableFrom = String(control.events('0', 1).availableFrom); } catch { availableFrom = '0'; }
     const requested = Number(cursorText);
-    const headValue = Number(head());
+    const initialHeadValue = Number(head());
     let initialGap: string | undefined;
-    if (requested > headValue) initialGap = 'cursor-ahead';
+    if (requested > initialHeadValue) initialGap = 'cursor-ahead';
     else if (requested + 1 < Number(availableFrom)) initialGap = 'cursor-expired';
+    let snapshotCursor = String(initialHeadValue);
     if (initialGap) {
-      emit('gap', { gap: true, reason: initialGap, cursor: cursorText, head: String(headValue), availableFrom }, String(headValue));
-      position = String(headValue);
-    }
-    const snapshotCursor = String(headValue);
-    // Decide up front whether the unseen backlog fits this connection's budget. An overflow is
-    // announced before the snapshot so the snapshot can carry gap=true and the client knows the
-    // full state is authoritative rather than a partial replay.
-    const backlog = Math.max(0, Number(snapshotCursor) - Number(position));
-    const replayBudget = maxEvents - sent;
-    const replayOverflow = backlog > 0 && (backlog > replayBudget || backlog > 10000);
-    if (replayOverflow) {
-      emit('gap', { gap: true, reason: 'replay-overflow', cursor: position, head: snapshotCursor, availableFrom }, snapshotCursor);
+      if (!emitCritical('gap', { gap: true, reason: initialGap, cursor: snapshotCursor, from: cursorText, head: snapshotCursor, availableFrom }, snapshotCursor)) { finish(); return reply; }
       position = snapshotCursor;
     }
-    if (!emit('snapshot', snapshot(snapshotCursor, Boolean(initialGap) || replayOverflow, false), snapshotCursor)) { overflow('stream-budget'); return reply; }
-    // Replay durable events the client has not seen. If an event cannot fit, close with an
-    // explicit gap; the snapshot cursor is the reconnect point.
-    if (!replayOverflow && backlog > 0) {
-      const read = control.events(position, backlog);
-      for (const event of read.events) {
-        if (!emit(event.kind, event.payload, event.seq)) { overflow('stream-budget'); return reply; }
-        position = event.seq;
-      }
-      if (Number(position) < Number(snapshotCursor)) {
-        emit('gap', { gap: true, reason: 'replay-incomplete', cursor: position, head: snapshotCursor, availableFrom }, snapshotCursor);
-        position = snapshotCursor;
+
+    // Decide up front whether the unseen backlog fits. The snapshot frame is always last and
+    // its event slot and serialized size are reserved before any replay frame is written.
+    const backlog = Math.max(0, initialHeadValue - Number(position));
+    let replayEvents: Array<{ seq: string; kind: string; payload: unknown }> = [];
+    let replayFits = backlog === 0;
+    let replayReason = 'replay-overflow';
+    if (backlog > 0) {
+      if (backlog > 10_000) replayFits = false;
+      else {
+        try {
+          const read = control.events(position, backlog);
+          replayEvents = read.events;
+          const snapshotSize = Buffer.byteLength(frameOf('snapshot', snapshot(snapshotCursor, Boolean(initialGap), false), snapshotCursor));
+          const replayBytes = replayEvents.reduce((total, event) => total + Buffer.byteLength(frameOf(event.kind, event.payload, event.seq)), 0);
+          let monotonic = true;
+          let previous = Number(position);
+          for (const event of replayEvents) {
+            const seq = Number(event.seq);
+            if (seq <= previous || seq > initialHeadValue) { monotonic = false; break; }
+            previous = seq;
+          }
+          replayFits = replayEvents.length === backlog && monotonic
+            && sent + replayEvents.length + 1 <= maxEvents
+            && bytes + replayBytes + snapshotSize <= maxBytes;
+        } catch { replayFits = false; }
       }
     }
+
+    let snapshotSent = false;
+    if (backlog > 0 && !replayFits) {
+      // The replay cannot fit. Emit an explicit gap at head and reset with the snapshot.
+      if (!emitCritical('gap', { gap: true, reason: replayReason, cursor: snapshotCursor, from: position, head: snapshotCursor, availableFrom }, snapshotCursor)) { finish(); return reply; }
+      position = snapshotCursor;
+      if (!emitCritical('snapshot', snapshot(snapshotCursor, true, false), snapshotCursor)) { finish(); return reply; }
+      snapshotSent = true;
+    } else {
+      for (const event of replayEvents) {
+        const result = emit(event.kind, event.payload, event.seq);
+        if (result === 'sent') { position = event.seq; continue; }
+        if (result === 'closed') return reply;
+        // A connection that cannot accept the remaining replay is reset at head. Slow consumers
+        // get an explicit gap and are disconnected rather than left with a partial cursor.
+        const reason = result === 'skipped' ? 'slow-consumer' : 'replay-overflow';
+        if (!emitCritical('gap', { gap: true, reason, cursor: snapshotCursor, from: position, head: snapshotCursor, availableFrom }, snapshotCursor)) { finish(); return reply; }
+        position = snapshotCursor;
+        if (!emitCritical('snapshot', snapshot(snapshotCursor, true, false), snapshotCursor)) { finish(); return reply; }
+        snapshotSent = true;
+        if (reason === 'slow-consumer') { finish(); return reply; }
+        break;
+      }
+      if (!closed && !snapshotSent) {
+        const result = emit('snapshot', snapshot(snapshotCursor, Boolean(initialGap), false), snapshotCursor);
+        if (result === 'sent') { snapshotSent = true; position = snapshotCursor; }
+        else {
+          // The reserved slot was still insufficient (for example a snapshot larger than
+          // maxSseBytes); announce a gap so the client does not resume at a partial cursor.
+          emitCritical('gap', { gap: true, reason: 'stream-budget', cursor: position, head: snapshotCursor, availableFrom }, snapshotCursor);
+          finish(); return reply;
+        }
+      }
+    }
+    if (!snapshotSent) { finish(); return reply; }
+
     poll = setInterval(() => {
       if (closed) return;
       try {
@@ -445,19 +502,31 @@ export function createControlServer(runtimeOrControl: RuntimeAssembly | ControlS
         if (read.gap) {
           // A retained-window gap: announce it, then resend the complete snapshot at the new
           // cursor so the subscriber never resumes from a partial status document.
-          emit('gap', { gap: true, reason: 'retention-gap', availableFrom: read.availableFrom, cursor: read.scannedCursor }, read.scannedCursor);
           const nextHead = head();
-          if (!emit('snapshot', snapshot(nextHead, true, false), nextHead)) { overflow('stream-budget'); return; }
+          if (!emitCritical('gap', { gap: true, reason: 'retention-gap', availableFrom: read.availableFrom, cursor: read.scannedCursor }, read.scannedCursor)) { finish(); return; }
+          if (!emitCritical('snapshot', snapshot(nextHead, true, false), nextHead)) { finish(); return; }
           position = nextHead;
           return;
         }
         for (const event of read.events) {
-          if (!emit(event.kind, event.payload, event.seq)) { overflow('stream-budget'); return; }
-          position = event.seq;
+          const result = emit(event.kind, event.payload, event.seq);
+          if (result === 'sent') { position = event.seq; continue; }
+          if (result === 'closed') return;
+          if (result === 'budget') { overflow('stream-budget'); return; }
+          // Backpressure: skip this and later non-critical frames without advancing the cursor.
+          if (slowConsumer()) {
+            const currentHead = head();
+            emitCritical('gap', { gap: true, reason: 'slow-consumer', cursor: currentHead, from: position, head: currentHead, availableFrom }, currentHead);
+            finish();
+          }
+          return;
         }
       } catch { finish(); }
     }, options.pollMs ?? 250);
-    heartbeat = setInterval(() => { if (closed || raw.writableNeedDrain) return; try { raw.write(': heartbeat\n\n'); } catch { finish(); } }, options.heartbeatMs ?? 15_000);
+    heartbeat = setInterval(() => {
+      if (closed || raw.writableNeedDrain) return;
+      try { trackWrite(': heartbeat\n\n'); } catch { finish(); }
+    }, options.heartbeatMs ?? 15_000);
     poll.unref?.(); heartbeat.unref?.();
     request.raw.on('close', finish);
     request.raw.on('error', finish);

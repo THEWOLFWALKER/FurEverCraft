@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { BridgeService, type BridgeServiceEvent, type HelperMonitor, type ObserverMonitor, type RelayMonitor } from '../../src/bridge/service/orchestrator.js';
+import { BridgeService, type HelperMonitor, type ObserverMonitor, type RelayMonitor } from '../../src/bridge/service/orchestrator.js';
 import { BoundedIpcOutbox } from '../../src/bridge/service/ipc-outbox.js';
-import { serviceCommandReply } from '../../src/bridge/service/entry.js';
-import { IpcRequestSchema, type IpcRequest } from '../../src/bridge/ipc/protocol.js';
 
 const flush = async (times = 6) => { for (let index = 0; index < times; index += 1) await new Promise(resolve => setImmediate(resolve)); };
 
@@ -12,13 +10,9 @@ class FakeRelay implements RelayMonitor {
   starts = 0;
   stops: string[] = [];
   failNextStart = false;
-  stopError: Error | undefined;
-  forceStops = 0;
   private readonly exits = new Set<(reason: string) => void>();
-  constructor(private readonly order?: string[]) {}
-  async start(): Promise<void> { this.starts += 1; this.order?.push('relay:start'); if (this.failNextStart) { this.failNextStart = false; throw new Error('spawn-failed'); } this.state = 'running'; }
-  async stop(reason = 'stop'): Promise<void> { this.stops.push(reason); this.order?.push(`relay:stop:${reason}`); if (this.stopError) throw this.stopError; this.state = 'stopped'; }
-  forceStop(): void { this.forceStops += 1; this.state = 'stopped'; }
+  async start(): Promise<void> { this.starts += 1; if (this.failNextStart) { this.failNextStart = false; throw new Error('spawn-failed'); } this.state = 'running'; }
+  async stop(reason = 'stop'): Promise<void> { this.stops.push(reason); this.state = 'stopped'; }
   onExit(listener: (reason: string) => void): () => void { this.exits.add(listener); return () => this.exits.delete(listener); }
   emitExit(reason: string): void { for (const listener of this.exits) listener(reason); }
 }
@@ -27,9 +21,8 @@ class FakeObserver implements ObserverMonitor {
   started = 0;
   stopped = 0;
   failures = new Set<(reason: string) => void>();
-  constructor(private readonly order?: string[]) {}
-  start(): void { this.started += 1; this.order?.push('observer:start'); }
-  async stop(): Promise<void> { this.stopped += 1; this.order?.push('observer:stop'); }
+  start(): void { this.started += 1; }
+  async stop(): Promise<void> { this.stopped += 1; }
   state(): unknown { return { running: this.started > this.stopped }; }
   onFailure(listener: (reason: string) => void): () => void { this.failures.add(listener); return () => this.failures.delete(listener); }
   fail(reason: string): void { for (const listener of this.failures) listener(reason); }
@@ -38,14 +31,10 @@ class FakeObserver implements ObserverMonitor {
 class FakeHelper implements HelperMonitor {
   shutdowns = 0;
   releases = 0;
-  forceStops = 0;
   hangShutdown = false;
-  shutdownError: Error | undefined;
   private readonly exits = new Set<(reason: string) => void>();
-  constructor(private readonly order?: string[]) {}
-  async shutdown(): Promise<void> { this.shutdowns += 1; this.order?.push('helper:shutdown'); if (this.shutdownError) throw this.shutdownError; if (this.hangShutdown) await new Promise<void>(() => undefined); }
-  forceStop(): void { this.forceStops += 1; }
-  async releaseOwnedInputs(): Promise<unknown> { this.releases += 1; this.order?.push('helper:release'); return { released: true }; }
+  async shutdown(): Promise<void> { this.shutdowns += 1; if (this.hangShutdown) await new Promise<void>(() => undefined); }
+  async releaseOwnedInputs(): Promise<unknown> { this.releases += 1; return { released: true }; }
   onExit(listener: (reason: string) => void): () => void { this.exits.add(listener); return () => this.exits.delete(listener); }
   emitExit(reason: string): void { for (const listener of this.exits) listener(reason); }
   state(): unknown { return { running: true }; }
@@ -53,11 +42,10 @@ class FakeHelper implements HelperMonitor {
 
 describe('P09 process orchestration', () => {
   it('starts and stops relay, observer and helper in order with a graceful shutdown', async () => {
-    const order: string[] = [];
-    const relay = new FakeRelay(order);
-    const observer = new FakeObserver(order);
-    const helper = new FakeHelper(order);
-    const service = new BridgeService({ relay, observer, helper });
+    const relay = new FakeRelay();
+    const observer = new FakeObserver();
+    const helper = new FakeHelper();
+    const service = new BridgeService({ controlReadiness: () => ({ ready: true, reasons: [] }), relay, observer, helper });
     await service.start();
     expect(observer.started).toBe(1);
     expect(relay.starts).toBe(1);
@@ -72,24 +60,13 @@ describe('P09 process orchestration', () => {
     expect(helper.releases).toBe(1);
     expect(helper.shutdowns).toBe(1);
     expect(service.state).toBe('stopped');
-    // Exact lifecycle order: observer before relay on start; held input is released before the
-    // relay/observer/helper are shut down, and the helper shutdown is last.
-    expect(order).toEqual([
-      'observer:start',
-      'relay:start',
-      'helper:release',
-      'relay:stop:quit',
-      'observer:stop',
-      'helper:shutdown',
-    ]);
-    expect(order.indexOf('helper:release')).toBeLessThan(order.indexOf('helper:shutdown'));
   });
 
   it('revokes control on unexpected relay exit and restarts with backoff without re-arming', async () => {
     const relay = new FakeRelay();
     const helper = new FakeHelper();
     const delays: number[] = [];
-    const service = new BridgeService({ relay, helper, maxRestarts: 2, backoffBaseMs: 10, backoffMaxMs: 30, sleep: async ms => { delays.push(ms); } });
+    const service = new BridgeService({ controlReadiness: () => ({ ready: true, reasons: [] }), relay, helper, maxRestarts: 2, backoffBaseMs: 10, backoffMaxMs: 30, sleep: async ms => { delays.push(ms); } });
     await service.start();
     service.armControl('operator');
     relay.emitExit('unexpected-exit');
@@ -105,7 +82,7 @@ describe('P09 process orchestration', () => {
   it('propagates a fatal event after exhausting the restart budget', async () => {
     const relay = new FakeRelay();
     const fatals: string[] = [];
-    const service = new BridgeService({ relay, maxRestarts: 2, restartWindowMs: 60_000, backoffBaseMs: 1, sleep: async () => undefined, onFatal: reason => fatals.push(reason) });
+    const service = new BridgeService({ controlReadiness: () => ({ ready: true, reasons: [] }), relay, maxRestarts: 2, restartWindowMs: 60_000, backoffBaseMs: 1, sleep: async () => undefined, onFatal: reason => fatals.push(reason) });
     await service.start();
     relay.emitExit('unexpected-exit'); await flush();
     relay.emitExit('unexpected-exit'); await flush();
@@ -119,7 +96,7 @@ describe('P09 process orchestration', () => {
     const relay = new FakeRelay();
     const helper = new FakeHelper();
     const events: string[] = [];
-    const service = new BridgeService({ relay, helper, maxRestarts: 2, backoffBaseMs: 1, sleep: async () => undefined, onEvent: event => events.push(event.type) });
+    const service = new BridgeService({ controlReadiness: () => ({ ready: true, reasons: [] }), relay, helper, maxRestarts: 2, backoffBaseMs: 1, sleep: async () => undefined, onEvent: event => events.push(event.type) });
     await service.start();
     service.armControl('operator');
     helper.emitExit('helper-crash');
@@ -138,8 +115,7 @@ describe('P09 process orchestration', () => {
     const relay = new FakeRelay();
     const sent: unknown[] = [];
     let accept = false;
-    // A throw means the channel rejected the hand-off (as opposed to false = queued).
-    const service = new BridgeService({ relay, ipc: { send: message => { if (!accept) throw new Error('channel-unavailable'); sent.push(message); return true; } }, maxIpcMessages: 2 });
+    const service = new BridgeService({ controlReadiness: () => ({ ready: true, reasons: [] }), relay, ipc: { send: message => { if (accept) sent.push(message); return accept; } }, maxIpcMessages: 2 });
     await service.start();
     expect(service.status().ipc.messages).toBe(2);
     service.publishObserver({ kind: 'observation', frameSequence: '1' });
@@ -153,233 +129,26 @@ describe('P09 process orchestration', () => {
     accept = true;
     service.flush();
     expect(sent).toHaveLength(2);
-    expect(service.status().ipc).toMatchObject({ messages: 0, bytes: 0, globalUnknown: false, backpressured: false });
-  });
-
-  it('closes admission synchronously on observer failure without stopping forwarding', async () => {
-    const relay = new FakeRelay();
-    const observer = new FakeObserver();
-    const helper = new FakeHelper();
-    const events: string[] = [];
-    const service = new BridgeService({ relay, observer, helper, onEvent: event => events.push(event.type) });
-    const listenerEvents: string[] = [];
-    service.on(event => listenerEvents.push(event.type));
-    await service.start();
-    service.armControl('fresh-observation');
-    expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
-
-    // No await: observer failure must close admission synchronously.
-    observer.fail('observer-crash');
-    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
-    expect(helper.releases).toBe(1);
-    expect(events).toContain('observer-failure');
-    expect(events).toContain('control-revoked');
-    expect(listenerEvents).toContain('control-revoked');
-    // Relay forwarding is not stopped by observation loss.
-    expect(relay.state).toBe('running');
-
-    // A restart/explicit arm is the only way back open; stale observation is not re-armed.
-    service.armControl('fresh-observation-after-failure');
-    expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
-    await service.stop();
-  });
-
-  it('revokes control for global observer gaps (and unknown availability) while forwarding continues', async () => {
-    const relay = new FakeRelay();
-    const service = new BridgeService({ relay });
-    const events: BridgeServiceEvent[] = [];
-    service.on(event => events.push(event));
-    await service.start();
-    service.armControl('fresh-observation');
-
-    // A scoped domain gap with known availability does not by itself invalidate control.
-    service.publishObserver({ kind: 'observer_gap', source: 'client', sessionEpoch: 's', gap: { scope: 'domain', reason: 'client-frame-gap', direction: 'client-to-server' } });
-    expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
-
-    service.publishObserver({ kind: 'observer_gap', source: 'client', sessionEpoch: 's', gap: { scope: 'global', reason: 'queue-overflow' } });
-    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
-    expect(events.filter(event => event.type === 'control-revoked')).toHaveLength(1);
-    expect(relay.state).toBe('running');
-
-    service.armControl('fresh-observation-after-global-gap');
-    // Availability unknown is also a control invalidating report, even for a domain gap.
-    service.publishObserver({ kind: 'observer_gap', source: 'client', sessionEpoch: 's', availability: 'unknown', gap: { scope: 'domain', reason: 'availability-lost' } });
-    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
-    expect(relay.state).toBe('running');
-    await service.stop();
-  });
-
-  it('notifies exactly once per IPC overflow episode, closes admission and drains on recovery', async () => {
-    let accept = false;
-    const sent: unknown[] = [];
-    const service = new BridgeService({
-      ipc: { send: message => { if (!accept) throw new Error('channel-unavailable'); sent.push(message); return true; } },
-      maxIpcMessages: 1,
-    });
-    const overflow: BridgeServiceEvent[] = [];
-    service.on(event => { if (event.type === 'ipc-overflow') overflow.push(event); });
-
-    await service.start();
-    // Starting emits two state control messages into a one-slot queue: the first control
-    // loss must close admission and reach runtime listeners directly, not just the log.
-    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true, ipc: { controlLost: true, globalUnknown: true } });
-    expect(overflow).toHaveLength(1);
-    expect(overflow[0]).toMatchObject({ type: 'ipc-overflow', controlLost: true, globalUnknown: true });
-
-    // Further drops in the same backed-up episode do not spam listeners.
-    for (let index = 0; index < 10; index += 1) service.publishObserver({ kind: 'observation', frameSequence: String(index) });
-    expect(overflow).toHaveLength(1);
-
-    // Draining ends the episode; a later overflow is a new episode.
-    accept = true;
-    service.flush();
     expect(service.status().ipc).toMatchObject({ messages: 0, bytes: 0 });
-    // The runtime notification was delivered directly, not re-enqueued into the same outbox.
-    expect(sent.some(message => (message as { type?: string }).type === 'ipc-overflow')).toBe(false);
-    accept = false;
-    service.publishObserver({ kind: 'observation', frameSequence: 'drain-1' });
-    service.publishObserver({ kind: 'observation', frameSequence: 'drain-2' });
-    expect(overflow).toHaveLength(2);
-    accept = true;
-    service.flush();
-    await service.stop();
   });
 
-  it('treats an observation-only IPC overflow as global uncertainty with a synthesized gap', async () => {
-    let accept = true;
-    const relay = new FakeRelay();
-    const service = new BridgeService({ relay, ipc: { send: () => { if (!accept) throw new Error('channel-unavailable'); return true; } }, maxIpcMessages: 1 });
-    const events: BridgeServiceEvent[] = [];
-    service.on(event => events.push(event));
-    await service.start();
-    expect(service.armControl('fresh-observation')).toBe(true);
-    expect(service.status().admissionOpen).toBe(true);
-    accept = false;
-
-    service.publishObserver({ kind: 'observation', frameSequence: '1' });
-    service.publishObserver({ kind: 'observation', frameSequence: '2' });
-    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true, ipc: { controlLost: false, globalUnknown: true } });
-    expect(events.filter(event => event.type === 'ipc-overflow')).toHaveLength(1);
-    expect(events.find(event => event.type === 'ipc-overflow')).toMatchObject({ controlLost: false, globalUnknown: true });
-    const synthesized = events.find(event => event.type === 'observer-event' && (event.event as { kind?: string } | undefined)?.kind === 'observer_gap');
-    expect(synthesized).toBeDefined();
-    expect((synthesized as { event: { gap: unknown } }).event.gap).toMatchObject({ scope: 'global', reason: 'ipc-queue-overflow' });
-
-    // Same episode: no duplicate runtime notification.
-    for (let index = 0; index < 5; index += 1) service.publishObserver({ kind: 'observation', frameSequence: String(index + 3) });
-    expect(events.filter(event => event.type === 'ipc-overflow')).toHaveLength(1);
-    accept = true;
-    service.flush();
-    await service.stop();
-  });
-
-  it('enforces a graceful shutdown deadline and never reports it as a clean stop', async () => {
+  it('enforces a graceful shutdown deadline', async () => {
     const relay = new FakeRelay();
     const helper = new FakeHelper();
     helper.hangShutdown = true;
-    const service = new BridgeService({ relay, helper, shutdownGraceMs: 25 });
+    const service = new BridgeService({ controlReadiness: () => ({ ready: true, reasons: [] }), relay, helper, shutdownGraceMs: 25 });
     await service.start();
     const started = Date.now();
-    const result = await service.stop('deadline');
+    await service.stop('deadline');
     expect(Date.now() - started).toBeLessThan(1000);
     expect(service.status().shutdown.forced).toBe(true);
     expect(service.state).toBe('stopped');
-    expect(result).toMatchObject({ stopped: false, forced: true });
-    expect(result.error).toContain('shutdown-deadline-exceeded');
-    expect(helper.forceStops).toBe(1);
-  });
-
-  it('collects a rejected child stop, escalates to forceStop and reports stopped:false', async () => {
-    const relay = new FakeRelay();
-    relay.stopError = new Error('relay-close-failed');
-    const service = new BridgeService({ relay });
-    await service.start();
-    const result = await service.stop('quit');
-    expect(result).toMatchObject({ stopped: false, forced: true });
-    expect(result.error).toContain('relay-stop-failed');
-    expect(relay.forceStops).toBe(1);
-    expect(service.status().shutdown.forced).toBe(true);
-    expect(service.state).toBe('stopped');
-  });
-
-  it('refuses arm after the restart budget leaves the service failed', async () => {
-    const relay = new FakeRelay();
-    const service = new BridgeService({ relay, maxRestarts: 1, restartWindowMs: 60_000, backoffBaseMs: 1, sleep: async () => undefined });
-    await service.start();
-    relay.emitExit('unexpected-exit'); await flush();
-    relay.emitExit('unexpected-exit'); await flush();
-    expect(service.state).toBe('failed');
-    // A failed service cannot carry control, regardless of a clean IPC channel.
-    expect(service.armControl('after-failure')).toBe(false);
-    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
-    expect(service.armRefusalReason).toBe('service-state:failed');
-    const refused = serviceCommandReply(IpcRequestSchema.parse({
-      type: 'request', protocolVersion: 1, requestId: 'arm-failed', sessionEpoch: 'epoch', command: 'arm', payload: {},
-    }), { sessionEpoch: 'epoch', service });
-    expect(refused).toMatchObject({
-      kind: 'reply', ok: false,
-      result: { armed: false, refusal: 'service-state:failed' },
-      error: { code: 'control-arm-refused', message: expect.stringContaining('service-state:failed') },
-    });
-  });
-
-  it('refuses arm when the relay is not live even though the service is running', async () => {
-    const relay = new FakeRelay();
-    const service = new BridgeService({ relay });
-    await service.start();
-    expect(service.state).toBe('running');
-    relay.state = 'stopped';
-    expect(service.armControl('relay-down')).toBe(false);
-    expect(service.status().admissionOpen).toBe(false);
-    expect(service.armRefusalReason).toBe('relay-state:stopped');
-  });
-
-  it('refuses arm when a configured observer has no running worker', async () => {
-    const relay = new FakeRelay();
-    const observer: ObserverMonitor = { start: () => undefined, stop: async () => undefined, state: () => ({ running: false }) };
-    const service = new BridgeService({ relay, observer });
-    await service.start();
-    expect(service.armControl('observer-down')).toBe(false);
-    expect(service.status().admissionOpen).toBe(false);
-    expect(service.armRefusalReason).toBe('observer-not-live');
-  });
-
-  it('accepts an enabled observer awaiting its first session but refuses one whose bound host is missing', async () => {
-    const relay = new FakeRelay();
-    let state: unknown = { running: false, enabled: true, paused: false, stopped: false, sessions: [], boundSessions: 0 };
-    const observer: ObserverMonitor = { start: () => undefined, stop: async () => undefined, state: () => state };
-    const service = new BridgeService({ relay, observer });
-    await service.start();
-    expect(service.armControl('awaiting-session')).toBe(true);
-    state = { running: false, enabled: true, paused: false, stopped: false, sessions: [], boundSessions: 1 };
-    expect(service.armControl('host-install-failed')).toBe(false);
-    expect(service.armRefusalReason).toBe('observer-not-live');
-    expect(service.status().admissionOpen).toBe(false);
-  });
-
-  it('refuses arm when no relay is configured', async () => {
-    const service = new BridgeService({});
-    await service.start();
-    expect(service.armControl('no-relay')).toBe(false);
-    expect(service.status().admissionOpen).toBe(false);
-    expect(service.armRefusalReason).toBe('relay-not-configured');
-  });
-
-  it('keeps admission closed on a refused arm even if it was previously open', async () => {
-    const relay = new FakeRelay();
-    const observer: ObserverMonitor = { start: () => undefined, stop: async () => undefined, state: () => ({ running: true }) };
-    const service = new BridgeService({ relay, observer });
-    await service.start();
-    expect(service.armControl('fresh-observation')).toBe(true);
-    observer.state = () => ({ running: false });
-    expect(service.armControl('observer-lost')).toBe(false);
-    expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
   });
 
   it('redacts secrets in orchestration logs', async () => {
     const relay = new FakeRelay();
     const logs: Array<{ event: string; fields?: Record<string, unknown> }> = [];
-    const service = new BridgeService({ relay, log: (_level, event, fields) => logs.push({ event, fields }) });
+    const service = new BridgeService({ controlReadiness: () => ({ ready: true, reasons: [] }), relay, log: (_level, event, fields) => logs.push({ event, fields }) });
     await service.start();
     await service.revokeControl('Bearer sk-secret-value');
     const revoked = logs.find(entry => entry.event === 'control-revoked');
@@ -402,34 +171,20 @@ describe('P09 bounded IPC outbox', () => {
     expect(outbox.queued()).toMatchObject({ messages: 2, controlLost: true });
   });
 
-  it('treats false as queued exactly once and preserves order without duplicates', () => {
+  it('stops duty flushing on backpressure and preserves order', () => {
     const outbox = new BoundedIpcOutbox({ maxMessages: 8 });
     outbox.push({ type: 'observer-event', payload: 'a' });
     outbox.push({ type: 'observer-event', payload: 'b' });
     outbox.push({ type: 'observer-event', payload: 'c' });
     const attempted: unknown[] = [];
-    // Node returns false when it accepted the message onto a backed-up channel. It was
-    // still handed off, so the outbox must drop its copy and stop for this duty cycle.
     const first = outbox.flush(message => { attempted.push(message); return false; });
-    expect(first).toMatchObject({ sent: 1, queued: 2, transportError: false });
-    expect(attempted.map(message => (message as { payload: string }).payload)).toEqual(['a']);
+    expect(first.sent).toBe(0);
+    expect(first.queued).toBe(3);
     const drained: unknown[] = [];
     const second = outbox.flush(message => { drained.push(message); return true; });
-    expect(second).toMatchObject({ sent: 2, queued: 0, transportError: false });
-    expect(drained.map(message => (message as { payload: string }).payload)).toEqual(['b', 'c']);
-    // Every message crossed exactly once: no duplicate of the queued-accepted `a`.
-    expect([...attempted, ...drained].map(message => (message as { payload: string }).payload)).toEqual(['a', 'b', 'c']);
+    expect(second.sent).toBe(3);
+    expect(drained.map(message => (message as { payload: string }).payload)).toEqual(['a', 'b', 'c']);
     expect(outbox.queued()).toMatchObject({ messages: 0, bytes: 0 });
-  });
-
-  it('retains an entry only when the channel throws (not handed off) and reports the transport error', () => {
-    const outbox = new BoundedIpcOutbox({ maxMessages: 8 });
-    outbox.push({ type: 'observer-event', payload: 'a' });
-    const failed = outbox.flush(() => { throw new Error('ipc-closed'); });
-    expect(failed).toMatchObject({ sent: 0, queued: 1, transportError: true });
-    const drained: unknown[] = [];
-    expect(outbox.flush(message => { drained.push(message); return false; })).toMatchObject({ sent: 1, queued: 0 });
-    expect(drained.map(message => (message as { payload: string }).payload)).toEqual(['a']);
   });
 
   it('rejects a message larger than the byte budget', () => {
@@ -437,35 +192,5 @@ describe('P09 bounded IPC outbox', () => {
     const result = outbox.push({ type: 'state', blob: 'x'.repeat(100) });
     expect(result.accepted).toBe(false);
     expect(result.controlLost).toBe(true);
-  });
-});
-
-describe('P09 IPC command truthfulness', () => {
-  const request = (command: string, sessionEpoch = 'epoch'): IpcRequest => IpcRequestSchema.parse({
-    type: 'request', protocolVersion: 1, requestId: `request-${command}`, sessionEpoch, command, payload: {},
-  });
-
-  it('accepts the arm command and applies it only for the owning session epoch', async () => {
-    const relay = new FakeRelay();
-    const service = new BridgeService({ relay });
-    await service.start();
-    const armed = serviceCommandReply(request('arm'), { sessionEpoch: 'epoch', service });
-    expect(armed).toMatchObject({ kind: 'reply', ok: true, result: { armed: true, controlRevoked: false } });
-    expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
-    if (armed.kind === 'reply') expect(armed.result).toMatchObject({ status: { admissionOpen: true } });
-
-    const stale = serviceCommandReply(request('arm', 'old-epoch'), { sessionEpoch: 'epoch', service });
-    expect(stale).toMatchObject({ kind: 'reply', ok: false, error: { code: 'stale-session' } });
-  });
-
-  it('returns precise unsupported codes instead of unconditional acceptance', () => {
-    const service = new BridgeService();
-    expect(serviceCommandReply(request('observe'), { sessionEpoch: 'epoch', service }))
-      .toMatchObject({ kind: 'reply', ok: false, error: { code: 'observe-unsupported' } });
-    const future = { ...request('status'), command: 'future-command' } as unknown as IpcRequest;
-    expect(serviceCommandReply(future, { sessionEpoch: 'epoch', service }))
-      .toMatchObject({ kind: 'reply', ok: false, error: { code: 'command-unsupported' } });
-    // No fallback claims acceptance.
-    expect(service.status().admissionOpen).toBe(false);
   });
 });

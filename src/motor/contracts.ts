@@ -27,14 +27,17 @@ export type BodyCapabilities = {
 };
 /** Capabilities that are actually implemented and may be planned against today. */
 export const SIMULATED_BODY_CAPABILITIES: BodyCapabilities = { threeDimensional: true, turn: true, walk: true, stop: true, jump: 'short', jumpMaxRise: 1, stepUp: false, controlledDrop: false };
-/**
- * The legacy 2D contract has no guaranteed orientation surface (`lookAt` is optional), so it
- * must not advertise `turn`. A caller that requires turn on a legacy body must prove it from
- * the concrete adapter/bridge instead of relying on this conservative capability report.
- */
-export const LEGACY_2D_CAPABILITIES: BodyCapabilities = { threeDimensional: false, turn: false, walk: true, stop: true, jump: 'none', jumpMaxRise: 0, stepUp: false, controlledDrop: false };
+export const LEGACY_2D_CAPABILITIES: BodyCapabilities = { threeDimensional: false, turn: true, walk: true, stop: true, jump: 'none', jumpMaxRise: 0, stepUp: false, controlledDrop: false };
 
 export type ObservedCell = { pos: BlockPos; cell: CellKnowledge; shape: ShapeKind; block?: string; revision: string };
+
+/**
+ * Support is tri-state. `unknown` (for example because the supporting cell was
+ * not in the observed volume) is never collapsed to `unsupported`: airborne and
+ * not-observed are different facts and only `supported` may confirm arrival.
+ */
+export type SupportState = 'supported' | 'unsupported' | 'unknown';
+
 export type WorldObservation = {
   context: BodyContext;
   /** Dimension is explicit and never derived from a 2D coordinate. */
@@ -43,7 +46,10 @@ export type WorldObservation = {
   observedAt: number;
   pose: Pose3D;
   velocity: Vec3;
+  /** Backwards-compatible boolean. Consumers that need the third state use `support`. */
   supported: boolean;
+  /** Optional tri-state support. When absent it is derived from `supported`. */
+  support?: SupportState;
   freshness: 'current' | 'stale' | 'unknown';
   gap: boolean;
   source: BodySource;
@@ -52,6 +58,18 @@ export type WorldObservation = {
   cells: ReadonlyMap<string, ObservedCell>;
   worldRevision?: string;
 };
+
+/** Resolve the tri-state support without upgrading `unknown` to a boolean guess. */
+export function observationSupport(observation: Pick<WorldObservation, 'supported' | 'support'>): SupportState {
+  return observation.support ?? (observation.supported ? 'supported' : 'unsupported');
+}
+
+/**
+ * Per-call observation budget. An adapter must abort its underlying work when
+ * `signal` fires or the clock reaches `deadline`; the controller additionally
+ * races the promise so a non-cooperative adapter cannot stall the control loop.
+ */
+export type ObserveOptions = { signal?: AbortSignal; deadline?: number };
 
 export type MotionDirection = { x: number; y: number; z: number };
 /**
@@ -86,7 +104,12 @@ export interface InputSink {
 
 export type GatherResult = { accepted: boolean; ambiguous?: boolean; collected: number; items: string[]; commandId?: string };
 
-export interface BodyAdapter extends InputSink {
+/**
+ * Read-only body port. Controllers, skills and diagnostics that only need to
+ * observe the body depend on this surface, not on the ability to push input.
+ * A write-capable body is a `BodyAdapter` (below), which adds `InputSink`.
+ */
+export interface BodyPort {
   readonly context: BodyContext;
   readonly capabilities: BodyCapabilities;
   readonly source: BodySource;
@@ -102,7 +125,7 @@ export interface BodyAdapter extends InputSink {
    * observation age is meaningless. Real adapters may share the Runtime clock.
    */
   readonly clock?: import('../contracts/index.js').Clock;
-  observe(): Promise<WorldObservation>;
+  observe(options?: ObserveOptions): Promise<WorldObservation>;
   /**
    * Optional synchronous view of the same observation `observe()` returns.
    * Control/status reads are synchronous; an adapter that can provide this
@@ -113,9 +136,19 @@ export interface BodyAdapter extends InputSink {
   advance?(ticks: number): void;
   findPlace?(placeId: string): Promise<BlockPos | undefined>;
   findBlock?(block: string): Promise<BlockPos | undefined>;
+}
+
+/**
+ * The write side of a body: input submission/release plus the optional
+ * higher-level action primitives. Kept separate from `BodyPort` so read-only
+ * consumers can be type-checked without a write capability.
+ */
+export interface BodyWritePort extends InputSink {
   digBlock?(pos: BlockPos, block: string): Promise<GatherResult>;
   collectNearby?(): Promise<{ accepted: boolean; collected: number; items: string[] }>;
 }
+
+export interface BodyAdapter extends BodyPort, BodyWritePort {}
 
 const BODY_ADAPTER = Symbol.for('furevercraft.body-adapter');
 export function attachBodyAdapter(bridge: object, adapter: BodyAdapter): void {
@@ -154,6 +187,7 @@ export type BodyStateView = {
   source: BodySource | 'legacy-2d';
   gap: boolean;
   supported?: boolean;
+  support?: SupportState;
   observedAt?: number;
   context: BodyContext;
 };
@@ -171,6 +205,7 @@ export function bodyStateFromObservation(observation: WorldObservation): BodySta
     source: observation.source,
     gap: observation.gap,
     supported: observation.supported,
+    support: observationSupport(observation),
     observedAt: observation.observedAt,
     context: { ...observation.context },
   };

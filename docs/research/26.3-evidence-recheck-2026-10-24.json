@@ -1,0 +1,205 @@
+{
+  "baseline": "17cdf063cd8b97af8d7a8d7094116870e11fdd1e",
+  "checkedAt": "2026-10-24",
+  "results": [
+    {
+      "path": "version.json",
+      "expected": "88bec449ce0f0d2eae011c004bd0f6f0c2487111759bf7773f5231e7257a1f67",
+      "actual": "88bec449ce0f0d2eae011c004bd0f6f0c2487111759bf7773f5231e7257a1f67",
+      "match": true,
+      "bytes": 426,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/version.json"
+    },
+    {
+      "path": "pack.mcmeta",
+      "expected": "445e02cadfc0787dd57826f4ff234c14247d337db9d4b8782df65621477f6b9f",
+      "actual": "445e02cadfc0787dd57826f4ff234c14247d337db9d4b8782df65621477f6b9f",
+      "match": true,
+      "bytes": 239,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/pack.mcmeta"
+    },
+    {
+      "path": "data/minecraft/recipe/chest.json",
+      "expected": "a2138509c2a81236a271552e7249643bc1b251779a3284a64036b15d40859f2d",
+      "actual": "a2138509c2a81236a271552e7249643bc1b251779a3284a64036b15d40859f2d",
+      "match": true,
+      "bytes": 185,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/recipe/chest.json"
+    },
+    {
+      "path": "data/minecraft/recipe/oak_button.json",
+      "expected": "a0576d800d960f25439255eea2d4801f65917119f259d8c5f5b0389ae7df8324",
+      "actual": "a0576d800d960f25439255eea2d4801f65917119f259d8c5f5b0389ae7df8324",
+      "match": true,
+      "bytes": 201,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/recipe/oak_button.json"
+    },
+    {
+      "path": "data/minecraft/recipe/yellow_dye_from_dandelion.json",
+      "expected": "4728bf94b3a518ea7c1b79ede2a30680bcd722d6c91a4edcd200e79dfff8fea1",
+      "actual": "4728bf94b3a518ea7c1b79ede2a30680bcd722d6c91a4edcd200e79dfff8fea1",
+      "match": true,
+      "bytes": 171,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/recipe/yellow_dye_from_dandelion.json"
+    },
+    {
+      "path": "data/minecraft/recipe/baked_potato.json",
+      "expected": "4956343d57cc9fb0e6a361b335981e0f6e1788aa5bd5016609ac167bf222d13f",
+      "actual": "4956343d57cc9fb0e6a361b335981e0f6e1788aa5bd5016609ac167bf222d13f",
+      "match": true,
+      "bytes": 190,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/recipe/baked_potato.json"
+    },
+    {
+      "path": "data/minecraft/recipe/poplar_planks.json",
+      "expected": "f660edc7c9a6c8e5035fec710dc4157811daa19127779ef1b4fd318ecc7be288",
+      "actual": "f660edc7c9a6c8e5035fec710dc4157811daa19127779ef1b4fd318ecc7be288",
+      "match": true,
+      "bytes": 215,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/recipe/poplar_planks.json"
+    },
+    {
+      "path": "data/minecraft/recipe/straw_bed.json",
+      "expected": "26e1f130797a95ebeb585f41aab62b3d3c9fd4107b2514ac060317cc7d823785",
+      "actual": "26e1f130797a95ebeb585f41aab62b3d3c9fd4107b2514ac060317cc7d823785",
+      "match": true,
+      "bytes": 185,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/recipe/straw_bed.json"
+    },
+    {
+      "path": "data/minecraft/recipe/mushroom_stew.json",
+      "expected": "c742a6108eca2da160f10f067fab227d719a641aa845ef094a6d791b19af676e",
+      "actual": "c742a6108eca2da160f10f067fab227d719a641aa845ef094a6d791b19af676e",
+      "match": true,
+      "bytes": 228,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/recipe/mushroom_stew.json"
+    },
+    {
+      "path": "data/minecraft/recipe/white_cushion.json",
+      "expected": "d47e69d68e2757eb191905798a0658cd2bcb27888ec2ca095bbc9befaf9ef3b1",
+      "actual": "d47e69d68e2757eb191905798a0658cd2bcb27888ec2ca095bbc9befaf9ef3b1",
+      "match": true,
+      "bytes": 201,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/recipe/white_cushion.json"
+    },
+    {
+      "path": "data/minecraft/tags/item/logs.json",
+      "expected": "439a696d433df1387db440b32017d1ae9a5b1ffad9ffce5d5c9cdc3a02b29484",
+      "actual": "439a696d433df1387db440b32017d1ae9a5b1ffad9ffce5d5c9cdc3a02b29484",
+      "match": true,
+      "bytes": 116,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/tags/item/logs.json"
+    },
+    {
+      "path": "data/minecraft/tags/item/logs_that_burn.json",
+      "expected": "6697c4380b98c6d240f59ba291974c61067e6e4e45bce4464ed7a0a15c333b93",
+      "actual": "6697c4380b98c6d240f59ba291974c61067e6e4e45bce4464ed7a0a15c333b93",
+      "match": true,
+      "bytes": 322,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/tags/item/logs_that_burn.json"
+    },
+    {
+      "path": "data/minecraft/tags/item/poplar_logs.json",
+      "expected": "9f2c1c5cf9a53e7cb2d21dc770b4c10c1bde4fefe5c2c46e1c3d95b53b69e968",
+      "actual": "9f2c1c5cf9a53e7cb2d21dc770b4c10c1bde4fefe5c2c46e1c3d95b53b69e968",
+      "match": true,
+      "bytes": 152,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/tags/item/poplar_logs.json"
+    },
+    {
+      "path": "data/minecraft/tags/item/mushrooms.json",
+      "expected": "4416eaf0cb32ddf49c68f18e52ca63860af853c46fcc2dffe3669b65b2582180",
+      "actual": "4416eaf0cb32ddf49c68f18e52ca63860af853c46fcc2dffe3669b65b2582180",
+      "match": true,
+      "bytes": 114,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/tags/item/mushrooms.json"
+    },
+    {
+      "path": "data/minecraft/loot_table/blocks/oak_leaves.json",
+      "expected": "e1c58772bb83cb72bda1638ac2b3aa8d217d04dafeb25c023e05d3ea2fea8983",
+      "actual": "e1c58772bb83cb72bda1638ac2b3aa8d217d04dafeb25c023e05d3ea2fea8983",
+      "match": true,
+      "bytes": 3208,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/loot_table/blocks/oak_leaves.json"
+    },
+    {
+      "path": "data/minecraft/predicate/tool/can_shear.json",
+      "expected": "df7789475f06b2749d5ed2abed03d338aab91b52ffa0f21c5d5c7086d7128868",
+      "actual": "df7789475f06b2749d5ed2abed03d338aab91b52ffa0f21c5d5c7086d7128868",
+      "match": true,
+      "bytes": 90,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "538b2b167248c648b2198f2c0d56eced10dfc0cf",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/538b2b167248c648b2198f2c0d56eced10dfc0cf/data/minecraft/predicate/tool/can_shear.json"
+    },
+    {
+      "path": "item_components/data.json",
+      "expected": "6f55ec3af4a0876988a2a10479200a7da8472d28875a774f2c0e51fe14ecb482",
+      "actual": "6f55ec3af4a0876988a2a10479200a7da8472d28875a774f2c0e51fe14ecb482",
+      "match": true,
+      "bytes": 1169351,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "d96c75fec200c4580dd75e033a76341521165461",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/d96c75fec200c4580dd75e033a76341521165461/item_components/data.json"
+    },
+    {
+      "path": "item/data.json",
+      "expected": "9c564cecf0358caaaa03e5b6501174a2879331e86d2820e2c475a24465f2f9cc",
+      "actual": "9c564cecf0358caaaa03e5b6501174a2879331e86d2820e2c475a24465f2f9cc",
+      "match": true,
+      "bytes": 35435,
+      "source": "misode/mcmeta",
+      "source_version": "26.3",
+      "commit": "2240df2376509bfaf12becbb36e156e29f8ecb4d",
+      "immutable_url": "https://github.com/misode/mcmeta/blob/2240df2376509bfaf12becbb36e156e29f8ecb4d/item/data.json"
+    }
+  ],
+  "note": "18 raw JSON/data file hashes independently rechecked; no full import, game assets, JAR or runtime compatibility verification."
+}

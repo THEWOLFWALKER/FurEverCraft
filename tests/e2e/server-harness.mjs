@@ -9,11 +9,6 @@
  * The injected model provider is a deterministic offline fixture. Only an explicit browser
  * message ("execute placement") produces a tool call; scheduler wakes and other commands return
  * a text turn. This keeps the browser workflow reproducible without pretending to call a model.
- *
- * This in-process harness is retained only for cases that need an injected provider and bridge
- * fault (`ambiguous` placement); those dependencies are not exposed by the public serve CLI.
- * The public `serve --profile`, `--db`, `--no-pairing` and `--cli-bearer` path is exercised by
- * spawning the compiled CLI in the spec instead of duplicating that assembly here.
  */
 import { createRuntime } from '../../dist/execution/factory.js';
 import { createControlServer } from '../../dist/server/index.js';
@@ -27,8 +22,9 @@ const arg = (name, fallback) => {
 
 const db = arg('--db');
 const webRoot = arg('--web-root', 'dist/web');
-const pairingCode = arg('--pairing-code', 'e2e-pair-code');
-const cliBearer = arg('--cli-bearer', 'e2e-cli-bearer');
+// Credentials come from the environment, not argv (FEC-20).
+const pairingCode = process.env.MINECRAFT_AGENT_PAIRING_CODE ?? 'e2e-pair-code';
+const cliBearer = process.env.MINECRAFT_AGENT_CLI_TOKEN ?? 'e2e-cli-bearer';
 const host = arg('--host', '127.0.0.1');
 if (!db) {
   console.error(JSON.stringify({ ready: false, error: 'missing-db-argument' }));
@@ -74,7 +70,7 @@ async function shutdown(exitCode = 0) {
   if (closing) return;
   closing = true;
   try { if (server) await server.close(); } catch { /* best effort */ }
-  try { if (runtime) runtime.close(); } catch { /* best effort */ }
+  try { if (runtime) await runtime.close(); } catch { /* best effort */ }
   process.exit(exitCode);
 }
 
@@ -105,6 +101,6 @@ try {
   // Startup failure is explicit and non-zero: the Playwright helper refuses the test run.
   console.error(JSON.stringify({ ready: false, error: error instanceof Error ? error.message : String(error) }));
   try { if (server) await server.close(); } catch { /* best effort */ }
-  try { if (runtime) runtime.close(); } catch { /* best effort */ }
+  try { if (runtime) await runtime.close(); } catch { /* best effort */ }
   process.exit(2);
 }

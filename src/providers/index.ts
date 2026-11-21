@@ -3,6 +3,9 @@ import { AnthropicProvider } from './anthropic/index.js';
 import { UnavailableProvider, type ModelProvider } from './scripted/index.js';
 import type { HttpTransport } from './shared.js';
 
+export { classifyToolCall, createToolClassifier, defaultWriteTools, DEFAULT_CONTROL_WRITE_TOOLS, DEFAULT_WRITE_TOOLS, isMutationClass } from './tools.js';
+export type { ToolClass, ToolClassifierOptions } from './tools.js';
+
 export type ConfiguredProviderName = 'openai' | 'anthropic';
 
 export type ConfiguredProviderOptions = {

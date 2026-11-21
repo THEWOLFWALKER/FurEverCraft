@@ -22,44 +22,12 @@ export const REQUEST_DEADLINE_MS = 60_000;
 export const DEFAULT_MAX_CONCURRENT_REQUESTS = 2;
 export const DEFAULT_MAX_QUEUED_REQUESTS = 8;
 export const DEFAULT_MAX_SHARED_RETRIES = 8;
-/** Retry tokens are a rolling-window budget, not a lifetime allowance. */
-export const DEFAULT_RETRY_WINDOW_MS = 60_000;
 
 export const utf8Bytes = (value: string) => new TextEncoder().encode(value).byteLength;
 export const jsonText = (value: unknown) => typeof value === 'string' ? value : JSON.stringify(value);
-/** Normalize an untrusted usage counter; malformed counts are 0 rather than NaN/types. */
-export const tokenCount = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
 export function parseToolArguments(value: string, provider?: string): unknown {
   if (utf8Bytes(value) > MAX_TOOL_ARGUMENT_BYTES) throw new ProviderError('provider-tool-arguments-limit', undefined, provider);
   try { return JSON.parse(value || '{}'); } catch { throw new ProviderError('provider-incomplete-tool-json', undefined, provider); }
-}
-
-/**
- * Normalize provider tool-call arguments to a JSON string. An absent/blank payload is the
- * empty object, never the invalid serialized form `""`. Anything else must already be valid
- * JSON; a truncated fragment is rejected before it can enter canonical history.
- */
-export function normalizeToolArguments(value: unknown, provider?: string): string {
-  if (value === undefined || value === null) return '{}';
-  if (typeof value !== 'string') throw new ProviderError('provider-invalid-tool-call', undefined, provider);
-  if (!value.trim()) return '{}';
-  parseToolArguments(value, provider);
-  return value;
-}
-
-/** Stop reasons that mean the provider cut the answer off. They are never a successful end. */
-export const TRUNCATING_STOP_REASONS: ReadonlySet<string> = new Set(['length', 'max_tokens']);
-
-/**
- * Validate a provider stop reason. Only provider-specific successful terminal reasons are
- * accepted; truncation and unknown/unexpected reasons become non-retryable provider errors so
- * the command layer can surface a rejected/canceled outcome instead of a terminal success.
- */
-export function validateResponseStop(stopReason: unknown, allowed: ReadonlySet<string>, provider?: string): string {
-  if (typeof stopReason !== 'string' || !stopReason) throw new ProviderError('provider-invalid-response', undefined, provider);
-  if (TRUNCATING_STOP_REASONS.has(stopReason)) throw new ProviderError(`provider-response-truncated:${stopReason}`, undefined, provider, false);
-  if (!allowed.has(stopReason)) throw new ProviderError(`provider-response-unexpected-stop:${stopReason}`, undefined, provider, false);
-  return stopReason;
 }
 
 export const SSE_DONE = Symbol('sse-done');
@@ -111,48 +79,34 @@ const isRetryable = (error: unknown) => error instanceof ProviderError && error.
 export type SharedRuntimeOptions = {
   maxConcurrent?: number;
   maxQueued?: number;
-  /**
-   * Retry tokens shared by every provider that receives this runtime within any rolling
-   * `retryWindowMs` window. The budget resets as old tokens age out, so a long-lived runtime
-   * cannot be permanently starved by an early burst.
-   */
+  /** Retry tokens shared by every provider that receives this runtime. */
   maxRetries?: number;
-  /** Length of the rolling retry window. Default 60s. */
-  retryWindowMs?: number;
-  /** Injectable wall clock for the retry window (tests and deterministic traces). */
-  now?: () => number;
   deadlineMs?: number;
 };
 
 /**
  * A bounded request domain. `maxQueued` rejects work instead of growing without limit;
- * `maxRetries` is a rolling-window budget shared by every provider using this runtime, so a
- * burst of retries across OpenAI and Anthropic cannot multiply the allowance, while a later
- * request is not denied by tokens consumed long ago.
+ * `maxRetries` is consumed globally so switching between OpenAI and Anthropic cannot
+ * multiply the retry allowance.
  */
 export class SharedProviderRuntime {
   private active = 0;
   private readonly waiting: Array<{ resolve: (release: () => void) => void; reject: (error: unknown) => void; signal?: AbortSignal; onAbort?: () => void }> = [];
-  /** Consumed retry timestamps inside the current rolling window. */
-  private readonly retryTimestamps: number[] = [];
+  private retriesUsed = 0;
   private readonly controllers = new Set<AbortController>();
   readonly maxConcurrent: number;
   readonly maxQueued: number;
   readonly maxRetries: number;
-  readonly retryWindowMs: number;
   readonly deadlineMs: number;
-  private readonly now: () => number;
   constructor(options: SharedRuntimeOptions = {}) {
     this.maxConcurrent = Math.max(1, options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT_REQUESTS);
     this.maxQueued = Math.max(0, options.maxQueued ?? DEFAULT_MAX_QUEUED_REQUESTS);
     this.maxRetries = Math.max(0, options.maxRetries ?? DEFAULT_MAX_SHARED_RETRIES);
-    this.retryWindowMs = Math.max(1, options.retryWindowMs ?? DEFAULT_RETRY_WINDOW_MS);
-    this.now = options.now ?? Date.now;
     this.deadlineMs = Math.max(1, options.deadlineMs ?? REQUEST_DEADLINE_MS);
   }
   get inFlight() { return this.active; }
   get queued() { return this.waiting.length; }
-  get sharedRetriesUsed() { this.pruneRetries(); return this.retryTimestamps.length; }
+  get sharedRetriesUsed() { return this.retriesUsed; }
   /** Synchronous fast path so a request starts before the caller's next statement/cancel. */
   tryAcquire(): (() => void) | undefined {
     if (this.active >= this.maxConcurrent) return undefined;
@@ -186,16 +140,11 @@ export class SharedProviderRuntime {
       }
     };
   }
-  /** Consume one shared retry token. Returns false when the rolling window budget is exhausted. */
+  /** Consume one shared retry token. Returns false when the shared budget is exhausted. */
   consumeRetry(): boolean {
-    this.pruneRetries();
-    if (this.retryTimestamps.length >= this.maxRetries) return false;
-    this.retryTimestamps.push(this.now());
+    if (this.retriesUsed >= this.maxRetries) return false;
+    this.retriesUsed++;
     return true;
-  }
-  private pruneRetries(): void {
-    const cutoff = this.now() - this.retryWindowMs;
-    while (this.retryTimestamps.length && this.retryTimestamps[0]! <= cutoff) this.retryTimestamps.shift();
   }
   register(controller: AbortController) { this.controllers.add(controller); }
   unregister(controller: AbortController) { this.controllers.delete(controller); }

@@ -242,7 +242,7 @@ describe('P03 execution and effect boundary', () => {
     const bridge = new FakeClientBridge();
     const runtime = createRuntime({ bridge, clock: new ManualClock() });
     try {
-      runtime.store.saveGoal({ goalId: 'goal-p03', revision: 1, status: 'active', text: 'place', context: bridge.context });
+      runtime.store.saveGoal({ goalId: 'goal-p03', revision: 1, status: 'active', text: 'place' });
       const result = await runtime.router.invoke(placeCall('stale-goal'), { goalId: 'goal-p03', goalRevision: 0 });
       expect(result).toMatchObject({ ok: false, error: 'goal-revision-conflict' });
       expect(bridge.inventory).toBe(8);
@@ -277,7 +277,7 @@ describe('P03 execution and effect boundary', () => {
     const bridge = new FakeClientBridge();
     const runtime = createRuntime({ bridge, clock: new ManualClock() });
     try {
-      runtime.store.saveGoal({ goalId: 'goal-p03', revision: 1, status: 'active', text: 'place', context: bridge.context });
+      runtime.store.saveGoal({ goalId: 'goal-p03', revision: 1, status: 'active', text: 'place' });
       const result = await runtime.router.invoke(placeCall('barrier-hit'), { goalId: 'goal-p03', goalRevision: 1 });
       expect(result.ok).toBe(true);
       expect(bridge.cell(1, 0)).toBe('blocked');
@@ -314,12 +314,14 @@ describe('P03 execution and effect boundary', () => {
     const bridge = new FakeClientBridge();
     const runtime = createRuntime({ bridge, clock: new ManualClock() });
     const store = runtime.store;
-    const original = store.updateEffect.bind(store);
+    // The durable barrier now goes through transitionEffect (the ActionGateway/EffectCoordinator
+    // path); the old updateEffect write shim no longer carries effect writes.
+    const original = store.transitionEffect.bind(store);
     let failBarrier = true;
-    store.updateEffect = (effectId, status, evidence) => {
+    store.transitionEffect = ((effectId: string, status: string, evidence: unknown, options?: { actor?: string; expectedRevision?: number; evidenceRef?: string }) => {
       if (status === 'may-have-dispatched' && failBarrier) { failBarrier = false; throw new Error('barrier-write-failed'); }
-      return original(effectId, status, evidence);
-    };
+      return original(effectId, status, evidence, options);
+    }) as typeof store.transitionEffect;
     try {
       const result = await runtime.router.invoke(placeCall('barrier-fail'));
       expect(result).toMatchObject({ ok: false, error: 'barrier-write-failed' });

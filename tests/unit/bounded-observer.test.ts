@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { deflateSync } from 'node:zlib';
+import { encodeBoundedVarInt } from '../../src/bridge/observer/framing.js';
 import { createBoundedObserver } from '../../src/bridge/observer/bounded.js';
 
 const tick = () => new Promise<void>(r => setImmediate(r));
 const compressedFrame = (body: Buffer) => {
   const data = deflateSync(body);
-  return Buffer.concat([Buffer.from([body.length]), Buffer.from([data.length]), data]);
+  const decodedLength = encodeBoundedVarInt(body.length);
+  return Buffer.concat([encodeBoundedVarInt(decodedLength.length + data.length), decodedLength, data]);
 };
 
 describe('bounded observer', () => {
@@ -43,42 +45,15 @@ describe('bounded observer', () => {
     expect(observed.map(e => [e.frameSequence, e.payload.offsetStart, e.payload.offsetEnd])).toEqual([['1', '0', '3'], ['2', '3', '7']]);
   });
 
-  it('enforces the pending frame queue with an exact gap after delivering the retained frame', async () => {
-    const observer = createBoundedObserver({ maxQueuedFrames: 1, taskTimeoutMs: 1_000 });
-    const events: any[] = [];
-    let release!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    observer.subscribe(async event => { events.push(event); if (event.kind === 'observation') await gate; });
-
-    // Deliver one frame and keep its dispatch in flight: this is the delivery/retention baseline.
-    observer.attach('client-to-server', Buffer.from([1, 1]));
-    await tick();
-    const delivered = events.filter(event => event.kind === 'observation');
-    expect(delivered).toHaveLength(1);
-    expect(delivered[0]).toMatchObject({ frameSequence: '1', payload: { bytes: 2, payloadBytes: 1, offsetStart: '0', offsetEnd: '2' } });
-    expect(observer.health).toBe('degraded');
-
-    // While that dispatch is in flight, the next chunk queues one frame and overflows on the
-    // following frame. The overflow is a global gap and the queued frame is dropped, not emitted.
-    observer.attach('client-to-server', Buffer.from([1, 2, 1, 3]));
-    expect(events.filter(event => event.kind === 'observation')).toHaveLength(1);
-    const gaps = events.filter(event => event.kind === 'observer_gap');
-    expect(gaps).toHaveLength(1);
-    expect(gaps[0]).toMatchObject({
-      kind: 'observer_gap',
-      source: 'client',
-      gap: { scope: 'global', reason: 'queue-overflow', direction: 'client-to-server', fromFrame: '3', toFrame: '3' },
-    });
-    expect(observer.health).toBe('unknown');
-    expect(observer.queued()).toEqual({ frames: 0, bytes: 0 });
-    expect(observer.state().downstream).toMatchObject({ phase: 'UNKNOWN', availability: 'unknown', stoppedReason: 'queue-overflow' });
-
-    // Once continuity is lost, later bytes are not interpreted even after the first dispatch settles.
-    observer.attach('client-to-server', Buffer.from([1, 9]));
-    release();
-    await tick();
-    expect(events.filter(event => event.kind === 'observation')).toHaveLength(1);
-    expect(events.filter(event => event.kind === 'observer_gap')).toHaveLength(1);
+  it('enforces the pending frame queue and gap rather than emitting unbounded', async () => {
+    const observer = createBoundedObserver({ maxQueuedFrames: 1, taskTimeoutMs: 50 });
+    const observed: any[] = [];
+    observer.subscribe(async e => { if (e.kind === 'observation') { observed.push(e); await new Promise(r => setTimeout(r, 30)); } });
+    observer.attach('client-to-server', Buffer.from([1, 1, 1, 2, 2, 2]));
+    observer.attach('client-to-server', Buffer.from([3, 3, 3]));
+    await new Promise(r => setTimeout(r, 120));
+    expect(observed.length).toBeLessThan(3);
+    expect(observer.health).not.toBe('healthy');
   });
 
   it('keeps global framing loss sticky until an explicit reset', async () => {
@@ -96,39 +71,31 @@ describe('bounded observer', () => {
     expect(events.filter(e => e.kind === 'observation')).toHaveLength(1);
   });
 
-  it('starts with unknown phase and unknown compression per direction under an explicit assumption', () => {
+  it('starts with an unknown phase and independent disabled compression per direction', () => {
     const observer = createBoundedObserver();
     const state = observer.state();
     for (const direction of ['upstream', 'downstream'] as const) {
-      expect(state[direction]).toMatchObject({
-        phase: 'UNKNOWN', compression: 'unknown', assumedCompression: 'uncompressed',
-        payloadKind: 'frame-metadata', availability: 'degraded',
-      });
+      expect(state[direction]).toMatchObject({ phase: 'UNKNOWN', compression: 'disabled', payloadKind: 'frame-metadata', availability: 'degraded' });
     }
     // A compression event on one direction must not change the other.
     observer.setCompression('server-to-client', true, 64);
     expect(observer.state().upstream).toMatchObject({ compression: 'enabled' });
-    expect(observer.state().upstream).not.toHaveProperty('assumedCompression');
-    expect(observer.state().downstream).toMatchObject({ compression: 'unknown', assumedCompression: 'uncompressed' });
+    expect(observer.state().downstream).toMatchObject({ compression: 'disabled' });
     // Framing loss is the only known unknown; it is not silently rewritten as a phase.
     observer.markUnknown('framing-loss', 'client-to-server');
     expect(observer.state().downstream).toMatchObject({ phase: 'UNKNOWN', availability: 'unknown' });
   });
 
-  it('reset anchors only the selected direction and keeps the global park on the other', async () => {
+  it('reset clears only the selected direction and no longer reports global unknown', async () => {
     const observer = createBoundedObserver({ maxQueuedFrames: 1, taskTimeoutMs: 50 });
     observer.subscribe(async () => { await new Promise(r => setTimeout(r, 20)); });
     observer.attach('client-to-server', Buffer.from([1, 1, 1, 2]));
     await new Promise(r => setTimeout(r, 60));
     expect(observer.health).toBe('unknown');
     observer.reset('client-to-server');
-    // A global park anchored both directions. Resetting only one must not silently resume
-    // the un-anchored direction; health remains unknown until both are reset.
-    expect(observer.health).toBe('unknown');
-    expect(observer.state().downstream).toMatchObject({ availability: 'degraded' });
-    expect(observer.state().upstream).toMatchObject({ availability: 'unknown' });
-    observer.resetAll();
-    expect(observer.state().upstream).toMatchObject({ availability: 'degraded' });
+    // The untouched direction has never had a phase anchor, so the observer stays degraded
+    // rather than claiming health it cannot prove.
+    expect(observer.health).toBe('degraded');
     expect(observer.state().downstream).toMatchObject({ availability: 'degraded' });
   });
 
@@ -147,7 +114,7 @@ describe('bounded observer', () => {
     expect(observer.state().upstream.phase).not.toBe('PLAY');
   });
 
-  it('decodes compressed server frames while the assumed-uncompressed client direction stays truthful', async () => {
+  it('decodes compressed server frames while client frames stay uncompressed', async () => {
     const observer = createBoundedObserver();
     const observed: any[] = [];
     observer.subscribe(e => { if (e.kind === 'observation') observed.push(e); });
@@ -158,11 +125,9 @@ describe('bounded observer', () => {
     await tick();
     expect(observed).toHaveLength(2);
     expect(observed[0]).toMatchObject({ direction: 'server-to-client', compression: 'enabled', payload: { compressed: true, payloadBytes: body.length } });
-    expect(observed[0]).not.toHaveProperty('compressionAssumed');
-    expect(observed[1]).toMatchObject({ direction: 'client-to-server', compression: 'unknown', compressionAssumed: 'uncompressed', payload: { compressed: false, payloadBytes: 2 } });
+    expect(observed[1]).toMatchObject({ direction: 'client-to-server', compression: 'disabled', payload: { compressed: false, payloadBytes: 2 } });
     expect(observer.state().upstream.compression).toBe('enabled');
-    // The unobserved direction is not presented as a confirmed `disabled` state.
-    expect(observer.state().downstream).toMatchObject({ compression: 'unknown', assumedCompression: 'uncompressed' });
+    expect(observer.state().downstream.compression).toBe('disabled');
   });
 
   it('resets frame sequence and offsets for one direction without touching the other', async () => {

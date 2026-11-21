@@ -1,9 +1,8 @@
 import { nextId, type BodyContext, type Clock, type Execution, SystemClock } from '../contracts/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import type { SQLiteStore } from '../persistence/store.js';
-import { sameStableScope } from '../persistence/store.js';
 import { findSkill, type SkillId } from '../skills/registry.js';
-import { skillRequiresInput } from './admission.js';
+import { INPUT_SKILLS } from './admission.js';
 
 export type Lease = { leaseId: string; owner: string; resources: string[]; until: number; generation: number; contextEpoch: string };
 /**
@@ -72,6 +71,9 @@ export class Executor {
   private readonly watchdogTtl: number;
   private readonly inputsEnabled: () => boolean;
   private readonly progressByExecution = new Map<string, Progress>();
+  private readonly pendingSettlements = new Set<Promise<void>>();
+  get idle(): boolean { return this.pendingSettlements.size === 0; }
+  async whenIdle(): Promise<void> { await Promise.all([...this.pendingSettlements]); }
   private readonly active = new Map<string, { lease: Lease; watchdog?: string; canceled: boolean; controller: AbortController; token: symbol }>();
 
   constructor(
@@ -89,9 +91,6 @@ export class Executor {
 
   private readonly arbiter: InputArbiter;
 
-  /** Current input gate; read-only observation of a closure the executor itself enforces. */
-  inputGateOpen(): boolean { return this.inputsEnabled(); }
-
   resourcesFor(skillId: string): string[] {
     return findSkill(skillId)?.resources ?? (skillId === 'send_chat' ? ['ui', 'textEntry'] : ['movement', 'view', 'hands']);
   }
@@ -101,28 +100,25 @@ export class Executor {
     const proposalHash = canonicalProposalHash({ skillId, args });
     const existing = this.store.getExecution?.(proposalId);
     if (existing) {
-      // Proposal ids are only idempotent inside the stable body scope. A match from another
-      // world/account must fail instead of being replayed as this body's successful execution.
-      if (!sameStableScope(existing.context, this.bridge.context)) throw new Error('proposal-id-scope-conflict');
       if (existing.proposalHash !== proposalHash) throw new Error('proposal-id-conflict');
       return existing as Execution;
     }
     const execution: Execution = { executionId: nextId('execution'), proposalId, proposalHash, goalId, skillId, skillVersion: findSkill(skillId)?.version ?? '1.0.0', status: 'queued' };
-    // Persist the body scope with every execution, including no-effect work, so recovery and
-    // later control reads can tell this world's execution from another world's.
-    const scopedExecution = { ...execution, context: this.bridge.context };
     // Input-disabled profiles must fail before any lease, effect or sink side effect exists.
-    if (skillRequiresInput(skillId) && !this.inputsEnabled()) {
+    if (INPUT_SKILLS.has(skillId) && !this.inputsEnabled()) {
       execution.status = 'failed'; execution.reason = 'input-disabled';
-      this.store.saveExecution({ ...scopedExecution, status: execution.status, reason: execution.reason });
+      this.store.saveExecution(execution);
       return execution;
     }
-    this.store.saveExecution(scopedExecution);
+    this.store.saveExecution(execution);
     let lease: Lease;
     try { lease = this.arbiter.acquire(execution.executionId, this.resourcesFor(skillId), this.leaseTtl); }
-    catch (error) { execution.status = 'failed'; execution.reason = error instanceof Error ? error.message : String(error); this.store.saveExecution({ ...scopedExecution, status: execution.status, reason: execution.reason }); return execution; }
+    catch (error) { execution.status = 'failed'; execution.reason = error instanceof Error ? error.message : String(error); this.store.saveExecution(execution); return execution; }
     const active: { lease: Lease; watchdog?: string; canceled: boolean; controller: AbortController; token: symbol } = { lease, canceled: false, controller: new AbortController(), token: Symbol(execution.executionId) };
     this.active.set(execution.executionId, active);
+    let settled!: () => void;
+    const completion = new Promise<void>(resolve => { settled = resolve; });
+    this.pendingSettlements.add(completion);
     const armWatchdog = () => {
       if (active.watchdog) this.clock.cancel(active.watchdog);
       active.watchdog = this.clock.schedule(this.clock.now() + this.watchdogTtl, () => {
@@ -184,8 +180,9 @@ export class Executor {
     } finally {
       if (active.watchdog) this.clock.cancel(active.watchdog);
       if (this.active.get(execution.executionId)?.token === active.token) {
-        this.arbiter.release(lease.leaseId, execution.executionId); this.active.delete(execution.executionId); this.store.saveExecution(execution);
-      }
+        try { this.arbiter.release(lease.leaseId, execution.executionId); this.active.delete(execution.executionId); this.store.saveExecution(execution); }
+        finally { this.pendingSettlements.delete(completion); settled(); }
+      } else { this.pendingSettlements.delete(completion); settled(); }
     }
     return execution;
   }

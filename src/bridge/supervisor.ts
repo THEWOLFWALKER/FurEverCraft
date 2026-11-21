@@ -7,11 +7,6 @@ import type { IpcMessage } from './ipc/protocol.js';
  * offline tests never launch a real child process.
  */
 export type ChildProcessLike = {
-  /**
-   * Channel contract: false means the message was accepted and queued on a backed-up IPC
-   * channel; it was delivered once and must not be resent. Only a thrown error means the
-   * message was not handed off.
-   */
   send(message: unknown): boolean;
   on(event: 'message' | 'exit' | 'error', listener: (value?: unknown) => void): unknown;
   kill(signal?: string): boolean;
@@ -50,7 +45,7 @@ export class ProcessSupervisor {
   private readonly ipcTimeoutMs: number;
   private readonly childExitGraceMs: number;
   private readonly pending = new Map<string, PendingRequest>();
-  private readonly helloWaiters = new Set<{ resolve: (epoch: string) => void; reject: (error: Error) => void }>();
+  private readonly helloWaiters = new Set<(epoch: string) => void>();
   private readonly exitListeners = new Set<(reason: string) => void>();
   private readonly messageListeners = new Set<(message: unknown) => void>();
   private readonly expectedExits = new WeakSet<ChildProcessLike>();
@@ -104,7 +99,7 @@ export class ProcessSupervisor {
         if (!this.childEpoch) { this.childEpoch = message.sessionEpoch; this.childBootEpoch = message.bootEpoch; }
         else if (message.sessionEpoch !== this.childEpoch || (message.bootEpoch && this.childBootEpoch && message.bootEpoch !== this.childBootEpoch)) { this.stateValue = 'failed'; child.kill(); return; }
         else if (message.bootEpoch && this.childBootEpoch === undefined) this.childBootEpoch = message.bootEpoch;
-        for (const waiter of this.helloWaiters) waiter.resolve(this.childEpoch!);
+        for (const waiter of this.helloWaiters) waiter(this.childEpoch!);
         this.helloWaiters.clear();
       }
       if (isResponse(message)) {
@@ -119,23 +114,14 @@ export class ProcessSupervisor {
     });
     child.on('exit', () => {
       if (this.child === child) { this.child = undefined; if (this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed'; }
-      this.rejectHelloWaiters('ipc-child-exited');
       this.notifyExit(child);
     });
     child.on('error', () => {
       if (this.child === child && this.stateValue !== 'stopping' && this.stateValue !== 'stopped') this.stateValue = 'failed';
-      this.rejectHelloWaiters('ipc-child-error');
       this.notifyExit(child);
     });
     const hello: IpcMessage = { type: 'hello', protocolVersion: 1, process: 'runtime', sessionEpoch: this.ownerEpoch, bootEpoch: randomUUID(), capabilities: ['control', 'observe'] };
-    try {
-      // false means Node queued the hello on a backed-up channel; it was still handed off
-      // exactly once. Only a synchronous throw means nothing was sent.
-      child.send(hello);
-    } catch {
-      this.stateValue = 'failed';
-      throw new Error('supervisor-hello-send-failed');
-    }
+    if (!child.send(hello)) { this.stateValue = 'failed'; throw new Error('supervisor-hello-backpressure'); }
     // Do not claim running until the child confirms its session with a hello.
     this.stateValue = 'starting';
     void this.promoteWhenReady();
@@ -151,24 +137,14 @@ export class ProcessSupervisor {
     if (this.childEpoch) return Promise.resolve(this.childEpoch);
     if (!this.child) return Promise.reject(new Error('supervisor-no-child'));
     return new Promise<string>((resolve, reject) => {
-      const waiter = {
-        resolve: (epoch: string) => { clearTimeout(timer); resolve(epoch); },
-        reject: (error: Error) => { clearTimeout(timer); reject(error); },
-      };
       const timer = setTimeout(() => { this.helloWaiters.delete(waiter); reject(new Error('ipc-hello-timeout')); }, timeoutMs);
+      const waiter = (epoch: string) => { clearTimeout(timer); resolve(epoch); };
       this.helloWaiters.add(waiter);
     });
   }
 
-  /** A dead child can never produce its hello; reject waiters instead of waiting for timeout. */
-  private rejectHelloWaiters(reason: string): void {
-    const waiters = [...this.helloWaiters];
-    this.helloWaiters.clear();
-    for (const waiter of waiters) waiter.reject(new Error(reason));
-  }
-
   /** Send a control request to the child and await its correlated response. */
-  async request<T = unknown>(command: 'status' | 'shutdown' | 'capabilities' | 'observe' | 'arm' | 'start-observer' | 'stop-observer', payload: unknown = {}): Promise<T> {
+  async request<T = unknown>(command: 'status' | 'shutdown' | 'capabilities' | 'observe' | 'start-observer' | 'stop-observer', payload: unknown = {}): Promise<T> {
     const child = this.child;
     if (!child) return Promise.reject(new Error('supervisor-no-child'));
     // Owner loss revokes control: a paused/failed supervisor must not keep driving the child.
@@ -181,15 +157,7 @@ export class ProcessSupervisor {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new Error('ipc-timeout')); }, this.ipcTimeoutMs);
       this.pending.set(requestId, { timer, resolve: value => resolve(value as T), reject });
-      try {
-        // A false return only means the channel queued the request; do not reject or resend.
-        // The correlated response (or the timeout) settles the request.
-        child.send(message);
-      } catch {
-        clearTimeout(timer);
-        this.pending.delete(requestId);
-        reject(new Error('ipc-send-failed'));
-      }
+      if (!child.send(message)) { clearTimeout(timer); this.pending.delete(requestId); reject(new Error('ipc-backpressure')); }
     });
   }
 
@@ -234,7 +202,6 @@ export class ProcessSupervisor {
     this.child = undefined;
     this.childEpoch = undefined;
     this.childBootEpoch = undefined;
-    this.rejectHelloWaiters('ipc-disconnected');
     for (const [id, waiter] of this.pending) { clearTimeout(waiter.timer); waiter.reject(new Error('ipc-disconnected')); this.pending.delete(id); }
     if (child) {
       this.expectedExits.add(child);
@@ -259,7 +226,6 @@ export class ProcessSupervisor {
     const epoch = this.childEpoch;
     this.childEpoch = undefined;
     this.childBootEpoch = undefined;
-    this.rejectHelloWaiters('ipc-disconnected');
     for (const [id, waiter] of this.pending) { clearTimeout(waiter.timer); waiter.reject(new Error('ipc-disconnected')); this.pending.delete(id); }
     if (!child) return;
     // Without a session epoch the IPC shutdown request would be rejected as stale, so there is

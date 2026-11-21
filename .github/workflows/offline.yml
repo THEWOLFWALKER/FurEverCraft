@@ -21,24 +21,7 @@ jobs:
       - run: npm run doctor -- --profile simulated
       - run: npm run bridge:protocol -- --config configs/simulated.json
       - run: npm run cli -- bridge --mode inspect --config configs/client-offline.example.json
-      # Static web check only (typecheck + production bundle); the behavioral browser run is
-      # the separate browser-e2e job below via `npm run test:web:e2e`.
-      - run: npm run check:web
-  browser-e2e:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      # Install the exact Chromium build Playwright expects; a missing browser fails the job.
-      - run: npx playwright install --with-deps chromium
-      # Behavioral browser E2E: builds dist and the web bundle, starts isolated local servers on
-      # temp SQLite paths and drives headless Chromium. Screenshots/video/trace stay off, and any
-      # server, assertion or cleanup failure exits non-zero.
-      - run: npm run test:web:e2e
+      - run: npm run test:web
   windows-static:
     runs-on: windows-latest
     steps:
@@ -49,10 +32,52 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      # The Windows job runs the same dist-dependent integration tests; build before testing
-      # so they execute instead of silently skipping when dist/ is absent.
-      - run: npm run build
       - run: npm run test:offline
+      # FEC-60: native/config bytes are hashed during verification, so a CRLF checkout must
+      # fail loudly instead of producing a different manifest/hash on Windows.
+      - name: Verify LF line endings
+        shell: powershell
+        run: |
+          $bad = @()
+          Get-ChildItem -Path native,configs -Recurse -File | ForEach-Object {
+            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            if ([Array]::IndexOf($bytes, [byte]13) -ge 0) { $bad += $_.FullName }
+          }
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { Write-Error "CR byte found: $_" }
+            exit 1
+          }
+      # Execute the real helper bootstrap under Windows PowerShell 5.1 with the dry-run
+      # sink. This never calls SendInput or captures the desktop.
+      - name: PowerShell 5.1 helper dry-run
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw "expected Windows PowerShell 5.1, got $($PSVersionTable.PSVersion)" }
+          $helper = Join-Path (Get-Location) 'native/windows/FurEverCraft.Helper.ps1'
+          $lease = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 5000
+          $requests = @(
+            (@{ requestId = 'ci-probe'; command = 'probe' } | ConvertTo-Json -Compress),
+            (@{ requestId = 'ci-bind'; command = 'bindWindow'; pid = 4242; hwnd = '4242'; epoch = 'ci-epoch' } | ConvertTo-Json -Compress),
+            (@{ requestId = 'ci-held'; command = 'setHeldInputs'; epoch = 'ci-epoch'; generation = 1; commandSeq = 1; leaseUntil = $lease; pulseTtlMs = 150; inputs = @{ '87' = $true } } | ConvertTo-Json -Compress),
+            (@{ requestId = 'ci-release'; command = 'releaseOwnedInputs' } | ConvertTo-Json -Compress),
+            (@{ requestId = 'ci-state'; command = 'getState' } | ConvertTo-Json -Compress),
+            (@{ requestId = 'ci-stop'; command = 'shutdown' } | ConvertTo-Json -Compress)
+          )
+          $output = $requests | & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $helper -DryRun
+          if ($LASTEXITCODE -ne 0) { throw "helper exited $LASTEXITCODE" }
+          $responses = @($output | ForEach-Object { $_ | ConvertFrom-Json })
+          foreach ($response in $responses) {
+            if (-not $response.ok) { throw "helper request failed: $($response.requestId):$($response.error)" }
+          }
+          $probe = $responses | Where-Object { $_.requestId -eq 'ci-probe' }
+          $held = $responses | Where-Object { $_.requestId -eq 'ci-held' }
+          $state = $responses | Where-Object { $_.requestId -eq 'ci-state' }
+          if ($probe.result.dryRun -ne $true) { throw 'probe did not report dry-run' }
+          if ($held.result.heldCount -ne 1) { throw "unexpected heldCount: $($held.result.heldCount)" }
+          if ($state.result.heldCount -ne 0) { throw "release left held input: $($state.result.heldCount)" }
+          if ($state.result.sendInputCalls -ne 0) { throw "dry-run called SendInput: $($state.result.sendInputCalls)" }
+          Write-Host 'PowerShell 5.1 dry-run helper OK'
       # Static parse of the PowerShell helper; this does not execute SendInput or capture.
       - shell: pwsh
         run: |

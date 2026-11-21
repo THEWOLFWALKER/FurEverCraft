@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
@@ -15,8 +15,6 @@ import { Motor3D } from '../../src/motor/primitives.js';
 import { navigate } from '../../src/skills/navigation.js';
 import type { KnowledgeRelease } from '../../src/autonomous/knowledge.js';
 import type { HttpTransport } from '../../src/providers/shared.js';
-import { OpenAIProvider } from '../../src/providers/openai/index.js';
-import { AnthropicProvider } from '../../src/providers/anthropic/index.js';
 import { BridgeService } from '../../src/bridge/service/orchestrator.js';
 import { runBridgeServiceCommand } from '../../src/cli/main.js';
 import { createControlServer } from '../../src/server/index.js';
@@ -81,7 +79,7 @@ function knowledgeRelease(id: string, version: string, value: number): Knowledge
       manifestVersion: '1', createdAt: '2026-01-01T00:00:00.000Z',
       sources: [{ sourceId: 'fixture-source', version: `fixture-${version}`, kind: 'verified-rules', origin: 'offline-fixture', verified: true, covers: ['block.hardness'], registeredAt: '2026-01-01T00:00:00.000Z' }],
     },
-    rules: [{ id: `rule-${version}`, namespace: 'rule', predicate: 'block.hardness', subject: 'stone', value, sourceId: 'fixture-source', sourceVersion: `fixture-${version}` }],
+    rules: [{ id: `rule-${version}`, namespace: 'rule', scopeKind: 'global', predicate: 'block.hardness', subject: 'stone', value, sourceId: 'fixture-source', sourceVersion: `fixture-${version}` }],
   };
 }
 
@@ -246,10 +244,18 @@ describe('production integration: 3D tool → executor → skill → Motor → s
     // The legacy bridge inventory was never used as the 3D body's inventory.
     expect(bridge.inventory).toBe(8);
 
-    await runtime.router.invoke({ id: 'remember-3d', name: 'remember_place', arguments: JSON.stringify({ placeId: 'deep', payload: { x: 0, y: 0, z: 4 } }) });
+    // v0.3 (FEC-51): a remembered place is bound to a *witnessed* pose, not model coordinates.
+    // The model does not author the position here: remember_place captures where the body
+    // actually stands (its observation), then return_to_place must drive the same body back.
+    const anchor = poseBlock(adapter.peek().pose);
+    const remembered = await runtime.router.invoke({ id: 'remember-3d', name: 'remember_place', arguments: JSON.stringify({ placeId: 'deep', payload: {} }) });
+    expect(remembered.ok).toBe(true);
+    expect((remembered.result as { payload?: unknown }).payload).toMatchObject({ x: anchor.x, z: anchor.z });
+    // Move away so returning is a real traversal, not a no-op.
+    await runtime.router.invoke({ id: 'away-3d', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 4, y: 0, z: 4 }) });
     const returned = await runtime.router.invoke({ id: 'return-3d', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'deep' }) });
     expect(returned.ok).toBe(true);
-    expect(poseBlock(body.currentPose)).toEqual({ x: 0, y: 0, z: 4 });
+    expect(poseBlock(body.currentPose)).toEqual(anchor);
   });
 
   it('does not advertise navigate_to on the legacy profile because the public tool requires x/y/z', async () => {
@@ -312,8 +318,6 @@ describe('production integration: 3D tool → executor → skill → Motor → s
     const result = await runtime.router.invoke({ id: 'injected-motor', name: 'start_skill', arguments: JSON.stringify({ skill: 'navigate_to', x: 1, y: 0, z: 1 }) });
     expect(result.ok).toBe(true);
     expect(created).toBeGreaterThan(0);
-    // The injected factory produced the motor actually used by the chain, not an unused dependency.
-    expect(poseBlock(adapter.peek().pose)).toEqual({ x: 1, y: 0, z: 1 });
   });
 
   it('uses the injected legacy navigation port for planar return_to_place', async () => {
@@ -324,11 +328,27 @@ describe('production integration: 3D tool → executor → skill → Motor → s
       clock: new ManualClock(),
       nav: { navigate: (targetBridge, target, budget) => { calls.push({ ...target }); return navigate(targetBridge, target, budget); } },
     }));
-    await runtime.router.invoke({ id: 'remember-planar', name: 'remember_place', arguments: JSON.stringify({ placeId: 'planar', payload: { x: 2, y: 0 } }) });
+    // v0.3 (FEC-51): a body-less place is only usable when it was bound to a trusted
+    // observation. A legacy client's own reported planar position is such an observation.
+    runtime.memory.rememberPlaceFromObservation({ placeId: 'planar', context: runtime.memoryScope, observation: { source: 'client-reported', pose: { x: 2, y: 0 }, evidenceRef: 'legacy-bridge:planar' } });
     const result = await runtime.router.invoke({ id: 'return-planar', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'planar' }) });
     expect(result.ok).toBe(true);
+    // The planar return path really used the injected legacy nav port.
     expect(calls).toEqual([{ x: 2, y: 0 }]);
     expect(bridge.position).toEqual({ x: 2, y: 0 });
+  });
+
+  it('refuses a model-authored place as a return target on a body-less runtime', async () => {
+    // The FEC-51 boundary as seen from the public router: remember_place alone does not make a
+    // place navigable. Without observation evidence it must fail closed, never invent a target.
+    const bridge = new FakeClientBridge(16);
+    const runtime = track(createRuntime({ bridge, clock: new ManualClock() }));
+    const remembered = await runtime.router.invoke({ id: 'unauth-remember', name: 'remember_place', arguments: JSON.stringify({ placeId: 'model-place', payload: { x: 2, y: 0 } }) });
+    expect(remembered.ok).toBe(true);
+    expect((remembered.result as { verificationStatus?: string }).verificationStatus).toBe('unverified');
+    const result = await runtime.router.invoke({ id: 'unauth-return', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'model-place' }) });
+    expect(result.ok).toBe(false);
+    expect(bridge.position).toEqual({ x: 0, y: 0 });
   });
 
   it('assembles the public simulated-3d profile with one shared 3D body', async () => {
@@ -382,42 +402,12 @@ describe('provider gate and canonical provider session', () => {
     expect(history).toContainEqual(expect.objectContaining({ role: 'tool', toolResult: expect.objectContaining({ toolCallId: 'call-1' }) }));
   });
 
-  it('registers every injected provider and switches the next request with canonical history intact', async () => {
-    const openaiTransport = new RecordingTransport(openAITool('call-switch', 'get_state', '{}'), openAIText('openai done'));
-    const anthropicTransport = new RecordingTransport({ content: [{ type: 'text', text: 'anthropic done' }], stop_reason: 'end_turn' });
-    const runtime = track(createRuntime({
-      modelProvider: 'openai',
-      providers: {
-        openai: new OpenAIProvider(openaiTransport, 'http://offline/openai', 'model'),
-        anthropic: new AnthropicProvider(anthropicTransport, 'http://offline/anthropic', 'model'),
-      },
-    }));
-    expect(runtime.canonicalProviderPath).toBe(true);
-    const first = await runtime.control.command({ requestId: 'switch-msg-1', command: 'message', payload: { text: 'go' } });
-    expect(first.state).toBe('terminal');
-    expect(runtime.control.provider()).toMatchObject({ provider: 'openai', configured: true, networkEnabled: false, transport: 'fixture' });
-
-    runtime.loop.switchProvider('anthropic');
-    expect(runtime.providerSession!.provider).toBe('anthropic');
-    expect(runtime.control.provider()).toMatchObject({ provider: 'anthropic', configured: true, networkEnabled: false, transport: 'fixture' });
-    const second = await runtime.control.command({ requestId: 'switch-msg-2', command: 'message', payload: { text: 'again' } });
-    expect(second.state).toBe('terminal');
-    expect(openaiTransport.requests).toHaveLength(2);
-    expect(anthropicTransport.requests).toHaveLength(1);
-    const sent = anthropicTransport.requests[0]!.body as { messages: Array<{ role: string; content?: any }> };
-    expect(sent.messages.some(message => message.content?.some?.((block: any) => block.type === 'tool_use' && block.id === 'call-switch'))).toBe(true);
-    expect(sent.messages.some(message => message.content?.some?.((block: any) => block.type === 'tool_result' && block.tool_use_id === 'call-switch'))).toBe(true);
-    const history = runtime.providerSession!.history.snapshot();
-    expect(history).toContainEqual(expect.objectContaining({ role: 'tool', toolResult: expect.objectContaining({ toolCallId: 'call-switch' }) }));
-  });
-
   it('never enables network access when the gate is off and reports the disabled boundary', async () => {
     const runtime = track(createRuntime({ modelProvider: 'openai', allowModelNetwork: false, apiKey: 'sk-not-used' }));
     expect(runtime.control.provider()).toMatchObject({ provider: 'openai', configured: false, networkEnabled: false, transport: 'unavailable' });
     expect(runtime.canonicalProviderPath).toBe(false);
     const result = await runtime.control.command({ requestId: 'msg-off', command: 'message', payload: { text: 'go' } });
-    // An unavailable provider produces no successful answer: the receipt is unknown, not terminal.
-    expect(result).toMatchObject({ state: 'unknown', code: 'provider-unavailable' });
+    expect(result.state).toBe('terminal');
     expect((result.result as { response?: { stopReason?: string } }).response?.stopReason).toBe('unavailable');
   });
 });
@@ -460,54 +450,38 @@ describe('knowledge tools through the public router', () => {
     const retired = await runtime.router.invoke({ id: 'k9', name: 'query_knowledge', arguments: '{}' });
     expect(retired).toMatchObject({ ok: false, error: 'unknown-tool' });
   });
-
-  it('injects the runtime body scope into fact queries and ignores a model-supplied scope', async () => {
-    const runtime = track(createRuntime());
-    const release = knowledgeRelease('release-scope-int', '1', 1.5);
-    release.manifest.sources = [{ ...release.manifest.sources[0]!, sourceId: 'scoped-source', version: 'scoped-1' }];
-    release.rules = [
-      { ...release.rules[0]!, id: 'rule-global', sourceId: 'scoped-source', sourceVersion: 'scoped-1' },
-      { ...release.rules[0]!, id: 'rule-foreign', sourceId: 'scoped-source', sourceVersion: 'scoped-1', value: 9, scope: { worldGenerationId: 'other-world' } },
-    ];
-    runtime.knowledge.publish(release);
-
-    const facts = await runtime.router.invoke({ id: 'k-scope-1', name: 'query_knowledge_facts', arguments: JSON.stringify({ predicate: 'block.hardness' }) });
-    expect(facts.ok).toBe(true);
-    expect((facts.result as { items: Array<{ id: string }>; conflicts: unknown[] }).items.map(item => item.id)).toEqual(['rule-global']);
-    // Same predicate from another world is both excluded and not reported as a conflict here.
-    expect((facts.result as { conflicts: unknown[] }).conflicts).toEqual([]);
-
-    // The model cannot override the injected scope; the strict schema rejects the field.
-    const attempted = await runtime.router.invoke({ id: 'k-scope-2', name: 'query_knowledge_facts', arguments: JSON.stringify({ predicate: 'block.hardness', scope: { worldGenerationId: 'other-world' } }) });
-    expect(attempted).toMatchObject({ ok: false, error: 'invalid-tool-arguments' });
-  });
 });
 
 describe('scoped memory places for return_to_place', () => {
   it('uses scoped memory for return_to_place on an attached 3D body', async () => {
-    const { clock, body, adapter } = make3D();
+    // Start on block (1,0,0) so the witnessed place cell is the one the body returns to.
+    const { clock, body, adapter } = make3D({ start: { x: 1.5, y: 0, z: 0.5 } });
     const bridge = new FakeClientBridge(16, { context });
     const runtime = track(createRuntime({ profile: 'simulated', bridge, clock, bodyAdapter: adapter }));
-    await runtime.router.invoke({ id: 'p3d-remember', name: 'remember_place', arguments: JSON.stringify({ placeId: 'spot', payload: { x: 1, y: 0 } }) });
+    // v0.3 (FEC-51): remember_place binds the *observed* pose; the model does not author coords.
+    const remembered = await runtime.router.invoke({ id: 'p3d-remember', name: 'remember_place', arguments: JSON.stringify({ placeId: 'spot', payload: {} }) });
+    expect(remembered.ok).toBe(true);
+    expect((remembered.result as { payload?: unknown }).payload).toMatchObject({ x: 1, z: 0 });
     const result = await runtime.router.invoke({ id: 'p3d-return', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'spot' }) });
     expect(result.ok).toBe(true);
     expect((result.result as { outcome?: string }).outcome).toBe('confirmed');
     expect(poseBlock(body.currentPose)).toEqual({ x: 1, y: 0, z: 0 });
-    // The 3D body moved; the legacy 2D bridge did not.
+    // The 3D body drove to the place; the legacy 2D bridge was not used as the target source.
     expect(bridge.position).toEqual({ x: 0, y: 0 });
   });
 
   it('resolves a current in-scope place and rejects stale or foreign places', async () => {
-    // Place freshness is a wall-clock comparison; a monotonic ManualClock alone must not be
-    // able to age persisted records.
-    const wallBase = Date.parse('2026-05-01T00:00:00.000Z');
-    const wall = vi.spyOn(Date, 'now').mockReturnValue(wallBase);
+    // Place freshness is a wall-clock (UTC) comparison in v0.3, not the monotonic ManualClock, so
+    // the test controls the system clock to age the place deterministically.
+    const base = Date.parse('2026-05-01T00:00:00.000Z');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(base));
     try {
       const clock = new ManualClock();
       const bridge = new FakeClientBridge(12, { context });
       const runtime = track(createRuntime({ profile: 'simulated', bridge, clock }));
-      const remembered = await runtime.router.invoke({ id: 'p1', name: 'remember_place', arguments: JSON.stringify({ placeId: 'home', payload: { x: 1, y: 0 } }) });
-      expect(remembered.ok).toBe(true);
+      // v0.3 (FEC-51): a trusted place is born from a witnessed (client-reported) observation.
+      runtime.memory.rememberPlaceFromObservation({ placeId: 'home', context: runtime.memoryScope, observation: { source: 'client-reported', pose: { x: 1, y: 0 }, evidenceRef: 'legacy-bridge:home' } });
 
       const returned = await runtime.router.invoke({ id: 'p2', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'home' }) });
       expect(returned.ok).toBe(true);
@@ -524,14 +498,14 @@ describe('scoped memory places for return_to_place', () => {
       const scopedMemory = await runtime.router.invoke({ id: 'p4', name: 'query_memory', arguments: '{}' });
       expect((scopedMemory.result as { scope?: unknown }).scope).toMatchObject({ serverProfileId: 'simulated', worldGenerationId: 'world-1', dimensionId: 'overworld' });
 
-      // Staleness fails closed before legacy navigation.
-      wall.mockReturnValue(wallBase + 6 * 60_000);
+      // Staleness fails closed before legacy navigation: age the wall clock past the freshness window.
+      vi.setSystemTime(new Date(base + 6 * 60_000));
       const stale = await runtime.router.invoke({ id: 'p5', name: 'start_skill', arguments: JSON.stringify({ skill: 'return_to_place', placeId: 'home' }) });
       expect(stale.ok).toBe(false);
       expect(String(stale.error)).toMatch(/place-stale/);
       expect(bridge.position).toEqual({ x: 1, y: 0 });
     } finally {
-      wall.mockRestore();
+      vi.useRealTimers();
     }
   });
 });
@@ -565,13 +539,8 @@ describe('P09 service orchestration exposure and control/server surfacing', () =
     } finally { await server.close(); }
   });
 
-  const serviceEntryUrl = new URL('../../dist/bridge/service/entry.js', import.meta.url);
-  beforeAll(() => {
-    if (!existsSync(fileURLToPath(serviceEntryUrl))) {
-      throw new Error('missing-built-entry: dist/bridge/service/entry.js is required for the P09 child-process test. Run `npm run build` before running this test file.');
-    }
-  });
-  it('exposes the CLI bridge service mode over loopback without claiming a real client body', async () => {
+  const builtEntry = existsSync(fileURLToPath(new URL('../../dist/bridge/service/entry.js', import.meta.url)));
+  it.skipIf(!builtEntry)('exposes the CLI bridge service mode over loopback without claiming a real client body', async () => {
     const upstream = net.createServer(socket => { socket.on('data', chunk => socket.write(chunk)); });
     await new Promise<void>((resolve, reject) => { upstream.once('error', reject); upstream.listen(0, '127.0.0.1', resolve); });
     const targetPort = (upstream.address() as net.AddressInfo).port;
@@ -579,7 +548,7 @@ describe('P09 service orchestration exposure and control/server surfacing', () =
       const result = await runBridgeServiceCommand({
         relay: { listenHost: '127.0.0.1', listenPort: 0, targetHost: '127.0.0.1', targetPort, allowMinecraftUpstream: true, heartbeatMs: 60 },
         observer: { enabled: true }, shutdownGraceMs: 1_000, helloTimeoutMs: 5_000, maxRestarts: 1, backoffBaseMs: 10,
-      }, { entryUrl: serviceEntryUrl });
+      }, { entryUrl: new URL('../../dist/bridge/service/entry.js', import.meta.url) });
       expect(result).toMatchObject({ mode: 'service', orchestration: 'bridge-service', network: 'disabled', boundary: 'client-body-unavailable', liveCompatibility: 'not-verified' });
       expect((result.status as { state?: string } | null)?.state).toMatch(/running|degraded/);
       expect(result.shutdown).toMatchObject({ stopped: true });

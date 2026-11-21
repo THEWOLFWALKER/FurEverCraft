@@ -1,6 +1,10 @@
 {
   "profile": "simulated",
-  "targetHost": "127.0.0.1",
-  "targetPort": 25565,
-  "allowMinecraftUpstream": true
+  "allowModelNetwork": false,
+  "allowMinecraftUpstream": false,
+  "allowOsInput": false,
+  "allowScreenCapture": false,
+  "provider": "scripted",
+  "serverProfileId": "simulated",
+  "worldGenerationId": "world-1"
 }

@@ -18,6 +18,11 @@ export const JUMP_APEX = 1.9;
 const bodyAabb = (p: BlockPos) => ({ minX: p.x + 0.15, minY: p.y, maxX: p.x + 0.85, maxY: p.y + BODY_HEIGHT, minZ: p.z + 0.15, maxZ: p.z + 0.85 });
 const headroomAabb = (p: BlockPos) => ({ minX: p.x + 0.15, minY: p.y + BODY_HEIGHT, maxX: p.x + 0.85, maxY: p.y + BODY_HEIGHT + JUMP_APEX, minZ: p.z + 0.15, maxZ: p.z + 0.85 });
 
+/** One incremental search step; the value is the number of expansions completed. */
+type SearchYield = { expanded: number };
+
+const setImmediatePromise = (): Promise<void> => new Promise<void>(resolve => setImmediate(resolve));
+
 const makeEdge = (kind: ActionKind, from: BlockPos, to: BlockPos, snapshotRevision: string, clearance: string[], takeoffHeadroom?: string[]): ActionEdge => {
   const support = blockKey({ ...to, y: to.y - 1 });
   return {
@@ -91,6 +96,66 @@ export class ActionPlanner {
   }
 
   planRoute(start: BlockPos, target: BlockPos): NavRoute {
+    // Synchronous compatibility facade: consume the incremental generator
+    // without ever suspending. Hot paths that must not monopolise the event
+    // loop use `planRouteAsync` instead.
+    const search = this.routeGenerator(start, target);
+    let next = search.next();
+    while (!next.done) next = search.next();
+    return next.value;
+  }
+
+  /**
+   * Async planning that actually yields to the macrotask queue. The synchronous
+   * `planRoute` only creates the generator; this path awaits `setImmediate`
+   * every `yieldEvery` expansions so timers, control API, watchdog and shutdown
+   * make progress during a large bounded search.
+   *
+   * Cancellation is cooperative and prompt: the signal is checked before each
+   * yield and the generator is closed with an explicit `CANCELED` route. A
+   * deadline that elapses returns `BUDGET_EXHAUSTED`, never a fake "unreachable".
+   */
+  async planRouteAsync(
+    start: BlockPos,
+    target: BlockPos,
+    options: { signal?: AbortSignal; deadline?: number; now?: () => number } = {},
+  ): Promise<NavRoute> {
+    const now = options.now ?? (() => Date.now());
+    const search = this.routeGenerator(start, target);
+    let next = search.next();
+    while (!next.done) {
+      if (options.signal?.aborted) {
+        const closed = search.return(this.emptyRoute('CANCELED', 'plan-canceled'));
+        return closed.value as NavRoute;
+      }
+      if (options.deadline !== undefined && now() >= options.deadline) {
+        const closed = search.return(this.emptyRoute('BUDGET_EXHAUSTED', 'plan-deadline-exhausted'));
+        return closed.value as NavRoute;
+      }
+      await setImmediatePromise();
+      next = search.next();
+    }
+    return next.value;
+  }
+
+  /** Build an empty route for a terminal planning condition. */
+  private emptyRoute(status: PlanStatus, reason: string): NavRoute {
+    return {
+      status, steps: [], expanded: 0,
+      snapshotRevision: this.world.snapshot().revision,
+      observationRevision: this.world.snapshot().revision,
+      supportedActions: [...this.capabilities],
+      dependencies: [], reason,
+    };
+  }
+
+  /**
+   * The bounded A* search. It yields every `yieldEvery` expansions; the sync
+   * facade drains it, while `planRouteAsync` awaits a real macrotask between
+   * yields. The search budget is resolved inside the generator so both paths
+   * share exactly the same expansion accounting.
+   */
+  private *routeGenerator(start: BlockPos, target: BlockPos): Generator<SearchYield, NavRoute, void> {
     const snap = this.world.snapshot();
     this.currentRevision = snap.revision;
     const supportedActions: readonly ActionKind[] = [...this.capabilities];
@@ -132,7 +197,9 @@ export class ActionPlanner {
         best.set(nextKey, nextCost);
         open.push({ at: edge.to, edges: [...node.edges, edge], cost: nextCost, priority: nextCost + this.heuristic(edge.to, target) });
       }
-      if (expanded % this.yieldEvery === 0) void Promise.resolve();
+      // A real suspension point for callers that drain this generator
+      // asynchronously; a sync consumer ignores the yielded value.
+      if (expanded % this.yieldEvery === 0) yield { expanded };
     }
 
     const status: PlanStatus = needsObservation ? 'NEEDS_OBSERVATION' : unsupportedTransition ? 'UNSUPPORTED_TRANSITION' : 'NO_PATH_IN_KNOWN_GRAPH';

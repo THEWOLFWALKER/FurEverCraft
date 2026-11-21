@@ -34,11 +34,7 @@ export type DoctorBodyReport = DoctorCapability & {
   legacy2d: boolean;
   source: string;
   dimension: string;
-  /** Effective input availability: a configured gate that is open but control-revoked is disabled. */
   inputs: DoctorCapability;
-  /** Raw configured input gate, kept separate from effective availability. */
-  inputsEnabled: boolean;
-  effectiveInputsEnabled: boolean;
   jump: 'none' | 'short' | 'unknown';
   capabilities: Record<string, unknown>;
   observation?: { revision: string; freshness: string; gap: boolean };
@@ -87,24 +83,6 @@ export type DoctorReport = {
   version: 1;
   generatedAt: number;
   status: 'ok' | 'degraded' | 'unavailable';
-  /**
-   * The profile string this runtime was actually assembled from (`simulated`,
-   * `simulated-3d`, `client-offline`, ...). This is deliberately separate from
-   * `profile.id`, which is the attached body/server identity.
-   */
-  runtimeProfile: string;
-  /** The attached body/server profile id, kept separate from `runtimeProfile`. */
-  serverProfileId: string;
-  /**
-   * Attached body/server context, not the assembled Runtime profile string.
-   *
-   * `id` is `BodyContext.serverProfileId`, `source` is the attached bridge/body source,
-   * and the epoch/world/dimension fields come from the same context. For a runtime
-   * assembled with `--profile simulated-3d` they therefore stay `"simulated"`: that is
-   * the simulated body/server the runtime is attached to, not a mislabelled assembly.
-   * The assembled path is reported separately and truthfully by `body.mode`,
-   * `body.threeDimensional` and `body.source`.
-   */
   profile: {
     id: string;
     simulated: boolean;
@@ -171,26 +149,7 @@ function networkReport(runtime: RuntimeAssembly): DoctorCapability {
   return { state: 'disabled', reason: 'network-gate-disabled' };
 }
 
-/**
- * Input availability is the conjunction of the configured gate and the attached service's
- * admission state. Reporting the raw gate as available while control is revoked would tell an
- * operator that writes can be dispatched when every write is actually rejected.
- */
-function inputsReport(runtime: RuntimeAssembly): { inputs: DoctorCapability; raw: boolean; effective: boolean } {
-  const raw = runtime.inputsEnabled;
-  const controlOpen = runtime.controlOpen();
-  const effective = raw && controlOpen;
-  return {
-    raw,
-    effective,
-    inputs: effective
-      ? { state: 'available' }
-      : { state: 'disabled', reason: raw ? 'control-revoked' : 'input-gate-disabled' },
-  };
-}
-
 function bodyReport(runtime: RuntimeAssembly): DoctorBodyReport {
-  const inputState = inputsReport(runtime);
   const adapter = runtime.bodyAdapter;
   if (adapter) {
     let observation: BodyStateView | undefined;
@@ -209,9 +168,9 @@ function bodyReport(runtime: RuntimeAssembly): DoctorBodyReport {
       legacy2d: false,
       source: adapter.source,
       dimension: adapter.context.dimension,
-      inputs: inputState.inputs,
-      inputsEnabled: inputState.raw,
-      effectiveInputsEnabled: inputState.effective,
+      inputs: runtime.inputsEnabled
+        ? { state: 'available' }
+        : { state: 'disabled', reason: 'input-gate-disabled' },
       jump: capabilities.jump === 'short' ? 'short' : capabilities.jump === 'none' ? 'none' : 'unknown',
       capabilities: redact(capabilities) as Record<string, unknown>,
       ...(observation ? { observation: { revision: observation.revision, freshness: observation.freshness, gap: observation.gap } } : {}),
@@ -240,9 +199,7 @@ function bodyReport(runtime: RuntimeAssembly): DoctorBodyReport {
     legacy2d: true,
     source: String(bridge.capabilities?.source ?? 'legacy-2d'),
     dimension: runtime.bridge.context.dimension,
-    inputs: inputState.inputs,
-    inputsEnabled: inputState.raw,
-    effectiveInputsEnabled: inputState.effective,
+    inputs: runtime.inputsEnabled ? { state: 'available' } : { state: 'disabled', reason: 'input-gate-disabled' },
     jump: 'none',
     capabilities,
   };
@@ -274,11 +231,10 @@ function storeReport(runtime: RuntimeAssembly): DoctorStoreReport {
   }
   let executions = 0; let effects = 0; let goals = 0;
   try {
-    // COUNT(*) in SQL: reading the whole execution/effect/goal tables just to report a
-    // number both scales badly and leaks rows from other worlds/accounts.
-    executions = runtime.store.countExecutionsForScope(runtime.memoryScope);
-    effects = runtime.store.countEffectsForScope(runtime.memoryScope);
-    goals = runtime.store.countGoalsForScope(runtime.memoryScope);
+    // SQL COUNT(*) rather than materialising every row just to read its length (FEC-56).
+    executions = runtime.store.countExecutions();
+    effects = runtime.store.countEffects();
+    goals = runtime.store.countGoals();
   } catch (error) {
     health = 'error'; reason = reason ?? (error instanceof Error ? error.message : String(error));
   }
@@ -297,12 +253,14 @@ function storeReport(runtime: RuntimeAssembly): DoctorStoreReport {
 function recoveryReport(runtime: RuntimeAssembly): DoctorRecoveryReport {
   const session = runtime.session;
   let pendingEffects = 0;
-  let effectStatuses: Record<string, number> = {};
+  let effectCounts: Record<string, number> = {};
   let reason: string | undefined;
   try {
-    // Aggregate in SQL rather than materialising every effect row twice per report.
-    effectStatuses = runtime.store.effectStatusCountsForScope(runtime.memoryScope);
-    pendingEffects = runtime.store.countPendingEffectsForScope(runtime.memoryScope);
+    // Group-by status and a derived pending count; never copy the effects table into JS.
+    effectCounts = runtime.store.effectStatusCounts();
+    pendingEffects = Object.entries(effectCounts)
+      .filter(([status]) => status !== 'confirmed' && status !== 'partial' && status !== 'not-dispatched')
+      .reduce((total, [, count]) => total + count, 0);
   } catch (error) {
     reason = error instanceof Error ? error.message : String(error);
   }
@@ -310,7 +268,7 @@ function recoveryReport(runtime: RuntimeAssembly): DoctorRecoveryReport {
   try {
     const latest = Number(runtime.store.getLatestCriticalSequence() ?? '0');
     const from = String(Math.max(0, latest - 1000));
-    const events = runtime.store.getCriticalEvents(from, 1000, undefined, runtime.memoryScope) as Array<{ seq: string; kind: string; payload?: unknown }>;
+    const events = runtime.store.getCriticalEvents(from, 1000) as Array<{ seq: string; kind: string; payload?: unknown }>;
     for (let index = events.length - 1; index >= 0; index -= 1) {
       const event = events[index]!;
       if (event.kind !== 'runtime.recovery_failed' && event.kind !== 'runtime.stopping' && event.kind !== 'session.failed') continue;
@@ -337,7 +295,7 @@ function recoveryReport(runtime: RuntimeAssembly): DoctorRecoveryReport {
     attempts: session.recoveryAttempts,
     budget: session.recoveryBudget,
     pendingEffects,
-    effectCounts: effectStatuses,
+    effectCounts,
     ...(lastFault ? { lastFault } : {}),
   };
 }
@@ -431,10 +389,6 @@ export function collectDoctorReport(runtime: RuntimeAssembly, options: DoctorOpt
     version: 1,
     generatedAt: nowOf(options),
     status,
-    runtimeProfile: runtime.runtimeProfile,
-    serverProfileId: context.serverProfileId,
-    // Body/server context summary: `id`/`source` are not the Runtime assembly profile.
-    // See the `DoctorReport.profile` comment; `body` below carries the assembled body mode.
     profile: {
       id: context.serverProfileId,
       simulated: context.serverProfileId === 'simulated',
@@ -472,13 +426,11 @@ export type UnavailableDoctorInput = {
  */
 export function unavailableDoctorReport(input: UnavailableDoctorInput): DoctorReport {
   const capability: DoctorCapability = { state: 'unavailable', reason: input.reason };
-  const body: DoctorBodyReport = { ...capability, mode: 'unknown', threeDimensional: false, legacy2d: false, source: 'unavailable', dimension: 'unknown', inputs: capability, inputsEnabled: false, effectiveInputsEnabled: false, jump: 'unknown', capabilities: {} };
+  const body: DoctorBodyReport = { ...capability, mode: 'unknown', threeDimensional: false, legacy2d: false, source: 'unavailable', dimension: 'unknown', inputs: capability, jump: 'unknown', capabilities: {} };
   return {
     version: 1,
     generatedAt: input.generatedAt ?? Date.now(),
     status: 'unavailable',
-    runtimeProfile: input.profile,
-    serverProfileId: input.profile,
     profile: { id: input.profile, simulated: false, source: 'unavailable', dimension: 'unknown', connectionEpoch: 'unknown', bodyEpoch: 'unknown' },
     provider: { ...capability, provider: 'unknown', configured: false, transport: 'unavailable', networkEnabled: false, canonicalPath: false },
     network: { state: 'disabled', reason: 'network-gate-disabled' },

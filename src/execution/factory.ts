@@ -1,3 +1,5 @@
+import { createTargetRegistry } from '../compat/target.js';
+import type { AdapterRegistry, ResolvedBundle } from '../compat/registry.js';
 import { FakeClientBridge } from '../bridge/fake/index.js';
 import type { ClientBridgeCapabilities } from '../bridge/capabilities.js';
 import { SQLiteStore } from '../persistence/store.js';
@@ -7,6 +9,7 @@ import { Executor, InputArbiter, leaseContextEpoch } from './runtime.js';
 import { ExecutionAdmission } from './admission.js';
 import { RuntimeOwnershipLock, type OwnershipLockOptions } from './ownership.js';
 import { MemoryService, type MemoryScope } from '../autonomous/memory.js';
+import { canonicalScopeKey, resolveStableScope, type StableScope } from '../contracts/context.js';
 import { KnowledgeService } from '../autonomous/knowledge.js';
 import { UnavailableProvider, type ModelProvider } from '../providers/scripted/index.js';
 import { createConfiguredProvider } from '../providers/index.js';
@@ -21,6 +24,7 @@ import { ManualClock, SystemClock } from '../contracts/index.js';
 import { EventHub } from '../diagnostics/events.js';
 import { ControlService } from '../control/service.js';
 import { GoalManager, TaskScheduler } from '../autonomous/tasks.js';
+import { SessionSupervisor } from '../autonomous/session.js';
 import type { ProviderMetadata } from '../control/dto.js';
 import { navigate } from '../skills/navigation.js';
 import type { MotorFactory } from '../motor/controller.js';
@@ -31,6 +35,7 @@ export type RuntimeMotorPort = MotorFactory;
 
 /** The explicit dependency container every profile is assembled from. */
 export type RuntimeDependencies = {
+  gameBundle: ResolvedBundle;
   clock: Clock;
   store: SQLiteStore;
   events: EventHub;
@@ -43,19 +48,14 @@ export type RuntimeDependencies = {
 };
 
 export type RuntimeFactoryOptions = {
+  adapterRegistry?: AdapterRegistry;
+  gameBundleId?: string;
   profile?: RuntimeProfile;
   db?: string;
   clock?: Clock;
   store?: SQLiteStore;
   events?: EventHub;
   provider?: ModelProvider;
-  /**
-   * Explicit provider registry for the canonical loop (for example `{ openai, anthropic }`).
-   * Supplying this enables provider switching: every entry is registered, and the initial
-   * provider is selected by `modelProvider` (or the first entry). These providers are injected
-   * dependencies, hence offline (`networkEnabled: false`).
-   */
-  providers?: Record<string, ModelProvider>;
   /** Explicit body adapter. `bridge` is the legacy alias for the same dependency. */
   body?: ClientBridgeCapabilities;
   bridge?: ClientBridgeCapabilities;
@@ -84,11 +84,12 @@ export type RuntimeFactoryOptions = {
   /** Consecutive recovery attempts allowed before the session stays suspended. */
   maxRecoveryAttempts?: number;
   lockOptions?: OwnershipLockOptions;
+  shutdownGraceMs?: number;
 };
+export type ShutdownReport = { complete: boolean; uncertain: string[] };
 export type RuntimeAssembly = {
+  gameBundle: ResolvedBundle;
   bridge: ClientBridgeCapabilities;
-  /** The profile this runtime was actually assembled from, separate from the body/server id. */
-  runtimeProfile: RuntimeProfile;
   store: SQLiteStore;
   session: SessionRuntime;
   router: ToolRouter;
@@ -99,9 +100,16 @@ export type RuntimeAssembly = {
   control: ControlService;
   goalManager: import('../autonomous/tasks.js').GoalManager;
   scheduler: import('../autonomous/tasks.js').TaskScheduler;
+  sessionSupervisor: import('../autonomous/session.js').SessionSupervisor;
   /** Durable, scoped memory (places/episodes) consumed by router and control. */
   memory: MemoryService;
   memoryScope: MemoryScope;
+  /**
+   * Canonical stable scope key for this runtime's control/memory reads and durable writes,
+   * derived once from `bridge.context` (tolerant of a body that does not expose account
+   * identity). Control reads and writes must both use this so they cannot disagree.
+   */
+  runtimeScopeKey: () => string;
   /** Release-backed knowledge service shared by every knowledge tool. */
   knowledge: KnowledgeService;
   /** Pause/cancel/human-control state for in-flight skill runs. */
@@ -116,16 +124,10 @@ export type RuntimeAssembly = {
   /** Explicit dependency container the runtime was assembled from. */
   dependencies: RuntimeDependencies;
   ownerId: string;
-  /** Raw configured input gate; does not by itself prove input can be dispatched. */
   inputsEnabled: boolean;
-  /**
-   * Effective control state from the attached bridge service. Without an attached service
-   * the runtime's own input setting is authoritative and this is always open.
-   */
-  controlOpen(): boolean;
   ownership?: RuntimeOwnershipLock;
   startBridgeService?(): Promise<void>;
-  close(): void;
+  close(): Promise<ShutdownReport>;
 };
 
 /**
@@ -151,88 +153,37 @@ function assertBodyAdapterContext(bridge: ClientBridgeCapabilities, adapter: Bod
   if (actual.dimension !== expected.dimension) throw mismatch('dimension');
 }
 
-type ResolvedProvider = {
-  provider: ModelProvider;
-  metadata: ProviderMetadata;
-  canonical: boolean;
-  /** Registry key used by ProviderSession/AgentLoop (may be a caller-defined name). */
-  providerName: string;
-  registry: Record<string, ModelProvider>;
-  metadataByName: Record<string, ProviderMetadata>;
-};
-
-function metadataProviderName(name: string): ProviderMetadata['provider'] {
-  return name === 'openai' || name === 'anthropic' || name === 'scripted' ? name : 'unknown';
-}
-
-/** Injected providers are fixture/offline dependencies; metadata must say so. */
-function injectedMetadata(name: string, provider: ModelProvider, model?: string): ProviderMetadata {
-  return {
-    provider: metadataProviderName(name),
-    configured: !(provider instanceof UnavailableProvider),
-    ...(model ? { model } : {}),
-    networkEnabled: false,
-    transport: 'fixture',
-  };
-}
+type ResolvedProvider = { provider: ModelProvider; metadata: ProviderMetadata; canonical: boolean; providerName: ProviderMetadata['provider'] };
 
 /**
  * The only provider gate. A configured network provider is built by createConfiguredProvider;
  * the factory never constructs a FetchTransport directly and metadata comes from that result.
- *
- * Every resolved assembly also returns a registry of all providers it could switch to. A
- * singleton configuration registers only itself (an honest boundary); an explicit injected
- * registry registers every entry.
  */
 function resolveProvider(options: RuntimeFactoryOptions): ResolvedProvider {
-  if (options.providers) {
-    const registry: Record<string, ModelProvider> = { ...options.providers };
-    // An explicitly injected single provider is also registered when its inferred key is free.
-    if (options.provider) {
-      const inferred = inferProviderName(options.provider);
-      if (!(inferred in registry)) registry[inferred] = options.provider;
-    }
-    if (Object.keys(registry).length === 0) throw new Error('provider-registry-empty');
-    const requested = options.modelProvider;
-    if (requested && !registry[requested]) throw new Error(`provider-registry-missing:${requested}`);
-    const providerName = requested ?? Object.keys(registry)[0]!;
-    const metadataByName: Record<string, ProviderMetadata> = Object.fromEntries(
-      Object.entries(registry).map(([name, provider]) => [name, injectedMetadata(name, provider, options.model)]),
-    );
-    return {
-      provider: registry[providerName]!,
-      metadata: { ...metadataByName[providerName]! },
-      canonical: true,
-      providerName,
-      registry,
-      metadataByName,
-    };
-  }
   if (options.provider) {
     // Injected providers are the scripted/fixture path. They are never treated as
     // network-enabled and keep the legacy AgentLoop.
     const providerName = options.modelProvider ?? inferProviderName(options.provider);
-    const metadata = injectedMetadata(providerName, options.provider, options.model);
     return {
       provider: options.provider,
-      metadata: { ...metadata },
+      metadata: {
+        provider: providerName,
+        configured: !(options.provider instanceof UnavailableProvider),
+        ...(options.model ? { model: options.model } : {}),
+        networkEnabled: false,
+        transport: 'fixture',
+      },
       canonical: false,
       providerName,
-      registry: { [providerName]: options.provider },
-      metadataByName: { [providerName]: metadata },
     };
   }
   const requested = options.modelProvider ?? 'scripted';
   if (requested === 'scripted') {
-    const metadata: ProviderMetadata = { provider: 'scripted', configured: false, ...(options.model ? { model: options.model } : {}), networkEnabled: false, transport: 'unavailable' };
-    const provider = new UnavailableProvider('scripted provider not configured');
     return {
-      provider,
-      metadata: { ...metadata },
+      provider: new UnavailableProvider('scripted provider not configured'),
+      metadata: { provider: 'scripted', configured: false, ...(options.model ? { model: options.model } : {}), networkEnabled: false, transport: 'unavailable' },
       canonical: false,
       providerName: 'scripted',
-      registry: { scripted: provider },
-      metadataByName: { scripted: metadata },
     };
   }
   const configured = createConfiguredProvider({
@@ -243,28 +194,26 @@ function resolveProvider(options: RuntimeFactoryOptions): ResolvedProvider {
     model: options.model,
     transport: options.transport,
   });
-  const metadata: ProviderMetadata = {
-    provider: configured.name,
-    configured: configured.configured,
-    ...(options.model ? { model: options.model } : {}),
-    // Truth comes from the gate, not from the raw option: an injected transport is offline
-    // and a disabled gate can never report networkEnabled=true.
-    networkEnabled: configured.networkEnabled,
-    transport: options.transport ? 'fixture' : configured.networkEnabled ? 'network' : 'unavailable',
-  };
   return {
     provider: configured.provider,
-    metadata: { ...metadata },
+    metadata: {
+      provider: configured.name,
+      configured: configured.configured,
+      ...(options.model ? { model: options.model } : {}),
+      // Truth comes from the gate, not from the raw option: an injected transport is offline
+      // and a disabled gate can never report networkEnabled=true.
+      networkEnabled: configured.networkEnabled,
+      transport: options.transport ? 'fixture' : configured.networkEnabled ? 'network' : 'unavailable',
+    },
     // The canonical ProviderSession path is the production path only for a configured provider.
     canonical: configured.configured,
     providerName: configured.name,
-    registry: { [configured.name]: configured.provider },
-    metadataByName: { [configured.name]: metadata },
   };
 }
 
 export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssembly {
   const profile = options.profile ?? 'simulated';
+  const gameBundle = (options.adapterRegistry ?? createTargetRegistry()).resolve(options.gameBundleId ?? 'java-26.3-candidate', { release: '26.3', protocol: 777 });
   if (!['simulated', 'simulated-3d', 'client-offline', 'unsupported'].includes(profile)) throw new Error(`unknown-profile:${profile}`);
   if (profile === 'unsupported') throw new Error('unsupported-profile');
   const providedBody = options.body ?? options.bridge;
@@ -317,7 +266,8 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     // An attached bridge service owns relay/observer/helper control. Its admission gate starts
     // closed and a failure re-closes it; the runtime must enforce that state instead of only
     // reporting it. Without an attached service the runtime's own inputs setting is authoritative.
-    const controlOpen = () => !bridgeService || bridgeService.status().admissionOpen;
+    let closing = false;
+    const controlOpen = () => !closing && (!bridgeService || bridgeService.status().admissionOpen) && (simulatedProfile || gameBundle.assess(['protocol.decode', 'control.motion']).available);
     const arbiter = new InputArbiter(() => clock.now(), () => leaseContextEpoch(bridge.context));
     // A 3D navigation skill advances virtual time while it plans/executes bounded steps; the
     // legacy 1s default would abort legitimate routes. Progress still renews the watchdog, and
@@ -331,35 +281,42 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
     const resolvedProvider = resolveProvider(options);
     const provider = resolvedProvider.provider;
     const memory = new MemoryService(store, [], { now: () => clock.now() });
-    // The stable scope is derived from the current body context. Connection/body epochs are
-    // excluded, but a dimension/account/world change must move control reads to the new scope
-    // instead of leaving them pointed at the scope captured at assembly time.
-    const scopeOf = () => memoryScopeOf(bridge.context);
-    const memoryScope = scopeOf();
+    // The runtime's internal stable scope. This is the single place a local/fixture runtime that
+    // does not expose account identity derives a *stable* scope: it mirrors the public
+    // `resolveStableScope` rule exactly when the identity is complete, and falls back to a
+    // profile-scoped sentinel only when account/world/dimension is genuinely absent. Control
+    // reads, memory and receipts all derive from this one value, so a write and its later read
+    // always agree instead of one side resolving where the other leaves the scope unresolved.
+    const runtimeStableScope = (): StableScope => {
+      const resolved = resolveStableScope(bridge.context);
+      return resolved.status === 'resolved' ? resolved.scope : {
+        serverProfileId: bridge.context.serverProfileId ?? 'simulated',
+        accountId: bridge.context.accountId ?? 'local',
+        worldGenerationId: bridge.context.worldGenerationId ?? 'local',
+        dimensionId: bridge.context.dimension ?? 'overworld',
+      };
+    };
+    const runtimeScopeKey = () => canonicalScopeKey(runtimeStableScope());
+    const memoryScope = memoryScopeOf(bridge.context);
     const knowledge = new KnowledgeService({ store });
     const lifecycle = new SkillLifecycle(undefined, { now: () => clock.now() });
     const nav: RuntimeNavPort = options.nav ?? { navigate };
     const motor = options.motor;
     const router = new ToolRouter(bridge, store, session.events, executor, memory, () => clock.now(), admission, { knowledge, lifecycle, memoryScope, nav, ...(motor ? { motor } : {}) });
-    const loop = new AgentLoop(provider, router, 8, {
-      canonical: resolvedProvider.canonical,
-      providerName: resolvedProvider.providerName,
-      providers: resolvedProvider.registry,
-      providerMetadata: resolvedProvider.metadata,
-      providerMetadataByName: resolvedProvider.metadataByName,
-    });
+    const loop = new AgentLoop(provider, router, 8, { canonical: resolvedProvider.canonical, providerName: resolvedProvider.providerName });
     const providerMetadata = resolvedProvider.metadata;
     const control = new ControlService(undefined, providerMetadata);
-    const goalManager = new GoalManager(store, session.events, () => bridge.context);
+    const goalManager = new GoalManager(store, session.events);
     // The scheduler's wake hook really advances one decision turn through the same AgentLoop.
     const scheduler = new TaskScheduler(session.events, async (reason) => {
       if (control.pausedValue || control.stoppingValue) return;
-      // Only a goal in this exact body scope may drive a turn: a goal from another
-      // account/world/dimension is not this runtime's work.
-      const active = store.findGoalForScope(scopeOf(), ['active']);
+      // Use the actual active goal (and its revision) so user goals can progress; without one
+      // there is nothing to drive and the wake is a no-op.
+      const active = store.listGoals().find(goal => goal.status === 'active');
       if (!active) return;
       await loop.run([{ role: 'user', content: `Scheduler wake: ${reason}. Continue the active goal or report the next blocked step.` }], undefined, undefined, { goalId: active.goal_id, goalRevision: active.revision, store, owner: session.ownerId });
     }, 25);
+    const sessionSupervisor = new SessionSupervisor(session.events);
     // Wire the scheduler to the event stream so goal/execution/effect/session events coalesce
     // into a single wake instead of a per-tick model call.
     const unsubscribeScheduler = session.events.subscribe(event => scheduler.observe(event));
@@ -374,27 +331,69 @@ export function createRuntime(options: RuntimeFactoryOptions = {}): RuntimeAssem
       try { executor.cancelAll(`bridge:${event.type}`); } catch { /* cancellation is best effort */ }
       try { lifecycle.humanControl(`bridge:${event.type}`); } catch { /* lifecycle may already be closed */ }
     });
-    const dependencies: RuntimeDependencies = { clock, store, events: session.events, provider, body: bridge, nav, motor, ...(bodyAdapter ? { bodyAdapter } : {}) };
-    let closed = false;
+    const dependencies: RuntimeDependencies = { gameBundle, clock, store, events: session.events, provider, body: bridge, nav, motor, ...(bodyAdapter ? { bodyAdapter } : {}) };
+    let shutdownPromise: Promise<ShutdownReport> | undefined;
     const startBridgeService = bridgeService ? async () => { await bridgeService.start(); } : undefined;
     const assembly = {
-      bridge, runtimeProfile: profile, store, session, router, provider, providerMetadata, loop, clock, control, goalManager, scheduler,
-      memory, knowledge, lifecycle, ...(bodyAdapter ? { bodyAdapter } : {}),
-      /** Recomputed on read so a dimension/world change closes the previous scope immediately. */
-      get memoryScope() { return scopeOf(); },
+      gameBundle, bridge, store, session, router, provider, providerMetadata, loop, clock, control, goalManager, scheduler, sessionSupervisor,
+      memory, memoryScope, runtimeScopeKey, knowledge, lifecycle, ...(bodyAdapter ? { bodyAdapter } : {}),
       providerSession: loop.providerSession, canonicalProviderPath: loop.canonicalPath,
       ...(bridgeService ? { bridgeService, startBridgeService } : {}),
-      dependencies, ownerId: session.ownerId, inputsEnabled, controlOpen, ownership,
-      close() {
-        if (closed) return;
-        closed = true;
+      dependencies, ownerId: session.ownerId, inputsEnabled, ownership,
+      close(): Promise<ShutdownReport> {
+        if (shutdownPromise) return shutdownPromise;
+        let resolveShutdown!: (report: ShutdownReport) => void;
+        shutdownPromise = new Promise<ShutdownReport>(resolve => { resolveShutdown = resolve; });
+        const uncertain: string[] = [];
+        const attempt = (name: string, fn: () => unknown) => { try { fn(); } catch { uncertain.push(name); } };
+        closing = true;
+        control.beginShutdown();
         unsubscribeScheduler();
         unsubscribeBridgeService?.();
         scheduler.close();
-        if (bridgeService) void bridgeService.stop('runtime-close').catch(() => undefined);
+        attempt('execution-cancel-failed', () => executor.cancelAll('runtime-close'));
+        attempt('lifecycle-cancel-failed', () => lifecycle.humanControl('runtime-close'));
+        attempt('provider-cancel-failed', () => provider.cancel());
         const shutdown = (bridge as { shutdown?: () => Promise<void> }).shutdown;
-        if (typeof shutdown === 'function') void shutdown.call(bridge).catch(() => undefined);
-        try { if (ownsStore) store.close(); } finally { ownership?.release(); }
+        const finalize = (): ShutdownReport => {
+          try {
+            if (ownsStore) store.close();
+            const released = ownership?.release();
+            return released === false ? { complete: false, uncertain: ['ownership-release-failed'] } : { complete: true, uncertain: [] };
+          } catch { return { complete: false, uncertain: ['storage-close-failed'] }; }
+        };
+        // Fixture-only runtimes have no asynchronous body resources; keep their cleanup
+        // synchronous for older callers while returning the same awaitable contract.
+        if (!bridgeService && !shutdown && executor.idle && !uncertain.length) {
+          void sessionSupervisor.stop();
+          resolveShutdown(finalize());
+          return shutdownPromise;
+        }
+        void (async (): Promise<ShutdownReport> => {
+          const cleanup = async (name: string, fn: () => unknown) => {
+            try { await fn(); } catch { uncertain.push(name); }
+          };
+          const work = Promise.all([
+            cleanup('execution-settlement-failed', () => executor.whenIdle()),
+            cleanup('session-stop-failed', () => sessionSupervisor.stop()),
+            cleanup('bridge-stop-failed', () => bridgeService?.stop('runtime-close')),
+            cleanup('body-shutdown-failed', () => shutdown?.call(bridge)),
+          ]);
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const deadline = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), options.shutdownGraceMs ?? 3_000); });
+          const completed = await Promise.race([work.then(() => true), deadline]);
+          if (timer) clearTimeout(timer);
+          if (!completed) uncertain.push('shutdown-deadline-exceeded');
+          const bridgeShutdown = bridgeService?.status().shutdown;
+          if (bridgeShutdown?.forced) uncertain.push('bridge-forced-shutdown-unverified');
+          if (bridgeShutdown?.releaseUncertain) uncertain.push('bridge-release-unverified');
+          if (bridgeShutdown?.errors.length) uncertain.push(...bridgeShutdown.errors);
+          // Unknown cleanup retains DB ownership; another owner must not race old finalizers.
+          if (uncertain.length) return { complete: false, uncertain };
+          return finalize();
+        })().then(resolveShutdown, () => resolveShutdown({ complete: false, uncertain: [...uncertain, 'unexpected-shutdown-failure'] }));
+        return shutdownPromise;
+
       },
     } as RuntimeAssembly;
     control.attach(assembly);

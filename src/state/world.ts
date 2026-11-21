@@ -1,5 +1,6 @@
 import type { BodyContext, WorldSnapshot } from '../contracts/index.js';
 import { WorldSnapshotSchema } from '../contracts/index.js';
+import { canonicalScopeKey, resolveStableScope, type ScopeResolution } from '../contracts/context.js';
 
 type Cell = 'free'|'blocked'|'unknown';
 export type Observation = WorldSnapshot & { observedAt:number; sequence:string; sourceEpoch?:string; ttl?:number; baseline?:'full'|'delta' };
@@ -122,6 +123,24 @@ export class WorldState {
     return clone(WorldSnapshotSchema.parse({...this.current,revision:this.revision.toString(),gap,fields,freshness}));
   }
   getState(){return this.snapshot();}
+  /**
+   * The stable identity of this world. Resolved only when every durable field is present;
+   * callers must treat an unresolved result as "do not read or write trustworthy memory"
+   * rather than filling the missing fields from the current session.
+   */
+  stableScope(): ScopeResolution { return resolveStableScope(this.context); }
+  /** Canonical scope key for this observation stream, or undefined when unresolved. */
+  scopeKey(): string | undefined {
+    const resolved = this.stableScope();
+    return resolved.status === 'resolved' ? canonicalScopeKey(resolved.scope) : undefined;
+  }
+  /** Copy of the immutable bridge context (never a live mutable reference). */
+  contextSnapshot(): BodyContext { return clone(this.context); }
+  matchesScope(value: unknown): boolean {
+    const resolved = resolveStableScope(value as Partial<BodyContext> | undefined);
+    const own = this.stableScope();
+    return resolved.status === 'resolved' && own.status === 'resolved' && canonicalScopeKey(resolved.scope) === canonicalScopeKey(own.scope);
+  }
   getInventory(){const s=this.snapshot();const evidence=s.fields.inventory;return{count:evidence?.available?s.inventory:undefined,source:evidence?.source??s.source,freshness:evidence?.freshness??'unknown'};}
   queryLocalWorld(){const s=this.snapshot();return{cells:clone(s.cells),revision:s.revision,gap:s.gap,freshness:s.freshness};}
   subscribe(l:(s:WorldSnapshot)=>void){this.listeners.add(l);return()=>this.listeners.delete(l);}

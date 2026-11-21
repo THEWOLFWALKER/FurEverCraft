@@ -1,0 +1,3 @@
+# Agent Entry
+
+Read root `CLAUDE.md`, current v0.2 design under `docs/design/`, and `NEXT_BATCH.md`. Implement the complete authorized F/B/U/M/A/V scope in dependency order; do not stop after one chain or shrink the batch to a minimal demo. Preserve the existing repository history and user changes. Subagents may be used for non-overlapping implementation/review tasks; all changes require integration review and offline verification. Never use real Minecraft servers/worlds, paid APIs, actual SendInput, or desktop capture. Tests must be based on correct contract premises and explicit fixture provenance.

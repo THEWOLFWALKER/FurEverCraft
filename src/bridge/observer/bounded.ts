@@ -37,8 +37,7 @@ export type ObserverDirectionState = {
   frameSequence: string;
   phase: ObserverPhaseState;
   compression: ObserverCompressionState;
-  /** Present while the direction is parsed under an explicit assumed-uncompressed framing. */
-  assumedCompression?: 'uncompressed';
+  compressionThreshold: number | null;
   payloadKind: ObserverPayloadKind;
   availability: 'degraded' | 'unknown';
   stoppedReason?: string;
@@ -53,7 +52,6 @@ export type ObserverEvent =
       frameSequence: string;
       phase: ObserverPhaseState;
       compression: ObserverCompressionState;
-      compressionAssumed?: 'uncompressed';
       availability: 'degraded';
       payload: {
         kind: ObserverPayloadKind;
@@ -68,7 +66,7 @@ export type ObserverEvent =
       kind: 'observer_gap';
       source: 'client';
       sessionEpoch: string;
-      gap: { scope: 'global' | 'domain'; reason: string; direction?: ObserverDirection; fromFrame?: string; toFrame?: string; dropped?: number };
+      gap: { scope: 'global' | 'domain'; reason: string; direction?: ObserverDirection; fromFrame?: string; toFrame?: string };
     };
 export type ObserverListener = (event: ObserverEvent) => unknown;
 type PendingFrame = DecodedFrame;
@@ -94,30 +92,35 @@ export type BoundedObserverOptions = {
   /** Injectable inflation for tests; defaults to bounded zlib inflate. */
   inflate?: (data: Buffer, maxOutputLength: number) => Buffer;
   now?: () => number;
+  /**
+   * Relay connection epoch this observer belongs to. Each TCP connection gets its own
+   * observer, so events are attributed to the connection instead of a shared worker epoch.
+   */
+  sessionEpoch?: string;
 };
 
 export class BoundedObserver {
-  readonly sessionEpoch = `observer_${randomUUID()}`;
+  readonly sessionEpoch: string;
   private healthValue: ObserverHealth = 'degraded';
   private readonly listeners = new Set<ObserverListener>();
+  private readonly isolatedListeners = new Set<ObserverListener>();
   private readonly decoders: Record<ObserverDirection, DirectionalFrameDecoder>;
   private readonly pending: PendingFrame[] = [];
   private queuedBytes = 0;
   private stopped = false;
   private draining = false;
   private inflight = 0;
-  /**
-   * A global gap parks both directions. Neither direction may resume until it has been
-   * explicitly reset; resetting one direction must not silently un-park the other one that
-   * never regained an anchor. `resetAll()` clears the park for both directions atomically.
-   */
-  private readonly parkedDirections = new Set<ObserverDirection>();
+  private readonly slotWaiters = new Set<() => void>();
+  private readonly stopSignal: Promise<void>;
+  private resolveStopSignal!: () => void;
   private readonly limits: ObserverLimits;
   private readonly now: () => number;
 
-  constructor(options: Partial<ObserverLimits> & Pick<BoundedObserverOptions, 'recogniseControl' | 'inflate' | 'now'> = {}) {
+  constructor(options: Partial<ObserverLimits> & Pick<BoundedObserverOptions, 'recogniseControl' | 'inflate' | 'now' | 'sessionEpoch'> = {}) {
     this.limits = { ...defaults, ...options };
+    this.sessionEpoch = options.sessionEpoch ?? `observer_${randomUUID()}`;
     this.now = options.now ?? (() => Number(process.hrtime.bigint() / 1_000_000n));
+    this.stopSignal = new Promise<void>(resolve => { this.resolveStopSignal = resolve; });
     const decoderOptions = {
       recogniseControl: options.recogniseControl,
       inflate: options.inflate,
@@ -133,15 +136,11 @@ export class BoundedObserver {
   queued(): { frames: number; bytes: number } { return { frames: this.pending.length, bytes: this.queuedBytes }; }
 
   attach(direction: ObserverDirection, chunk: Uint8Array): void {
-    if (this.stopped || this.parkedDirections.has(direction)) return;
+    if (this.stopped) return;
     const decoder = this.decoders[direction];
     if (decoder.stopped) return;
     const result = decoder.attach(chunk);
-    for (const frame of result.frames) {
-      // Once the queue overflows, the remainder of this chunk is not processed and no
-      // drain starts: later frames from the same chunk must not be presented as observed.
-      if (!this.enqueue(frame)) return;
-    }
+    for (const frame of result.frames) this.enqueue(frame);
     if (result.failure) {
       this.markUnknownFromDecoder(direction, result.failure.reason);
       return;
@@ -180,42 +179,23 @@ export class BoundedObserver {
 
   markUnknown(reason = 'framing-loss', direction?: ObserverDirection): void {
     this.healthValue = 'unknown';
-    this.parkBoth();
     if (direction) {
       this.decoders[direction].markUnknown(reason);
+      this.dropPending(direction);
     } else {
-      for (const key of Object.keys(this.decoders) as ObserverDirection[]) this.decoders[key].markUnknown(reason);
+      for (const key of Object.keys(this.decoders) as ObserverDirection[]) {
+        this.decoders[key].markUnknown(reason);
+        this.dropPending(key);
+      }
     }
-    // A global gap invalidates pending continuity for both directions, not just the one
-    // whose decoder reported the failure.
-    this.dropPending();
     this.gap('global', reason, direction);
   }
 
-  /**
-   * Reset one direction. This does not clear the global park for the other direction:
-   * after a global gap both directions lost their anchor and each must be reset.
-   */
   reset(direction: ObserverDirection): void {
+    // A reset starts a new session/sequence for one direction only. It clears framing
+    // and control state for that direction; the other direction is untouched.
     this.decoders[direction].reset();
     this.dropPending(direction);
-    this.parkedDirections.delete(direction);
-    this.recomputeHealth();
-  }
-
-  /** Reset both directions together, clearing a global park only once both are re-anchored. */
-  resetAll(): void {
-    for (const key of Object.keys(this.decoders) as ObserverDirection[]) this.decoders[key].reset();
-    this.dropPending();
-    this.parkedDirections.clear();
-    this.recomputeHealth();
-  }
-
-  private parkBoth(): void {
-    for (const key of Object.keys(this.decoders) as ObserverDirection[]) this.parkedDirections.add(key);
-  }
-
-  private recomputeHealth(): void {
     const directions = this.directionStates();
     if (directions.some(state => state.availability === 'unknown')) this.healthValue = 'unknown';
     else if (directions.some(state => state.phase === 'UNKNOWN')) this.healthValue = 'degraded';
@@ -231,9 +211,9 @@ export class BoundedObserver {
         frameSequence: decoder.frameSequence,
         phase: decoder.phase,
         compression: decoder.compression,
-        ...(decoder.compressionAssumed === undefined ? {} : { assumedCompression: decoder.compressionAssumed }),
+        compressionThreshold: decoder.compressionThreshold,
         payloadKind: PAYLOAD_KIND,
-        availability: decoder.stopped || this.parkedDirections.has(direction) ? 'unknown' : 'degraded',
+        availability: decoder.stopped ? 'unknown' : 'degraded',
         ...(decoder.stopReason === undefined ? {} : { stoppedReason: decoder.stopReason }),
       };
     });
@@ -241,26 +221,24 @@ export class BoundedObserver {
 
   private markUnknownFromDecoder(direction: ObserverDirection, reason: string): void {
     this.healthValue = 'unknown';
-    this.parkBoth();
-    this.dropPending();
+    this.dropPending(direction);
     this.gap('global', reason, direction);
   }
 
-  private enqueue(frame: DecodedFrame): boolean {
+  private enqueue(frame: DecodedFrame): void {
     if (this.pending.length >= this.limits.maxQueuedFrames || this.queuedBytes + frame.payloadBytes > this.limits.maxQueuedBytes) {
       // Without a decoded packet class we cannot prove the dropped frame was not a
       // control packet, so continuity is lost globally; stop interpreting rather than
       // skipping frames and pretending later state is authoritative.
-      this.decoders[frame.direction].markUnknown('queue-overflow');
-      this.parkBoth();
-      this.dropPending();
+      const decoder = this.decoders[frame.direction];
+      decoder.markUnknown('queue-overflow');
+      this.dropPending(frame.direction);
       this.healthValue = 'unknown';
       this.gap('global', 'queue-overflow', frame.direction, frame.frameSequence);
-      return false;
+      return;
     }
     this.pending.push(frame);
     this.queuedBytes += frame.payloadBytes;
-    return true;
   }
 
   private dropPending(direction?: ObserverDirection): void {
@@ -276,21 +254,35 @@ export class BoundedObserver {
     if (this.draining || this.stopped) return;
     this.draining = true;
     try {
-      while (this.pending.length) {
-        const batch = this.pending.splice(0, Math.max(1, this.limits.maxConcurrency - this.inflight));
-        for (const item of batch) this.queuedBytes = Math.max(0, this.queuedBytes - item.payloadBytes);
-        await Promise.all(batch.map(item => this.dispatch(item)));
+      while (!this.stopped && this.pending.length > 0) {
+        // Never dispatch over capacity. A timed-out listener keeps its slot until it truly
+        // settles (or the observer stops), so capacity can legitimately be zero here.
+        if (this.inflight >= this.limits.maxConcurrency) {
+          await this.waitForSlot();
+          continue;
+        }
+        const item = this.pending.shift()!;
+        this.queuedBytes = Math.max(0, this.queuedBytes - item.payloadBytes);
+        void this.dispatch(item);
       }
     } finally {
       this.draining = false;
+      if (!this.stopped && this.pending.length > 0) void this.drain();
     }
   }
 
+  private waitForSlot(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    return new Promise<void>(resolve => { this.slotWaiters.add(resolve); });
+  }
+
+  private releaseSlot(): void {
+    this.inflight = Math.max(0, this.inflight - 1);
+    const waiter = this.slotWaiters.values().next().value as (() => void) | undefined;
+    if (waiter) { this.slotWaiters.delete(waiter); waiter(); }
+  }
+
   private async dispatch(item: PendingFrame): Promise<void> {
-    // A global gap that landed while this frame was inflight invalidates it; do not
-    // present an observation after continuity was declared lost. A reset of this
-    // direction lifts its park, but the other direction remains parked independently.
-    if (this.parkedDirections.has(item.direction)) return;
     // Frame metadata only: the outer length is framing, not a decoded packet ID; no
     // packet fields are parsed or exposed.
     const event: ObserverEvent = {
@@ -301,7 +293,6 @@ export class BoundedObserver {
       frameSequence: item.frameSequence,
       phase: item.phase,
       compression: item.compression,
-      ...(item.compressionAssumed === undefined ? {} : { compressionAssumed: item.compressionAssumed }),
       availability: 'degraded',
       payload: {
         kind: PAYLOAD_KIND,
@@ -313,22 +304,38 @@ export class BoundedObserver {
       },
     };
     this.inflight += 1;
-    let released = false;
-    const release = () => { if (released) return; released = true; this.inflight = Math.max(0, this.inflight - 1); };
+    const outcomes = [...this.listeners]
+      .filter(listener => !this.isolatedListeners.has(listener))
+      .map(listener => {
+        let settled = false;
+        const promise = Promise.resolve()
+          .then(() => listener(event))
+          .catch(() => undefined)
+          .finally(() => { settled = true; });
+        return { listener, settled: () => settled, promise };
+      });
+    const work = Promise.all(outcomes.map(outcome => outcome.promise)).then(() => undefined);
+    let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<void>(resolve => {
       timer = setTimeout(() => {
+        timedOut = true;
         if (this.healthValue === 'healthy') this.healthValue = 'degraded';
         resolve();
       }, this.limits.taskTimeoutMs);
     });
-    const work = Promise.all([...this.listeners].map(listener => Promise.resolve().then(() => listener(event)).catch(() => undefined))).then(() => undefined);
-    await Promise.race([work, timeout]);
-    // On timeout release the slot immediately so a hung listener cannot exceed
-    // maxConcurrency. The listener may keep running; its settlement never double-releases.
-    release();
-    work.finally(() => release());
+    await Promise.race([work, timeout, this.stopSignal]);
     if (timer) clearTimeout(timer);
+    if (timedOut && !this.stopped) {
+      // A timed-out subscriber is not cancelled but must never receive another event. The
+      // concurrency slot remains occupied until its current invocation actually settles.
+      for (const outcome of outcomes) {
+        if (!outcome.settled()) this.isolatedListeners.add(outcome.listener);
+      }
+    }
+    // stop() resolves this wait even when a listener is hung, so shutdown is bounded.
+    await Promise.race([work, this.stopSignal]);
+    this.releaseSlot();
   }
 
   private gap(scope: 'global' | 'domain', reason: string, direction?: ObserverDirection, fromFrame?: string): void {
@@ -360,11 +367,14 @@ export class BoundedObserver {
     this.pending.length = 0;
     this.queuedBytes = 0;
     this.listeners.clear();
+    this.isolatedListeners.clear();
+    // Resolve any in-flight dispatch/drain waits. Hung listeners may still be running, but
+    // stop() must not wait for them.
+    this.resolveStopSignal();
+    for (const waiter of [...this.slotWaiters]) { this.slotWaiters.delete(waiter); waiter(); }
   }
 }
 
-export function createBoundedObserver(
-  options: Partial<ObserverLimits> & Partial<Pick<BoundedObserverOptions, 'recogniseControl' | 'inflate' | 'now'>> = {},
-): BoundedObserver {
-  return new BoundedObserver(options);
+export function createBoundedObserver(limits: Partial<ObserverLimits> = {}): BoundedObserver {
+  return new BoundedObserver(limits);
 }

@@ -13,8 +13,7 @@ describe('providers', () => {
     expect(await collect(chunks([bytes.slice(0, 10), bytes.slice(10, 12), bytes.slice(12)]))).toEqual([{ text: '雪' }]);
   });
   it('maps generic tools to native OpenAI and Anthropic schemas', async () => {
-    const calls: unknown[] = [];
-    const transport: HttpTransport = { async post(url, body) { calls.push(body); return url.includes('/messages') ? { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' } : transportResponse; } };
+    const calls: unknown[] = []; const transport: HttpTransport = { async post(_url, body) { calls.push(body); return transportResponse; } };
     await new OpenAIProvider(transport, 'http://offline', 'model').complete([], [{ name: 'lookup', description: 'look up', parameters: { type: 'object', properties: { q: { type: 'string' } } } }]);
     await new AnthropicProvider(transport, 'http://offline', 'model').complete([{ role: 'system', content: 'rules' }, { role: 'user', content: 'hi' }], [{ name: 'lookup', description: 'look up', parameters: { type: 'object', properties: {} } }]);
     expect((calls[0] as any).tools[0]).toEqual({ type: 'function', function: { name: 'lookup', description: 'look up', parameters: { type: 'object', properties: { q: { type: 'string' } } } } });

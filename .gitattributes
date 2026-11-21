@@ -1,0 +1,7 @@
+# Native helpers and committed manifests are hashed as raw bytes by Windows CI.
+# Pin them to LF so checkout on any host produces identical manifests and byte counts.
+native/** text eol=lf
+configs/** text eol=lf
+
+*.ps1 text eol=lf
+*.cs text eol=lf

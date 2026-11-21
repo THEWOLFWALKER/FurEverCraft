@@ -1,6 +1,29 @@
 {
   "profile": "client-offline",
+  "protocolVersion": 777,
+  "dataVersion": 5023,
+  "minecraftVersion": "26.3",
+  "gameJavaRequirement": "25",
+  "inputBackend": "SDL3",
+  "versionProfileStatus": "candidate",
   "targetHost": "127.0.0.1",
   "targetPort": 25565,
-  "allowMinecraftUpstream": false
+  "usernameEnv": "MINECRAFT_USERNAME",
+  "allowModelNetwork": false,
+  "allowMinecraftUpstream": false,
+  "allowOsInput": false,
+  "allowScreenCapture": false,
+  "windowsHelper": {
+    "scriptPath": "native/windows/FurEverCraft.Helper.ps1",
+    "corePath": "native/windows/FurEverCraft.Helper.Core.cs",
+    "heartbeatIntervalMs": 250,
+    "heartbeatTimeoutMs": 500,
+    "pulseTtlMs": 150,
+    "requestTimeoutMs": 500,
+    "releaseTimeoutMs": 250,
+    "shutdownTimeoutMs": 500,
+    "dedupCapacity": 4096,
+    "dedupTtlMs": 600000,
+    "dryRun": true
+  }
 }

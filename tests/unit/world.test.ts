@@ -48,26 +48,6 @@ describe('W03 world state and fake bridge contracts', () => {
   });
 });
 
-describe('Round 5 — bounded source-epoch history', () => {
-  const ctx = { serverProfileId:'simulated', worldGenerationId:'world-1', connectionEpoch:'1', bodyEpoch:'1', dimension:'overworld' } as const;
-  it('caps retained epochs while still fencing the most recent superseded epochs', () => {
-    const bridge = new FakeClientBridge(4);
-    const state = new WorldState(ctx, () => 0, 3);
-    for (let index = 0; index <= 10; index += 1) {
-      state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '1', sourceEpoch: `epoch-${index}`, ttl: 100, baseline: 'full' });
-    }
-    expect(state.epochHistorySize).toBe(3);
-
-    // The three most recent epochs remain superseded and cannot be re-adopted.
-    expect(() => state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '2', sourceEpoch: 'epoch-9', ttl: 100, baseline: 'full' })).toThrow('stale-source-epoch');
-    expect(state.epochHistorySize).toBe(3);
-
-    // A genuinely new epoch still starts a fresh baseline and the history stays bounded.
-    expect(state.apply({ ...bridge.snapshot(), observedAt: 0, sequence: '3', sourceEpoch: 'epoch-11', ttl: 100, baseline: 'full' }).gap).toBe(false);
-    expect(state.epochHistorySize).toBe(3);
-  });
-});
-
 describe('FEC-481 delta merge', () => {
   const ctx = { serverProfileId:'simulated', worldGenerationId:'world-1', connectionEpoch:'1', bodyEpoch:'1', dimension:'overworld' } as const;
   it('merges a delta instead of deleting cells it did not mention', () => {

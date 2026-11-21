@@ -1,23 +1,16 @@
 import type { CanonicalImagePart, CanonicalMessage, CanonicalToolCall, ModelMessage, ModelResponse, ToolCall } from './scripted/index.js';
-import { jsonText, normalizeToolArguments, parseToolArguments, ProviderError, utf8Bytes } from './shared.js';
+import { jsonText, parseToolArguments, ProviderError, utf8Bytes } from './shared.js';
 
 export type ProviderName = 'openai' | 'anthropic';
 
 const toolResultId = (message: ModelMessage) => message.toolCallId ?? message.toolResult?.toolCallId;
 
-/** Byte ceiling for retained canonical history (a token-budget proxy). */
-export const MAX_CANONICAL_HISTORY_BYTES = 256 * 1024;
-
 /**
  * Validate the canonical contract before either provider serializes it. The check is about
  * pairing/order, not about provider-private blocks: canonical history is the only thing a
  * provider ever sees, so switching providers cannot leak a foreign private payload.
- *
- * Serializers set `requireComplete`: a request must never carry an assistant tool call whose
- * result has not been recorded. Appends use the permissive form so the assistant message can
- * be stored before its results exist.
  */
-export function validateCanonicalHistory(messages: readonly CanonicalMessage[], provider?: string, options: { requireComplete?: boolean } = {}): void {
+export function validateCanonicalHistory(messages: readonly CanonicalMessage[], provider?: string): void {
   const calls = new Map<string, { index: number; resultSeen: boolean }>();
   for (let index = 0; index < messages.length; index++) {
     const message = messages[index]!;
@@ -26,8 +19,8 @@ export function validateCanonicalHistory(messages: readonly CanonicalMessage[], 
         if (!call || typeof call.id !== 'string' || !call.id || typeof call.name !== 'string' || !call.name) throw new ProviderError('provider-invalid-tool-call', undefined, provider);
         if (calls.has(call.id)) throw new ProviderError(`provider-duplicate-tool-call-id:${call.id}`, undefined, provider);
         if (!Number.isInteger(index)) throw new ProviderError('provider-invalid-history', undefined, provider);
-        // Blank arguments are normalized to `{}`; a truncated fragment is rejected.
-        parseToolArguments(normalizeToolArguments(call.arguments, provider), provider);
+        // The empty string is a valid JSON object only when parsed; reject obviously incomplete args.
+        parseToolArguments(call.arguments ?? '', provider);
         calls.set(call.id, { index, resultSeen: false });
       }
     }
@@ -40,7 +33,6 @@ export function validateCanonicalHistory(messages: readonly CanonicalMessage[], 
       call.resultSeen = true;
     }
   }
-  if (options.requireComplete && !isToolHistoryComplete(messages)) throw new ProviderError('provider-incomplete-tool-history', undefined, provider);
 }
 
 /** True when the final assistant tool calls all have results. */
@@ -62,7 +54,7 @@ const textParts = (message: CanonicalMessage): unknown[] => {
 
 /** OpenAI Chat Completions serialization from canonical history. */
 export function openAIMessages(messages: ModelMessage[]): unknown[] {
-  validateCanonicalHistory(messages, 'openai', { requireComplete: true });
+  validateCanonicalHistory(messages, 'openai');
   return messages.map(message => {
     const content = message.images?.length
       ? [...textParts(message), ...message.images.map(imageToOpenAI)]
@@ -72,7 +64,7 @@ export function openAIMessages(messages: ModelMessage[]): unknown[] {
       return {
         role: 'assistant',
         content: content === '' || (Array.isArray(content) && content.length === 0) ? null : content,
-        tool_calls: message.toolCalls.map(call => ({ id: call.id, type: 'function', function: { name: call.name, arguments: normalizeToolArguments(call.arguments, 'openai') } })),
+        tool_calls: message.toolCalls.map(call => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } })),
       };
     }
     if (message.role === 'tool') {
@@ -97,7 +89,7 @@ function imageToAnthropic(image: CanonicalImagePart): unknown {
  * user message, which is the only shape Anthropic accepts for parallel tool_use blocks.
  */
 export function anthropicMessages(messages: ModelMessage[]): { system?: string; messages: unknown[] } {
-  validateCanonicalHistory(messages, 'anthropic', { requireComplete: true });
+  validateCanonicalHistory(messages, 'anthropic');
   const system = messages.filter(message => message.role === 'system').map(message => typeof message.content === 'string' ? message.content : (message.content ?? []).map(part => part.text).join('\n')).filter(Boolean).join('\n');
   const mapped: unknown[] = [];
   for (let index = 0; index < messages.length; index++) {
@@ -123,7 +115,7 @@ export function anthropicMessages(messages: ModelMessage[]): { system?: string; 
     const parts: unknown[] = [...textParts(message).map(part => ({ ...(part as object), type: 'text' as const })), ...(message.images ?? []).map(imageToAnthropic)];
     if (message.role === 'assistant' && message.toolCalls?.length) {
       // tool_use blocks are emitted in assistant order after any text, matching the response shape.
-      mapped.push({ role: 'assistant', content: [...parts, ...message.toolCalls.map(call => ({ type: 'tool_use', id: call.id, name: call.name, input: parseToolArguments(normalizeToolArguments(call.arguments, 'anthropic'), 'anthropic') }))] });
+      mapped.push({ role: 'assistant', content: [...parts, ...message.toolCalls.map(call => ({ type: 'tool_use', id: call.id, name: call.name, input: parseToolArguments(call.arguments, 'anthropic') }))] });
       continue;
     }
     if (message.role === 'assistant') { mapped.push({ role: 'assistant', content: singleText(parts) }); continue; }
@@ -141,31 +133,13 @@ export function admitToolCalls(response: Pick<ModelResponse, 'toolCalls'>, maxPa
   if (!Number.isInteger(maxParallel) || maxParallel < 1) throw new ProviderError('provider-parallel-limit');
   if (calls.length > maxParallel) throw new ProviderError('provider-parallel-limit', undefined, undefined, false);
   const ids = new Set<string>();
-  const admitted: ToolCall[] = [];
   for (const call of calls) {
-    if (!call || typeof call.id !== 'string' || !call.id || typeof call.name !== 'string' || !call.name) throw new ProviderError('provider-invalid-tool-call');
+    if (!call.id || !call.name) throw new ProviderError('provider-invalid-tool-call');
     if (ids.has(call.id)) throw new ProviderError(`provider-duplicate-tool-call-id:${call.id}`);
     ids.add(call.id);
-    // Providers sometimes omit an empty argument object; canonical history always stores valid JSON.
-    admitted.push({ id: call.id, name: call.name, arguments: normalizeToolArguments(call.arguments) });
+    parseToolArguments(call.arguments);
   }
-  return admitted;
-}
-
-/**
- * Provider-neutral response guard used by ProviderSession for injected providers too. A
- * truncated or shape-less response must never be treated as a completed model turn.
- */
-export function assertModelResponse(response: unknown, provider?: string): asserts response is ModelResponse {
-  if (!response || typeof response !== 'object' || Array.isArray(response)) throw new ProviderError('provider-invalid-response', undefined, provider);
-  const candidate = response as Partial<ModelResponse>;
-  if (typeof candidate.stopReason !== 'string' || !candidate.stopReason) throw new ProviderError('provider-invalid-response', undefined, provider);
-  if (candidate.stopReason === 'length' || candidate.stopReason === 'max_tokens') throw new ProviderError(`provider-response-truncated:${candidate.stopReason}`, undefined, provider, false);
-  if (candidate.stopReason === 'unknown') throw new ProviderError('provider-response-unexpected-stop:unknown', undefined, provider, false);
-  if (candidate.toolCalls !== undefined && !Array.isArray(candidate.toolCalls)) throw new ProviderError('provider-invalid-response', undefined, provider);
-  // A tool-termination stop reason without any tool call is a malformed (not completed) turn.
-  if ((candidate.stopReason === 'tool_calls' || candidate.stopReason === 'tool_use' || candidate.stopReason === 'function_call') && !(candidate.toolCalls?.length)) throw new ProviderError('provider-invalid-response', undefined, provider);
-  if (candidate.text !== undefined && typeof candidate.text !== 'string') throw new ProviderError('provider-invalid-response', undefined, provider);
+  return calls;
 }
 
 const stableJson = (value: unknown): string => {
@@ -173,42 +147,65 @@ const stableJson = (value: unknown): string => {
   if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`;
   return JSON.stringify(value);
 };
-export function toolFingerprint(call: ToolCall): string {
-  let args: unknown = call.arguments;
-  try { args = JSON.parse(call.arguments || '{}'); } catch { /* keep raw argument text */ }
-  return `${call.name}:${stableJson(args)}`;
-}
 
 /**
- * In-process replay guard for one top-level conversation turn. Read tools are reused by call
- * id; write tools are reused by semantic fingerprint even if the model invents a new id on a
- * retry, so a write that already executed is never executed twice inside one model turn chain.
+ * Hash of the call's arguments for logical-identity conflict detection. It is never used
+ * as a replay key: two independent decisions that happen to send the same text/arguments
+ * must both execute (FEC-39).
+ */
+export function toolArgumentsHash(call: ToolCall): string {
+  let args: unknown = call.arguments;
+  try { args = JSON.parse(call.arguments || '{}'); } catch { /* keep raw argument text */ }
+  return stableJson(args);
+}
+
+/** Backwards-compatible name: name + canonical arguments, useful for diagnostics only. */
+export function toolFingerprint(call: ToolCall): string {
+  return `${call.name}:${toolArgumentsHash(call)}`;
+}
+
+export type LogicalToolCallId = {
+  sessionId: string;
+  decisionId: string;
+  responseAttemptId: string;
+  toolCallId: string;
+};
+export type ToolExecutionEntry = { name: string; payloadHash: string; result: unknown };
+export type LedgerCheck =
+  | { status: 'new' }
+  | { status: 'replay'; result: unknown }
+  | { status: 'conflict'; name: string; payloadHash: string };
+
+/**
+ * Durable-in-process replay guard keyed by the logical call identity
+ * (sessionId + decisionId + responseAttemptId + toolCallId).
  *
- * The ledger is intentionally scoped to a single ProviderSession.run: a later user turn may
- * legitimately ask for the same write again. It is not durable. Cross-restart and cross-turn
- * duplicate suppression is the job of the executor's durable proposal/execution records; this
- * ledger only prevents replay of a write that this process already executed for the same turn.
+ * It deliberately does NOT suppress writes by argument fingerprint:
+ *   - a new decision with identical text/arguments is a new legitimate action;
+ *   - the same logical call with the same name/arguments replays its recorded result;
+ *   - the same logical call with a changed name/arguments is a conflict, never a silent
+ *     replay of the old result (FEC-39/40);
+ *   - a failed call is only replayed for the same logical identity, so a later decision
+ *     may legitimately retry it.
  */
 export class ToolExecutionLedger {
-  private readonly byId = new Map<string, unknown>();
-  private readonly writes = new Map<string, unknown>();
-  constructor(private readonly writeTools: ReadonlySet<string> = new Set()) {}
-  isWrite(name: string) { return this.writeTools.has(name); }
-  reuse(call: ToolCall): { replayed: boolean; result?: unknown } {
-    if (this.isWrite(call.name)) {
-      const key = toolFingerprint(call);
-      if (this.writes.has(key)) return { replayed: true, result: this.writes.get(key) };
+  private readonly entries = new Map<string, ToolExecutionEntry>();
+  static logicalId(parts: LogicalToolCallId): string {
+    return JSON.stringify([parts.sessionId, parts.decisionId, parts.responseAttemptId, parts.toolCallId]);
+  }
+  check(logicalId: string, call: ToolCall): LedgerCheck {
+    const entry = this.entries.get(logicalId);
+    if (!entry) return { status: 'new' };
+    const payloadHash = toolArgumentsHash(call);
+    if (entry.name !== call.name || entry.payloadHash !== payloadHash) {
+      return { status: 'conflict', name: entry.name, payloadHash: entry.payloadHash };
     }
-    if (this.byId.has(call.id)) return { replayed: true, result: this.byId.get(call.id) };
-    return { replayed: false };
+    return { status: 'replay', result: entry.result };
   }
-  record(call: ToolCall, result: unknown) {
-    this.byId.set(call.id, result);
-    if (this.isWrite(call.name)) this.writes.set(toolFingerprint(call), result);
+  record(logicalId: string, call: ToolCall, result: unknown): void {
+    this.entries.set(logicalId, { name: call.name, payloadHash: toolArgumentsHash(call), result });
   }
-  /** Forget every entry. Called at the start of each top-level run. */
-  reset() { this.byId.clear(); this.writes.clear(); }
-  get size() { return this.byId.size; }
+  get size() { return this.entries.size; }
 }
 
 /** Immutable canonical transcript. Provider-private response data is never stored. */
@@ -227,62 +224,66 @@ export class CanonicalHistory {
   appendToolResults(calls: readonly ToolCall[], results: ReadonlyMap<string, unknown>): void {
     for (const call of calls) {
       const result = results.get(call.id);
-      this.append({ role: 'tool', content: typeof result === 'string' ? result : JSON.stringify(result ?? null), toolResult: { toolCallId: call.id, content: result } });
+      const isError = Boolean(result && typeof result === 'object' && (result as { ok?: unknown }).ok === false);
+      this.append({ role: 'tool', content: typeof result === 'string' ? result : JSON.stringify(result ?? null), toolResult: { toolCallId: call.id, content: result, ...(isError ? { isError } : {}) } });
     }
   }
   snapshot(): CanonicalMessage[] { return structuredClone(this.entries); }
   get length() { return this.entries.length; }
   validate(provider?: string) { validateCanonicalHistory(this.entries, provider); }
-  private byteLength(): number {
-    // Account for the actual serialized transcript (array punctuation and commas included).
-    return utf8Bytes(JSON.stringify(this.entries));
+  /** Drop entries appended at/after `length` (used to roll back a conflicted turn). */
+  truncate(length: number): void {
+    if (length < 0 || length >= this.entries.length) return;
+    this.entries.splice(length);
+    validateCanonicalHistory(this.entries);
   }
   /**
-   * Bound the transcript by entries and serialized bytes. Complete tool-turn groups
-   * (assistant call + its contiguous results) are evicted first as an indivisible unit, so an
-   * assistant call can never outlive its results (or vice versa). User/system context is only
-   * dropped when no tool-turn group remains to evict. Bytes are the token-budget proxy.
+   * Trim whole units, never splitting an assistant tool_calls message from its results.
+   *
+   * A unit is either one non-tool message or an assistant tool-call message plus the
+   * contiguous tool-result messages that answer it. The oldest units are removed until both
+   * the message count and the serialized UTF-8 budget fit. A single remaining unit that is
+   * still over budget is an explicit error: fabricating a truncated tool pair or silently
+   * dropping the newest response would corrupt the provider contract (FEC-44).
    */
-  trim(maxEntries = 200, maxBytes = MAX_CANONICAL_HISTORY_BYTES): void {
-    const entryLimit = Math.max(0, Math.floor(maxEntries));
-    const byteLimit = Math.max(0, Math.floor(maxBytes));
-    const over = () => this.entries.length > entryLimit || this.byteLength() > byteLimit;
-    if (!over()) return;
-    const evict = (kind: 'tool-turn' | 'other' | 'system') => {
-      while (over()) {
-        const group = groupEntries(this.entries).find(candidate => candidate.kind === kind);
-        if (!group) return;
-        this.entries.splice(group.start, group.end - group.start);
-      }
-    };
-    // Tool turns are the bulk of a tool-heavy transcript, so evict them before context.
-    evict('tool-turn');
-    evict('other');
-    // A pathological system message still cannot exceed the hard cap.
-    evict('system');
-  }
-}
-
-type HistoryGroup = { start: number; end: number; kind: 'tool-turn' | 'other' | 'system' };
-
-/**
- * Split history into evictable groups. An assistant message with tool calls and the contiguous
- * tool results that follow it form one group; removing only part of it would corrupt pairing.
- */
-function groupEntries(entries: readonly CanonicalMessage[]): HistoryGroup[] {
-  const groups: HistoryGroup[] = [];
-  let index = 0;
-  while (index < entries.length) {
-    const entry = entries[index]!;
-    if (entry.role === 'assistant' && entry.toolCalls?.length) {
-      let end = index + 1;
-      while (end < entries.length && entries[end]!.role === 'tool') end++;
-      groups.push({ start: index, end, kind: 'tool-turn' });
-      index = end;
-      continue;
+  trim(maxEntries = 200, maxBytes = 256 * 1024): void {
+    validateCanonicalHistory(this.entries);
+    while (this.entries.length > maxEntries || this.serializedBytes() > maxBytes) {
+      const units = this.units();
+      if (units.length <= 1) throw new ProviderError('canonical-history-budget-exceeded');
+      const oldest = units[0]!;
+      this.entries.splice(0, oldest.length);
     }
-    groups.push({ start: index, end: index + 1, kind: entry.role === 'system' ? 'system' : 'other' });
-    index++;
+    // A trim that leaves a dangling tool result or duplicate id would be worse than an
+    // explicit error; validate the post-trim transcript before any provider sees it.
+    validateCanonicalHistory(this.entries);
   }
-  return groups;
+  private serializedBytes(): number {
+    return this.entries.reduce((total, entry) => total + utf8Bytes(JSON.stringify(entry)), 0);
+  }
+  private units(): CanonicalMessage[][] {
+    const units: CanonicalMessage[][] = [];
+    for (let index = 0; index < this.entries.length; index++) {
+      const message = this.entries[index]!;
+      if (message.role === 'assistant' && message.toolCalls?.length) {
+        const unit: CanonicalMessage[] = [message];
+        const ids = new Set(message.toolCalls.map(call => call.id));
+        let next = index + 1;
+        // Every result answering this assistant turn is part of the same indivisible unit.
+        while (next < this.entries.length) {
+          const candidate = this.entries[next]!;
+          if (candidate.role !== 'tool') break;
+          const id = toolResultId(candidate);
+          if (id && !ids.has(id)) break;
+          unit.push(candidate);
+          next++;
+        }
+        units.push(unit);
+        index = next - 1;
+      } else {
+        units.push([message]);
+      }
+    }
+    return units;
+  }
 }

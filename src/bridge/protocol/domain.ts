@@ -16,7 +16,7 @@ export type DomainProjection = {
   sessionEpoch: string;
   sequence: string;
   /** Stable scope so projections from another world/account cannot be merged. */
-  scope: ProjectionScope;
+  scope: { serverProfileId: string; dimension: string; worldGenerationId: string; accountId?: string };
   payload: Record<string, unknown>;
   evidence: { packet: string; direction: string; phase: string };
 };

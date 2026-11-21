@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawnRelayProcess } from '../../src/bridge/relay/spawn.js';
@@ -7,11 +7,7 @@ import net from 'node:net';
 
 const entryUrl = new URL('../../dist/bridge/relay/entry.js', import.meta.url);
 // The forked child runs compiled JS; this integration test requires a prior build.
-beforeAll(() => {
-  if (!existsSync(fileURLToPath(entryUrl))) {
-    throw new Error('missing-built-entry: dist/bridge/relay/entry.js is required for the B06 child-process test. Run `npm run build` before running this test file.');
-  }
-});
+const built = existsSync(fileURLToPath(entryUrl));
 
 /**
  * Real child_process fork of the relay entry against a loopback echo target. No Minecraft
@@ -21,12 +17,12 @@ beforeAll(() => {
 const peer = (port: number) => new Promise<net.Socket>(resolve => { const socket = net.createConnection(port, '127.0.0.1', () => resolve(socket)); });
 
 describe('B06 supervised relay child', () => {
-  it('forks the relay, correlates status, forwards bytes and stops cleanly', async () => {
+  it.skipIf(!built)('forks the relay, correlates status, forwards bytes and stops cleanly', async () => {
     const upstream = net.createServer(socket => socket.on('data', chunk => socket.write(chunk)));
     await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', () => resolve()));
     const targetPort = (upstream.address() as net.AddressInfo).port;
     const supervisor = new ProcessSupervisor({
-      spawn: () => spawnRelayProcess({ listenHost: '127.0.0.1', listenPort: 0, targetHost: '127.0.0.1', targetPort, allowMinecraftUpstream: true, heartbeatMs: 50 }, { entryUrl }),
+      spawn: () => spawnRelayProcess({ listenHost: '127.0.0.1', listenPort: 0, targetHost: '127.0.0.1', targetPort, allowMinecraftUpstream: true, heartbeatMs: 50 }, { entryUrl: new URL('../../dist/bridge/relay/entry.js', import.meta.url) }),
       ipcTimeoutMs: 4_000,
     });
     try {

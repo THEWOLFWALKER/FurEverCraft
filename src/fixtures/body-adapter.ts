@@ -1,5 +1,5 @@
 import { nextId, type BodyContext, type Clock, type InputPlan, type WorldSnapshot } from '../contracts/index.js';
-import type { BodyAdapter, BodyCapabilities, GatherResult, MotionPlan, WorldObservation } from '../motor/contracts.js';
+import type { BodyAdapter, BodyCapabilities, GatherResult, MotionPlan, ObserveOptions, WorldObservation } from '../motor/contracts.js';
 import { LEGACY_2D_CAPABILITIES, SIMULATED_BODY_CAPABILITIES, FULL_BODY_HEIGHT } from '../motor/contracts.js';
 import type { BlockPos, InputPlan3D, InputReceipt } from '../motor/types.js';
 import { yawDelta } from '../motor/route.js';
@@ -44,7 +44,12 @@ export class SimulatedBodyAdapter implements BodyAdapter {
   /** Inject a bounded observation defect for stale/gap/dimension tests. */
   setObservationOverride(override: Partial<SimulatedBodyAdapterOptions> | undefined): void { this.override = override; }
 
-  async observe(): Promise<WorldObservation> { return this.readObservation(); }
+  async observe(options: ObserveOptions = {}): Promise<WorldObservation> {
+    // Cooperative cancellation: the controller also races the promise so a
+    // non-cooperative adapter cannot pin the loop.
+    if (options.signal?.aborted) throw new DOMException('observation-aborted', 'AbortError');
+    return this.readObservation();
+  }
 
   /** Synchronous counterpart used by control/status surfaces; same source of truth as observe(). */
   peek(): WorldObservation { return this.readObservation(); }
@@ -69,6 +74,7 @@ export class SimulatedBodyAdapter implements BodyAdapter {
       pose: { ...observation.pose },
       velocity: { ...observation.velocity },
       supported: observation.supported,
+      support: observation.supported ? 'supported' : 'unsupported',
       freshness: this.override?.freshness ?? this.options.freshness,
       gap: this.override?.gap ?? this.options.gap,
       source: 'simulated',
@@ -190,7 +196,10 @@ export class Legacy2DBodyAdapter implements BodyAdapter {
   readonly context: BodyContext;
   constructor(readonly bridge: LegacyBridge, readonly clock?: Clock) { this.context = bridge.context; }
 
-  async observe(): Promise<WorldObservation> { return this.readObservation(); }
+  async observe(options: ObserveOptions = {}): Promise<WorldObservation> {
+    if (options.signal?.aborted) throw new DOMException('observation-aborted', 'AbortError');
+    return this.readObservation();
+  }
   peek(): WorldObservation { return this.readObservation(); }
   private readObservation(): WorldObservation {
     const snapshot = this.bridge.snapshot();
@@ -210,6 +219,7 @@ export class Legacy2DBodyAdapter implements BodyAdapter {
       pose: { x: this.bridge.position.x, y: 0, z: this.bridge.position.y, yaw: 0, pitch: 0 },
       velocity: { x: 0, y: 0, z: 0 },
       supported: true,
+      support: 'supported',
       freshness: snapshot.freshness,
       gap: snapshot.gap,
       source: 'legacy-simulated',

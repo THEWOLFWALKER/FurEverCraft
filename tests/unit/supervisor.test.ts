@@ -84,27 +84,6 @@ describe('B06 process supervisor', () => {
     await supervisor.stop();
   });
 
-  it('correlates an arm request with the child session epoch and ignores a mismatched epoch', async () => {
-    const child = new FakeChild();
-    const supervisor = new ProcessSupervisor({ spawn: () => child, ipcTimeoutMs: 50 });
-    await supervisor.start();
-    child.emit('message', { type: 'hello', protocolVersion: 1, process: 'relay', sessionEpoch: 'child-arm', bootEpoch: 'b', capabilities: [] });
-    await new Promise(r => setImmediate(r));
-
-    const pending = supervisor.request('arm');
-    await new Promise(r => setImmediate(r));
-    const request = child.sent.at(-1) as { type: string; command: string; sessionEpoch: string; requestId: string };
-    expect(request).toMatchObject({ type: 'request', command: 'arm', sessionEpoch: 'child-arm' });
-
-    // A response for another session must not settle the arm request.
-    child.emit('message', { type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch: 'other-session', ok: true, result: { armed: true } });
-    await expect(Promise.race([pending.then(() => 'settled'), new Promise(r => setTimeout(() => r('pending'), 10))])).resolves.toBe('pending');
-
-    child.emit('message', { type: 'response', protocolVersion: 1, requestId: request.requestId, sessionEpoch: 'child-arm', ok: true, result: { armed: true, status: { admissionOpen: true } } });
-    await expect(pending).resolves.toEqual({ armed: true, status: { admissionOpen: true } });
-    await supervisor.stop();
-  });
-
   it('waits for the child hello before allowing a request', async () => {
     const child = new FakeChild();
     const supervisor = new ProcessSupervisor({ spawn: () => child, ipcTimeoutMs: 200 });

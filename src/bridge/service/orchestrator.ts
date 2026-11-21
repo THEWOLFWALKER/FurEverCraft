@@ -1,3 +1,4 @@
+import { ControlAuthority, type ControlDecision, type ControlReadiness } from '../../execution/control-authority.js';
 import { redact } from '../../diagnostics/redaction.js';
 import { BoundedIpcOutbox, type IpcMessageLike } from './ipc-outbox.js';
 
@@ -21,7 +22,7 @@ export type RelayMonitor = {
 };
 
 export type ObserverMonitor = {
-  start(): void;
+  start(): void | Promise<void>;
   stop(): Promise<void>;
   forceStop?(): void | Promise<void>;
   state(): unknown;
@@ -50,6 +51,8 @@ export type BridgeServiceEvent = IpcMessageLike & (
 );
 
 export type BridgeServiceOptions = {
+  /** Trusted composition evaluates fresh observation, binding and capability evidence. Absent means unavailable. */
+  controlReadiness?: () => ControlReadiness;
   relay?: RelayMonitor;
   observer?: ObserverMonitor;
   helper?: HelperMonitor;
@@ -76,34 +79,26 @@ export type BridgeServiceStatus = {
   helper: unknown;
   admissionOpen: boolean;
   controlRevoked: boolean;
+  control: ControlDecision;
   restarts: { attempts: number; max: number; lastDelayMs?: number };
-  ipc: { messages: number; bytes: number; dropped: number; controlLost: boolean; globalUnknown: boolean; backpressured: boolean };
-  shutdown: { forced: boolean; graceMs: number };
+  ipc: { messages: number; bytes: number; dropped: number; controlLost: boolean; globalUnknown: boolean };
+  shutdown: { forced: boolean; graceMs: number; releaseUncertain: boolean; errors: string[] };
 };
-
-/** Outcome of a shutdown attempt. `stopped` is true only for a clean graceful stop. */
-export type BridgeShutdownResult = { stopped: boolean; forced: boolean; error?: string };
 
 const defaultSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 export class BridgeService {
   private stateValue: BridgeServiceState = 'idle';
-  private admissionOpenValue = false;
-  private controlRevokedValue = true;
+  private readonly authority: ControlAuthority;
+  private stopPromise?: Promise<void>;
+  private releasePromise?: Promise<void>;
   private readonly restarts: number[] = [];
   private lastDelayMs?: number;
   private restarting?: Promise<boolean>;
   private forcedShutdown = false;
+  private releaseUncertain = false;
+  private readonly shutdownErrors: string[] = [];
   private globalUnknown = false;
-  /** True while the IPC channel has rejected a hand-off (a throw, not a false/queued send). */
-  private transportUnavailable = false;
-  /** True once the current observation-overflow episode has notified its listeners. */
-  private overflowEpisodeNotified = false;
-  /** Precise reason for the most recent refused arm request (for truthful IPC/CLI reporting). */
-  private armRefusalReasonValue?: string;
-  /** Single in-flight shutdown, so callers awaiting the same stop observe the same completion. */
-  private shutdownPromise?: Promise<BridgeShutdownResult>;
-  private shutdownResultValue?: BridgeShutdownResult;
   private readonly outbox: BoundedIpcOutbox;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -114,6 +109,14 @@ export class BridgeService {
   private readonly eventListeners = new Set<(event: BridgeServiceEvent) => void>();
 
   constructor(private readonly options: BridgeServiceOptions = {}) {
+    this.authority = new ControlAuthority(() => {
+      const reasons: string[] = [];
+      if (this.stateValue !== 'running') reasons.push(`bridge-${this.stateValue}`);
+      if (this.globalUnknown) reasons.push('observer-control-unknown');
+      const evidence = options.controlReadiness?.() ?? { ready: false, reasons: ['control-evidence-unavailable'] };
+      if (!evidence.ready || evidence.reasons.length) reasons.push(...(evidence.reasons.length ? evidence.reasons : ['control-evidence-not-ready']));
+      return { ready: reasons.length === 0, reasons };
+    });
     this.now = options.now ?? (() => Date.now());
     this.sleep = options.sleep ?? defaultSleep;
     this.outbox = new BoundedIpcOutbox({ maxMessages: options.maxIpcMessages, maxBytes: options.maxIpcBytes });
@@ -123,9 +126,7 @@ export class BridgeService {
   }
 
   get state(): BridgeServiceState { return this.stateValue; }
-  get controlRevoked(): boolean { return this.controlRevokedValue; }
-  /** Precise reason the last arm attempt was refused, or undefined when it was accepted. */
-  get armRefusalReason(): string | undefined { return this.armRefusalReasonValue; }
+  get controlRevoked(): boolean { return !this.authority.decision().allowed; }
 
   /** Subscribe a runtime consumer (admission/lifecycle). Returns an unsubscribe function. */
   on(listener: (event: BridgeServiceEvent) => void): () => void {
@@ -139,7 +140,7 @@ export class BridgeService {
     this.stateValue = 'starting';
     this.emitState();
     try {
-      this.options.observer?.start();
+      await Promise.resolve(this.options.observer?.start());
       if (this.options.relay) {
         await this.options.relay.start();
         if (this.options.relay.waitForHello) await this.options.relay.waitForHello(this.options.helloTimeoutMs ?? 5_000);
@@ -155,96 +156,33 @@ export class BridgeService {
     }
   }
 
-  /**
-   * Explicit control re-arm after a new, trusted observation; restart is not enough.
-   *
-   * Admission may only reopen when the service is actually able to carry control right now:
-   * a running/degraded service with a live relay (and a live observer when one is configured).
-   * IPC loss/backpressure is still checked, because reopening admission on a channel that
-   * cannot carry control would silently drop the next revoke.
-   */
-  armControl(reason = 'operator-arm'): boolean {
-    const queued = this.outbox.queued();
-    // An IPC channel with our own messages still queued is backpressured even when the
-    // send itself was accepted (false = queued). Arming there would reopen admission on
-    // a channel that is not keeping up.
-    const backpressured = this.transportUnavailable
-      || (this.options.ipc !== undefined && queued.messages > 0);
-    const liveness = this.controlLivenessRefusal();
-    const refusal = liveness
-      ?? (this.globalUnknown ? 'ipc-global-unknown'
-        : this.overflowEpisodeNotified ? 'ipc-overflow-episode'
-          : backpressured ? (this.transportUnavailable ? 'ipc-transport-unavailable' : 'ipc-backpressured')
-            : undefined);
-    if (refusal !== undefined) {
-      this.armRefusalReasonValue = refusal;
-      // A refused arm must leave admission closed, even if it was open before (for example
-      // an operator re-arm racing a relay/observer failure).
-      this.closeAdmission();
-      this.log('warn', 'control-arm-refused', {
-        reason,
-        refusal,
-        service: this.stateValue,
-        relay: this.options.relay?.state ?? 'absent',
-        ipc: { globalUnknown: this.globalUnknown, backpressured, dropped: queued.dropped },
-      });
-      return false;
-    }
-    this.armRefusalReasonValue = undefined;
-    this.controlRevokedValue = false;
-    this.admissionOpenValue = true;
-    this.log('info', 'control-armed', { reason });
+  /** Re-evaluate trusted evidence; a reason string is not an authorization credential. */
+  armControl(reason = 'operator-arm'): ControlDecision {
+    const decision = this.authority.arm();
+    this.log(decision.allowed ? 'info' : 'warn', decision.allowed ? 'control-armed' : 'control-arm-rejected', { reason, reasons: decision.reasons });
     this.emitState();
-    return true;
+    return this.authority.decision();
   }
 
-  /**
-   * Liveness precondition for arming. Returns undefined only when control can truthfully be
-   * opened: running/degraded service, a configured relay whose monitor reports running, and a
-   * configured observer that reports a running worker.
-   */
-  private controlLivenessRefusal(): string | undefined {
-    if (this.stateValue !== 'running' && this.stateValue !== 'degraded') return `service-state:${this.stateValue}`;
-    if (!this.options.relay) return 'relay-not-configured';
-    if (this.options.relay.state !== 'running') return `relay-state:${this.options.relay.state}`;
-    if (this.options.observer) {
-      let observerState: unknown;
-      try { observerState = this.options.observer.state(); } catch { return 'observer-state-unavailable'; }
-      if (!observerState || typeof observerState !== 'object') return 'observer-not-live';
-      const value = observerState as {
-        running?: unknown; enabled?: unknown; paused?: unknown; stopped?: unknown;
-        sessions?: unknown; boundSessions?: unknown;
-      };
-      if (value.running === true) return undefined;
-      // A passive observer with no bound TCP session has no worker to report running yet;
-      // an enabled, unpaused supervisor is ready for the next session. A bound session that
-      // has no installed host (or whose host is not running) is a real liveness failure.
-      const enabled = value.enabled === true && value.paused !== true && value.stopped !== true;
-      const installed = Array.isArray(value.sessions) ? value.sessions.length : undefined;
-      const bound = typeof value.boundSessions === 'number' ? value.boundSessions : undefined;
-      if (enabled && installed !== undefined && installed === 0 && (bound === undefined || bound === 0)) return undefined;
-      return 'observer-not-live';
+  /** Close admission and notify in-process consumers before any potentially hanging release. */
+  revokeControl(reason: string): Promise<void> {
+    this.authority.revoke(reason);
+    this.emit({ type: 'control-revoked', reason }, true);
+    this.log('warn', 'control-revoked', { reason });
+    if (!this.releasePromise) {
+      this.releasePromise = Promise.resolve().then(() => this.options.helper?.releaseOwnedInputs?.()).then(result => {
+        if (result && typeof result === 'object' && (('released' in result && result.released === false) || ('ok' in result && result.ok === false))) this.releaseUncertain = true;
+      }, () => { this.releaseUncertain = true; }).finally(() => { this.releasePromise = undefined; });
     }
-    return undefined;
-  }
-
-  /** Revoke held input and close admission without stopping forwarding. */
-  async revokeControl(reason: string): Promise<void> {
-    this.closeAdmission();
-    const released = this.releaseInputsBestEffort();
-    this.announceRevoked(reason);
-    await released;
+    return this.releasePromise;
   }
 
   onObserverFailure(reason: string): void {
+    void this.revokeControl(`observer-failure:${reason}`);
     this.emit({ type: 'observer-failure', reason });
     this.log('warn', 'observer-worker-failure', { reason });
-    // Observer loss means the controlling runtime can no longer prove body state. Admission
-    // must close synchronously; releasing held input is best-effort and never blocks it.
-    this.closeAdmission();
-    void this.releaseInputsBestEffort();
-    this.announceRevoked(`observer-failure:${reason}`);
-    this.degradeIfRunning();
+    if (this.stateValue === 'running') this.stateValue = 'degraded';
+    this.emitState();
   }
 
   /**
@@ -262,197 +200,99 @@ export class BridgeService {
   }
 
   publishObserver(event: unknown): void {
-    // Relay forwarding is independent of this consumer; the event is still reported even
-    // when it also revokes control.
     this.emit({ type: 'observer-event', event });
-    const gapReason = globalObserverGapReason(event);
-    if (gapReason === undefined) return;
-    // A global observer gap (or an explicit unknown-availability report) invalidates the
-    // observation the runtime was admitted on. Close admission synchronously and require
-    // an explicit armControl after fresh, trusted observation.
-    this.closeAdmission();
-    void this.releaseInputsBestEffort();
-    this.announceRevoked(`observer-gap:${gapReason}`);
-    this.degradeIfRunning();
   }
 
-  /**
-   * Stop every owned child and report what actually happened.
-   *
-   * A child stop failure is not swallowed: it is collected and escalated to that monitor's
-   * hard stop. Exceeding the graceful deadline escalates every monitor. The returned result is
-   * `stopped:true` only for a clean graceful stop; otherwise `stopped:false` carries the
-   * failures and `forced:true` so no caller can report a clean shutdown that did not occur.
-   */
-  stop(reason = 'quit'): Promise<BridgeShutdownResult> {
-    if (this.shutdownPromise) return this.shutdownPromise;
-    if (this.stateValue === 'stopped') {
-      return Promise.resolve(this.shutdownResultValue ?? { stopped: true, forced: this.forcedShutdown });
-    }
-    this.shutdownPromise = this.doStop(reason);
-    return this.shutdownPromise;
+  stop(reason = 'quit'): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    let resolve!: () => void; let reject!: (reason: unknown) => void;
+    this.stopPromise = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
+    void this.stopOwned(reason).then(resolve, reject);
+    return this.stopPromise;
   }
 
-  private async doStop(reason: string): Promise<BridgeShutdownResult> {
+  private async stopOwned(reason: string): Promise<void> {
+    if (this.stateValue === 'stopped') return;
     this.stateValue = 'stopping';
     this.emitState();
-    await this.revokeControl(`stop:${reason}`);
+    const release = this.revokeControl(`stop:${reason}`);
     const graceMs = this.options.shutdownGraceMs ?? 3_000;
-    const failures: string[] = [];
-    const tasks: Array<{ name: string; run: () => Promise<void>; force?: () => void | Promise<void> }> = [];
-    if (this.options.relay) {
-      const relay = this.options.relay;
-      tasks.push({
-        name: 'relay',
-        run: () => relay.stop(reason),
-        ...(relay.forceStop ? { force: () => relay.forceStop!() } : {}),
-      });
-    }
-    if (this.options.observer) {
-      const observer = this.options.observer;
-      tasks.push({
-        name: 'observer',
-        run: () => observer.stop(),
-        ...(observer.forceStop ? { force: () => observer.forceStop!() } : {}),
-      });
-    }
-    if (this.options.helper) {
-      const helper = this.options.helper;
-      tasks.push({
-        name: 'helper',
-        run: () => helper.shutdown(),
-        ...(helper.forceStop ? { force: () => helper.forceStop!() } : {}),
-      });
-    }
-    // Preserve lifecycle order while recording each failure instead of swallowing it.
     const work = (async () => {
-      for (const task of tasks) {
-        try {
-          await task.run();
-        } catch (error) {
-          const detail = errorText(error);
-          failures.push(`${task.name}-stop-failed:${detail}`);
-          this.log('warn', `${task.name}-stop-failed`, { error: detail });
-        }
-      }
+      await release;
+      if (this.options.relay) await this.options.relay.stop(reason).catch(error => { this.shutdownErrors.push('relay-stop-failed'); this.log('warn', 'relay-stop-failed', { error: errorText(error) }); });
+      if (this.options.observer) await this.options.observer.stop().catch(error => { this.shutdownErrors.push('observer-stop-failed'); this.log('warn', 'observer-stop-failed', { error: errorText(error) }); });
+      if (this.options.helper) await this.options.helper.shutdown().catch(error => { this.shutdownErrors.push('helper-stop-failed'); this.log('warn', 'helper-stop-failed', { error: errorText(error) }); });
     })();
-    const outcome = await withDeadline(work, graceMs);
-    const escalate = new Set<(typeof tasks)[number]>();
-    let forced = false;
-    if (outcome.timedOut) {
-      forced = true;
-      failures.push(`shutdown-deadline-exceeded:${graceMs}ms`);
+    const completed = await withDeadline(work, graceMs);
+    if (!completed) {
+      this.forcedShutdown = true;
       this.log('error', 'shutdown-deadline-exceeded', { reason, graceMs });
-      // A deadline must not leave orphaned children: escalate to every monitor's hard stop.
-      for (const task of tasks) escalate.add(task);
-    } else if (outcome.error !== undefined) {
-      forced = true;
-      failures.push(`shutdown-failed:${errorText(outcome.error)}`);
-      this.log('error', 'shutdown-failed', { reason, error: errorText(outcome.error) });
-      for (const task of tasks) escalate.add(task);
-    } else {
-      // Only the monitors whose graceful stop rejected need escalation.
-      for (const task of tasks) if (failures.some(failure => failure.startsWith(`${task.name}-stop-failed:`))) escalate.add(task);
-    }
-    if (escalate.size > 0) {
-      forced = true;
-      const targets = [...escalate];
-      const forceDeadline = Math.max(50, Math.min(graceMs, 500));
-      const forcedOutcome = await withDeadline(Promise.all(targets.map(async task => {
-        try {
-          if (task.force) await task.force();
-          else failures.push(`${task.name}-force-stop-unavailable`);
-        } catch (error) {
-          failures.push(`${task.name}-force-stop-failed:${errorText(error)}`);
-        }
-      })), forceDeadline);
-      if (forcedOutcome.timedOut) failures.push(`force-stop-deadline-exceeded:${forceDeadline}ms`);
-      else if (forcedOutcome.error !== undefined) failures.push(`force-stop-failed:${errorText(forcedOutcome.error)}`);
+      // A deadline must not leave orphaned children: escalate to each monitor's hard stop.
+      const forced = [
+        this.options.relay?.forceStop?.(),
+        this.options.observer?.forceStop?.(),
+        this.options.helper?.forceStop?.(),
+      ].map(item => Promise.resolve(item).catch(() => undefined));
+      await withDeadline(Promise.all(forced), Math.max(50, Math.min(graceMs, 500)));
     }
     this.stateValue = 'stopped';
-    this.admissionOpenValue = false;
-    if (forced) this.forcedShutdown = true;
-    const result: BridgeShutdownResult = failures.length === 0
-      ? { stopped: true, forced }
-      : { stopped: false, forced, error: failures.join('; ') };
-    this.shutdownResultValue = result;
+
     this.emit({ type: 'state', state: 'stopped' });
     this.flush();
     this.unsubscribeRelay?.();
     this.unsubscribeObserver?.();
     this.unsubscribeHelper?.();
-    return result;
   }
 
   status(): BridgeServiceStatus {
+    const control = this.authority.decision();
     return {
       state: this.stateValue,
       relay: { state: this.options.relay?.state ?? 'absent', ...(this.options.relay?.pid === undefined ? {} : { pid: this.options.relay.pid }) },
       observer: this.options.observer?.state() ?? null,
       helper: this.options.helper?.state?.() ?? null,
-      admissionOpen: this.admissionOpenValue,
-      controlRevoked: this.controlRevokedValue,
+      admissionOpen: control.allowed,
+      controlRevoked: !control.allowed,
+      control,
       restarts: { attempts: this.restarts.length, max: this.options.maxRestarts ?? 3, ...(this.lastDelayMs === undefined ? {} : { lastDelayMs: this.lastDelayMs }) },
-      ipc: { ...this.outbox.queued(), globalUnknown: this.globalUnknown, backpressured: this.transportUnavailable },
-      shutdown: { forced: this.forcedShutdown, graceMs: this.options.shutdownGraceMs ?? 3_000 },
+      ipc: { ...this.outbox.queued(), globalUnknown: this.globalUnknown },
+      shutdown: { forced: this.forcedShutdown, graceMs: this.options.shutdownGraceMs ?? 3_000, releaseUncertain: this.releaseUncertain, errors: [...this.shutdownErrors] },
     };
   }
 
   /** Queue a message for the parent. Control loss is surfaced as global uncertainty. */
   emit(event: BridgeServiceEvent | IpcMessageLike, control?: boolean): void {
-    const before = this.outbox.queued();
+    const previous = this.outbox.queued();
+    const before = previous.dropped;
     this.outbox.push(event, control);
     const after = this.outbox.queued();
-    const droppedNow = after.dropped - before.dropped;
-    if (droppedNow > 0) {
-      this.globalUnknown = true;
-      const controlLostNow = !before.controlLost && after.controlLost;
-      this.log('warn', 'ipc-queue-overflow', { dropped: droppedNow, controlLost: after.controlLost });
-      if (!this.overflowEpisodeNotified || controlLostNow) {
-        this.overflowEpisodeNotified = true;
-        // The outbox can no longer be trusted to carry control. Close admission and notify
-        // runtime listeners directly: re-enqueueing this notification would recurse into the
-        // same full queue, and each overflow episode must notify exactly once.
-        this.closeAdmission();
-        void this.releaseInputsBestEffort();
-        this.dispatch({
-          type: 'observer-event',
-          event: {
-            kind: 'observer_gap', source: 'client', sessionEpoch: 'ipc-outbox',
-            gap: { scope: 'global', reason: 'ipc-queue-overflow', dropped: droppedNow },
-          },
-        } as BridgeServiceEvent);
-        this.dispatch({ type: 'ipc-overflow', dropped: droppedNow, controlLost: after.controlLost, globalUnknown: true });
-      }
+    if (after.dropped > before) {
+      this.globalUnknown = this.globalUnknown || after.controlLost;
+      this.log('warn', 'ipc-queue-overflow', { dropped: after.dropped - before, controlLost: after.controlLost });
     }
-    this.flush(droppedNow === 0);
-    this.dispatch(event as BridgeServiceEvent);
+    if (after.controlLost && !previous.controlLost) {
+      this.globalUnknown = true;
+      void this.revokeControl('ipc-control-lost');
+      // Local notification bypasses the already saturated IPC queue.
+      this.notify({ type: 'ipc-overflow', dropped: after.dropped - before, controlLost: true, globalUnknown: true });
+    }
+    this.flush();
+    this.notify(event as BridgeServiceEvent);
   }
 
-  /**
-   * Attempt to drain queued IPC without blocking.
-   *
-   * `endEpisodeOnDrain=false` is used right after a drop so one backed-up publish does not
-   * immediately declare the episode recovered. A transport throw (not a false/queued send)
-   * marks the channel unavailable; admission cannot be re-armed until a later flush hands
-   * off successfully and the queue is empty.
-   */
-  flush(endEpisodeOnDrain = true): void {
+  private notify(event: BridgeServiceEvent): void {
+    try { this.options.onEvent?.(event); } catch { /* listeners isolated */ }
+    for (const listener of this.eventListeners) {
+      try { listener(event); } catch { /* listeners isolated */ }
+    }
+  }
+
+  /** Attempt to drain queued IPC without blocking. */
+  flush(): void {
     if (!this.options.ipc) return;
-    const result = this.outbox.flush(message => {
-      try { return this.options.ipc!.send(message); } catch { throw new Error('ipc-transport-failed'); }
+    this.outbox.flush(message => {
+      try { return this.options.ipc!.send(message); } catch { return false; }
     });
-    if (result.transportError) {
-      this.transportUnavailable = true;
-      return;
-    }
-    // Every entry in this flush was handed to the channel (true = written, false = queued).
-    this.transportUnavailable = false;
-    // A fully drained queue ends the overflow episode; a later overflow is a new episode.
-    if (result.queued === 0 && endEpisodeOnDrain) {
-      this.overflowEpisodeNotified = false;
-      this.globalUnknown = false;
-    }
   }
 
   private async onRelayExit(reason: string): Promise<void> {
@@ -516,37 +356,6 @@ export class BridgeService {
 
   private isStopping(): boolean { return this.stateValue === 'stopping' || this.stateValue === 'stopped'; }
 
-  private closeAdmission(): void {
-    this.controlRevokedValue = true;
-    this.admissionOpenValue = false;
-  }
-
-  private releaseInputsBestEffort(): Promise<void> {
-    try {
-      return Promise.resolve(this.options.helper?.releaseOwnedInputs?.()).then(() => undefined, () => undefined);
-    } catch {
-      return Promise.resolve();
-    }
-  }
-
-  private announceRevoked(reason: string): void {
-    this.emit({ type: 'control-revoked', reason });
-    this.log('warn', 'control-revoked', { reason });
-  }
-
-  private degradeIfRunning(): void {
-    if (this.stateValue !== 'running') return;
-    this.stateValue = 'degraded';
-    this.emitState();
-  }
-
-  private dispatch(event: BridgeServiceEvent | IpcMessageLike): void {
-    try { this.options.onEvent?.(event as BridgeServiceEvent); } catch { /* listeners isolated */ }
-    for (const listener of this.eventListeners) {
-      try { listener(event as BridgeServiceEvent); } catch { /* listeners isolated */ }
-    }
-  }
-
   private emitState(): void {
     this.emit({ type: 'state', state: this.stateValue });
   }
@@ -559,36 +368,14 @@ export class BridgeService {
   }
 }
 
-async function withDeadline(work: Promise<unknown>, ms: number): Promise<{ completed: boolean; timedOut: boolean; error?: unknown }> {
+async function withDeadline(work: Promise<unknown>, ms: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<{ completed: false; timedOut: true }>(resolve => { timer = setTimeout(() => resolve({ completed: false, timedOut: true }), ms); });
-  const result = await Promise.race([
-    work.then(
-      () => ({ completed: true, timedOut: false }) as const,
-      // A rejected stop is a failure, never a completed shutdown.
-      (error: unknown) => ({ completed: false, timedOut: false, error }) as const,
-    ),
-    deadline,
-  ]);
+  const deadline = new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), ms); });
+  const result = await Promise.race([work.then(() => true).catch(() => true), deadline]);
   if (timer) clearTimeout(timer);
   return result;
 }
 
 function errorText(error: unknown): string {
   return redact(error instanceof Error ? error.message : String(error)) as string;
-}
-
-/**
- * Returns the reason when an observer event invalidates control: a global gap, a domain
- * gap that also reports unknown availability, or any observation marked unavailable.
- * A scoped domain gap with known availability does not revoke on its own.
- */
-function globalObserverGapReason(event: unknown): string | undefined {
-  if (!event || typeof event !== 'object') return undefined;
-  const value = event as { kind?: unknown; availability?: unknown; gap?: { scope?: unknown; reason?: unknown } };
-  const reason = typeof value.gap?.reason === 'string' ? value.gap.reason : undefined;
-  if (value.availability === 'unknown') return reason ?? 'availability-unknown';
-  if (value.kind !== 'observer_gap') return undefined;
-  if (value.gap?.scope === 'domain') return undefined;
-  return reason ?? 'observer-gap';
 }

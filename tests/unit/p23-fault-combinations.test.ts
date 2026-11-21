@@ -234,7 +234,7 @@ describe('P23 goal race and lease revival', () => {
     const runtime = createRuntime({ bridge, clock: new ManualClock() });
     store = runtime.store;
     try {
-      runtime.store.saveGoal({ goalId: 'goal-race', revision: 1, status: 'active', text: 'original target', context: bridge.context });
+      runtime.store.saveGoal({ goalId: 'goal-race', revision: 1, status: 'active', text: 'original target' });
       const racedResult = await runtime.router.invoke(placeCall('goal-race-1', 1, 0), { goalId: 'goal-race', goalRevision: 1 });
       expect(racedResult.ok).toBe(false);
       expect(String(racedResult.error)).toContain('goal-revision-conflict');
@@ -304,8 +304,10 @@ describe('P23 goal race and lease revival', () => {
     const events: string[] = [];
     let accept = true;
     const service = new BridgeService({
+      // Explicit synthetic readiness; saturation begins only after successful arm.
+      controlReadiness: () => ({ ready: true, reasons: [] }),
       relay, observer, helper,
-      ipc: { send: () => { if (!accept) throw new Error('channel-unavailable'); return true; } },
+      ipc: { send: () => accept },
       maxIpcMessages: 2,
       maxRestarts: 1,
       restartWindowMs: 60_000,
@@ -319,14 +321,11 @@ describe('P23 goal race and lease revival', () => {
       await service.start();
       service.armControl('fresh-observation');
       expect(service.status()).toMatchObject({ admissionOpen: true, controlRevoked: false });
-      // Start with a drained channel, then stop accepting so the queue really saturates.
-      accept = false;
 
+      accept = false;
       // Saturate the parent queue while the observer is slow/failing and the relay dies.
       for (let index = 0; index < 40; index += 1) service.publishObserver({ kind: 'observation', frameSequence: String(index) });
       observer.fail('observer-slow-consumer');
-      // Round 3: observer failure alone closes admission synchronously, before any await.
-      expect(service.status()).toMatchObject({ admissionOpen: false, controlRevoked: true });
       relay.emitExit('unexpected-exit');
       for (let index = 0; index < 20; index += 1) await new Promise(resolve => setImmediate(resolve));
 

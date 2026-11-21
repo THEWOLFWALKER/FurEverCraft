@@ -69,8 +69,12 @@ export type BodyNavigationOptions = {
 export type ResolvedNavigationTarget = { target: BlockPos; mapping: 'explicit-xyz' | 'planar-xz-current-y' | 'legacy-2d-xz'; derived: boolean; observation: WorldObservation };
 
 /** Resolve a caller target against one observation, recording how any planar legacy input was mapped. */
-export async function resolveNavigationTarget(body: BodyAdapter, target: { x: number; y: number; z?: number }): Promise<ResolvedNavigationTarget> {
-  const observation = await body.observe();
+export async function resolveNavigationTarget(
+  body: BodyAdapter,
+  target: { x: number; y: number; z?: number },
+  options: { signal?: AbortSignal } = {},
+): Promise<ResolvedNavigationTarget> {
+  const observation = await body.observe({ ...(options.signal ? { signal: options.signal } : {}) });
   const resolved = resolveTarget3D(observation, target);
   return { ...resolved, observation };
 }
@@ -114,7 +118,7 @@ export async function navigateToBody(
   target: { x: number; y: number; z?: number },
   options: BodyNavigationOptions,
 ): Promise<BodyControllerResult & { executionId: string; path: string[]; targetMapping: ResolvedNavigationTarget['mapping']; derivedTarget: boolean; target: BlockPos }> {
-  const resolved = await resolveNavigationTarget(body, target);
+  const resolved = await resolveNavigationTarget(body, target, { ...(options.signal ? { signal: options.signal } : {}) });
   const result = await navigateBody(body, clock, resolved.target, options);
   return { ...result, targetMapping: resolved.mapping, derivedTarget: resolved.derived, target: resolved.target };
 }
@@ -164,7 +168,7 @@ export async function exploreBody(
   radius: number,
   options: BodyNavigationOptions,
 ): Promise<BodyControllerResult & { executionId: string; path: string[]; exploreTarget?: BlockPos }> {
-  const observation = await body.observe();
+  const observation = await body.observe({ ...(options.signal ? { signal: options.signal } : {}) });
   const usable = observationUsable(observation, { maxAgeMs: 500, now: clock.now(), context: body.context });
   if (!isReal3DObservation(observation) || !usable.ok) {
     return { ...failedNavigation(usable.reason ?? 'legacy-observation-not-3d') };
@@ -204,7 +208,7 @@ export async function gatherBody(body: BodyAdapter, clock: Clock, block: string,
   if (!body.findBlock || !body.digBlock) return { executionId, status: 'failed', reason: 'gather-capability-unavailable', collected: 0, items: [], observedFree: false };
   const target = await body.findBlock(block);
   if (!target) return { executionId, status: 'failed', reason: `no-observed-block:${block}`, collected: 0, items: [], observedFree: false };
-  const observation = await body.observe();
+  const observation = await body.observe({ ...(options.signal ? { signal: options.signal } : {}) });
   const initialUsable = observationUsable(observation, { maxAgeMs: 500, now: clock.now(), context: body.context });
   if (!isReal3DObservation(observation) || !initialUsable.ok) {
     return { executionId, status: 'failed', reason: initialUsable.reason ?? 'legacy-observation-not-3d', target, collected: 0, items: [], observedFree: false };
@@ -221,7 +225,7 @@ export async function gatherBody(body: BodyAdapter, clock: Clock, block: string,
   }
   // Re-observe after navigation: the dig must be based on fresh evidence that the
   // target is still present, not on the observation that selected the route.
-  const beforeDigObservation = await body.observe();
+  const beforeDigObservation = await body.observe({ ...(options.signal ? { signal: options.signal } : {}) });
   const freshUsable = observationUsable(beforeDigObservation, { maxAgeMs: 500, now: clock.now(), context: body.context });
   if (!isReal3DObservation(beforeDigObservation) || !freshUsable.ok) {
     return { executionId, status: 'failed', reason: freshUsable.reason ?? 'legacy-observation-not-3d', target, ...(navigation ? { navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path } } : {}), collected: 0, items: [], observedFree: false };
@@ -235,7 +239,7 @@ export async function gatherBody(body: BodyAdapter, clock: Clock, block: string,
   // (position, observed target) are already satisfied.
   options.onBeforeDig?.();
   const dig = await body.digBlock(target, block);
-  const after = await body.observe();
+  const after = await body.observe({ ...(options.signal ? { signal: options.signal } : {}) });
   const observed = after.cells.get(`${target.x},${target.y},${target.z}`);
   const observedFree = observed?.cell === 'free';
   if (!dig.accepted) return { executionId, status: dig.ambiguous ? 'partial' : 'failed', reason: dig.ambiguous ? 'dig-ambiguous' : 'dig-rejected', target, ...(navigation ? { navigation: { executionId: navigation.executionId, status: navigation.status, path: navigation.path } } : {}), collected: dig.collected, items: dig.items, observedFree };
@@ -287,6 +291,8 @@ export type BodySkillContext = {
   report: (progress: { stage: 'prepare' | 'dispatch' | 'verify' | 'complete'; completed: number; total?: number; message?: string }) => void;
   isCanceled?: () => boolean;
   isPaused?: () => boolean;
+  /** Executor/lifecycle abort signal; forwarded to every 3D observe and controller run. */
+  signal?: AbortSignal;
   clock?: Clock;
   motor?: MotorFactory;
 };
@@ -309,6 +315,7 @@ export async function navigateToSkill(ctx: BodySkillContext, target: { x: number
     leaseId: ctx.lease.leaseId,
     ownerToken: ctx.lease.owner,
     maxReplans: budget,
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
     ...(ctx.motor ? { motor: ctx.motor } : {}),
     ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}),
     onProgress: (stage, completed, total, message) => ctx.report({ stage: stage === 'plan' ? 'dispatch' : 'verify', completed, total, message }),
@@ -321,7 +328,7 @@ export async function returnToPlaceSkill(ctx: BodySkillContext, placeId: string,
   if (!body) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   const clock = body.clock ?? ctx.clock;
   if (!clock) return { ok: false, outcome: 'failed', reason: 'clock-required' };
-  const result = await returnToPlaceBody(body, clock, placeId, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
+  const result = await returnToPlaceBody(body, clock, placeId, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.signal ? { signal: ctx.signal } : {}), ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
   return toSkillResult(result);
 }
 
@@ -330,7 +337,7 @@ export async function exploreAreaSkill(ctx: BodySkillContext, radius: number, bu
   if (!body) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   const clock = body.clock ?? ctx.clock;
   if (!clock) return { ok: false, outcome: 'failed', reason: 'clock-required' };
-  const result = await exploreBody(body, clock, radius, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
+  const result = await exploreBody(body, clock, radius, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.signal ? { signal: ctx.signal } : {}), ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}) });
   return toSkillResult(result);
 }
 
@@ -339,7 +346,7 @@ export async function gatherBlocksSkill(ctx: BodySkillContext, block: string, bu
   if (!body) return { ok: false, outcome: 'failed', reason: 'body-adapter-unavailable' };
   const clock = body.clock ?? ctx.clock;
   if (!clock) return { ok: false, outcome: 'failed', reason: 'clock-required' };
-  const result = await gatherBody(body, clock, block, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}), onBeforeDig: () => ctx.report({ stage: 'dispatch', completed: 0, total: 1, message: 'dig' }) });
+  const result = await gatherBody(body, clock, block, { leaseId: ctx.lease.leaseId, ownerToken: ctx.lease.owner, maxReplans: budget, ...(ctx.signal ? { signal: ctx.signal } : {}), ...(ctx.motor ? { motor: ctx.motor } : {}), ...(ctx.isPaused ?? ctx.isCanceled ? { isPaused: ctx.isPaused ?? ctx.isCanceled } : {}), onBeforeDig: () => ctx.report({ stage: 'dispatch', completed: 0, total: 1, message: 'dig' }) });
   const outcome = result.status === 'confirmed' ? 'confirmed' : result.status === 'partial' ? 'partial' : result.status === 'canceled' ? 'canceled' : 'failed';
   return outcome === 'confirmed'
     ? { ok: true, outcome, value: result }

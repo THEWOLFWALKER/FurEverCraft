@@ -84,6 +84,6 @@ export class SessionSupervisor {
   constructor(private readonly events: EventHub, private readonly adapter?: ClientLifecycleAdapter, private readonly maxAttempts = 8) {}
   async start() { if (this.state === 'ready' || this.state === 'connecting') return; this.state = 'connecting'; this.events.publish('session.connecting', {}); try { await this.adapter?.connect(); const observation = await this.adapter?.observe(); this.state = observation ? 'ready' : 'observing'; this.attempts = 0; this.events.publish('session.ready', { fixture: !this.adapter }); } catch (error) { this.state = 'disconnected'; this.events.publish('session.failed', { reason: error instanceof Error ? error.message : String(error) }, true); throw error; } }
   async recover() { if (this.recoveryOwner) return false; if (this.attempts >= this.maxAttempts) { this.state = 'suspended'; return false; } this.recoveryOwner = `recovery-${Date.now()}`; this.attempts++; this.state = 'recovering'; try { await this.start(); return true; } finally { this.recoveryOwner = undefined; } }
-  async stop() { this.state = 'offline'; await this.adapter?.disconnect(); this.events.publish('session.stopped', {}); }
+  async stop() { this.state = 'offline'; if (this.adapter) await this.adapter.disconnect(); this.events.publish('session.stopped', {}); }
   get retryCount() { return this.attempts; }
 }

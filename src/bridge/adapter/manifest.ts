@@ -522,12 +522,15 @@ export type Candidate26_3Generation = {
 export function buildCandidate26_3Manifest(rootDir: string): Candidate26_3Generation {
   const dataPath = 'node_modules/minecraft-data/minecraft-data/data/pc/26.3/version.json';
   const nativePath = 'native/windows/FurEverCraft.Helper.ps1';
+  const corePath = 'native/windows/FurEverCraft.Helper.Core.cs';
   const schemaPresent = existsSync(resolve(rootDir, 'node_modules/minecraft-data/minecraft-data/data/pc/26.3/protocol.json'));
   const dataPresent = existsSync(resolve(rootDir, dataPath));
   const nativePresent = existsSync(resolve(rootDir, nativePath));
   if (!nativePresent) throw new Error(`candidate-native-missing:${nativePath}`);
+  if (!existsSync(resolve(rootDir, corePath))) throw new Error(`candidate-native-missing:${corePath}`);
   const artifacts: ManifestInput['artifacts'] = [
     { path: nativePath, role: 'native' },
+    { path: corePath, role: 'native' },
     { path: 'node_modules/minecraft-data/package.json', role: 'fixture' },
     { path: 'node_modules/minecraft-protocol/package.json', role: 'fixture' },
   ];
